@@ -34,6 +34,12 @@
 - 三座城市离线地图产物：**5 925 个分片 / 约 314 MB**
 - 自研代码规模：约 **25.7 万行**（C 386 文件 + Dart 107 文件）
 
+**实机照片**（原图见 [`docs/photos/`](docs/photos/)）：
+
+| <img src="docs/photos/01-整机-骑行地图页.jpg" width="230"> | <img src="docs/photos/02-整机-系统状态页.jpg" width="230"> | <img src="docs/photos/03-夜间实拍-半透半反屏.jpg" width="230"> | <img src="docs/photos/04-样机-工厂自检页.jpg" width="230"> |
+| --- | --- | --- | --- |
+| **成品整机 · 骑行地图页**<br>离线矢量地图 + 速度/心率，双实体键 | **整机 · 系统状态页**<br>记录盘/地图盘/数据盘容量、RAM 剩余、CPU 空闲 | **夜间实拍 · 半透半反屏**<br>览山路/龙蟠大道，47.8 km/h、坡度 −5.9% | **样机 · 工厂自检页**<br>陀螺/BLE/存储 PASS，PASS 8 FAIL 1 |
+
 ---
 
 ## 二、选题方向
@@ -41,7 +47,7 @@
 **AI 硬件产品创新 + 新硬件平台适配**（本项目两个方向都做）：
 
 - **AI 硬件产品创新**：从产品定义出发做一台真实可用的骑行码表——无触摸双键交互、离线全国地图、低功耗形态，而不是把现成方案换个壳。
-- **新硬件平台适配**：在 SiFli **SF32LB52** 上完成全新板级适配，自研 vendor 树（`vendor/my_vendor`）与二级 boot（2SFBL），覆盖显示、存储、定位、蓝牙、USB 等驱动的重写与调试。
+- **新硬件平台适配**：在 SiFli **SF32LB52** 上完成全新板级适配，自研 vendor 树（`vendor/HelmOne`，本仓 `helm-one/`）与二级 boot（2SFBL），覆盖显示、存储、定位、蓝牙、USB 等驱动的重写与调试。
 
 **使用到的 openvela 核心能力（大赛要求至少落地图形 / AI / 多媒体之一）：**
 
@@ -64,16 +70,17 @@
 ```text
 contest2026_048_dijiugexiaxianyue/
 ├── README.md                 # 本文件（作品说明）
+├── helm-one/                 # 作品主体：完整 vendor 树（sync 后落在 vendor/HelmOne/）
 ├── docs/
 │   ├── report/               # 技术报告（.docx 可编辑版 + .pdf 提交版）
+│   ├── photos/               # 实机照片（成品/夜间/系统状态/工厂自检）
 │   ├── ai/                   # 自定义 Skill（硬性要求）与 AI 知识沉淀
 │   │   ├── vela-helm-one.md          # 运行时 Skill（可直接拷入 /data/agent/skills/）
 │   │   ├── vela-helm-one/            # 同源 PC 侧深读知识库（references/ 4 篇）
 │   │   └── ai_native_skill.md        # 沉淀过程与维护约定
 │   └── build/                # 构建、烧录、上板与探针说明
 ├── logs/                     # AI Coding 日志
-├── board/                    # 板级适配代码（vendor 树，见「四、运行方式」）
-├── app/                      # 应用代码（如需要）
+├── board/helmone/            # 板级适配目录（与 helm-one/boards/sf32lb52/helmone 一致）
 └── openvela.xml / contest2026_048_dijiugexiaxianyue.xml   # repo manifest
 ```
 
@@ -84,58 +91,49 @@ contest2026_048_dijiugexiaxianyue/
 ### 1. 拉取工程
 
 ```bash
-repo init -u https://github.com/open-vela/contest2026_048_dijiugexiaxianyue \
+repo init -u https://github.com/jinsc123654/contest2026_048_dijiugexiaxianyue \
   -b dev-ai-contest-2026 -m contest2026_048_dijiugexiaxianyue.xml
 repo sync -c -j8
 ```
 
 同步后，本仓内容位于工作区的 `contest2026_048_dijiugexiaxianyue/`，openvela 全量源码在外层。
+（上游合入后也可直接用 `https://github.com/open-vela/contest2026_048_dijiugexiaxianyue`。）
 
-### 2. 引入自研 vendor 树
+### 2. 作品主体所在的位置
 
-本作品的主体代码是一棵**自研 vendor 树**，与官方 `vendor/sifli/` 平行：
-
-- 路径：openvela 工作区下的 `vendor/my_vendor/`
-- 源：Gitee `jinsc123654/vela_sifli`（开发期通过 `.repo/local_manifests/my_vendor.xml` 引入）
-
-`.repo/local_manifests/my_vendor.xml` 内容：
+主体代码是**随仓发布的完整 vendor 树** `helm-one/`，清单里的 `linkfile` 会把它挂到工作区的
+**`vendor/HelmOne/`** —— 板级 defconfig 的 `CONFIG_ARCH_BOARD_CUSTOM_DIR` 就是按这个路径写死的：
 
 ```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<manifest>
-  <remote name="my" fetch="https://gitee.com/jinsc123654" />
-  <project path="vendor/my_vendor" name="vela_sifli" remote="my" revision="master" />
-</manifest>
+<project path="contest2026_048_dijiugexiaxianyue" name="contest2026_048_dijiugexiaxianyue">
+  …
+  <linkfile src="helm-one" dest="vendor/HelmOne"/>
+</project>
 ```
 
-> 也可直接 `git clone` 到工作区的 `vendor/my_vendor/`，效果等价。
+> 不用 `repo`、直接 clone 本仓也可以：把 `helm-one/` 拷成工作区的 `vendor/HelmOne/` 即可（等价于上面那条 linkfile）。
 
 ### 3. 编译与烧录
 
 所有命令在 **openvela 工作区根目录**（含 `build.sh` 与 `nuttx/`）执行：
 
 ```bash
-# 日常开发：编译产品固件
-python3 vendor/my_vendor/build_board.py build
+# 一条命令：编 main + factory 固件 → 生成文件系统镜像 → 打成 SD 整盘 .img
+bash vendor/HelmOne/docs/tools/make_sd_2g.sh      # 2 GiB；4 / 8 / 16 GiB 各有一个同名脚本
 
-# 全量：main（产品）+ factory（工厂）+ 二级 boot（+ 文件系统）
-python3 vendor/my_vendor/build_board.py build-all
+# 写卡
+sudo dd if=boot_loader/bin/helmone_sd_2g.img of=/dev/sdX bs=4M status=progress conv=fsync
 
-# 打包 SD 整盘镜像（ftab + bootloader + main + factory + LFS 种子）
-python3 vendor/my_vendor/build_board.py pack-sd-img
+# 只编固件（不打整盘镜像）
+./build.sh vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/ --cmake -j8
+bash vendor/HelmOne/scripts/wrap_nuttx_image.sh cmake_out/helmone_nsh
 
-# 烧录
-python3 vendor/my_vendor/build_board.py flash              # 固件（ftab + boot + main）
-python3 vendor/my_vendor/build_board.py flash-all          # 全部条目
-python3 vendor/my_vendor/build_board.py burn-sd --sd /dev/sdX   # 整盘 SD
-
-# 串口监视（默认 1000000 波特）
-python3 vendor/my_vendor/build_board.py monitor
+# 板载固件烧写：先生成烧录清单，再用 SiFli sftool 烧（本板 BOOT_STORAGE=nand）
+python3 vendor/HelmOne/scripts/gen_flasher_args.py
 ```
 
-**选择原则**：只改代码/固件 → `build` + `flash`；改了分区表或 boot → `build-boot`（或 `build`）再 `flash`；改了文件系统内容 → `pack-sd-img` + `burn-sd`。
-
-更细的构建/烧录/上板说明见 [`docs/build/`](docs/build/)。
+更细的从零复现、字节级一致的四个要点、以及上板自检，见 [`docs/build/reproduce.md`](docs/build/reproduce.md)；
+板级结构与「为什么有一份自己的 LVGL」见 [`helm-one/README.md`](helm-one/README.md)。
 
 ### 4. 硬件
 
@@ -207,5 +205,5 @@ cp docs/ai/vela-helm-one.md /data/agent/skills/vela-helm-one.md
 
 - 作品遵循 **Apache 2.0** 开源协议。
 - 本作品**不含语音唤醒功能**，因此不涉及「你好，openvela」唤醒词。
-- 项目在开发期**未改动 openvela 上游仓库**，板级差异通过 `vendor/my_vendor/boards/sf32lb52/my_vendor/vela_override/` 抽换机制实现（共 16 个上游 `.c` 替换）；
+- 项目在开发期**未改动 openvela 上游仓库**，板级差异通过 `vendor/HelmOne/boards/sf32lb52/helmone/vela_override/` 抽换机制实现（共 16 个上游 `.c` 替换）；
   对上游的改进以补丁形式另行提交（如 zblue `id.c` 的随机地址设置、`scan.c` 空指针保护、HCI H4 接收重开的有界重试）。
