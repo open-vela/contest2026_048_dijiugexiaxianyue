@@ -12,5 +12,11 @@
     <linkfile src="app/hello_app" dest="packages/demos/contest2026_048_hello_app"/>
     <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_048_hello_quickapp"/>
     <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_048_board"/>
+
+    <!-- 作品主体：Helm One 板卡包（vendor 树）。板级 defconfig 里
+         CONFIG_ARCH_BOARD_CUSTOM_DIR / ARCH_CHIP_CUSTOM_DIR 写死的就是
+         vendor/HelmOne/... 这个路径，所以必须 link 到这里。
+         编 SD 整盘镜像：bash vendor/HelmOne/docs/tools/make_sd_2g.sh -->
+    <linkfile src="helm-one" dest="vendor/HelmOne"/>
   </project>
 </manifest>
