@@ -1,0 +1,30 @@
+.depend
+Make.dep
+*.o
+*.a
+*.d
+!**/etc/init.d/
+!**/etc/init.d/**
+*.i
+*~
+.swp
+.*.swp
+/core
+.gdbinit
+cscope.out
+
+# Packed vector map (generated: pack_map.py). Keep the directory in git.
+boards/sf32lb52/my_vendor/mkfs/fat/map/**
+!boards/sf32lb52/my_vendor/mkfs/fat/map/.gitkeep
+
+# Terrarium DEM cache used by build_vgraph.py
+docs/osm/cache/
+.mimosa/
+
+# Python 字节码缓存：跑任何工具脚本（docs/tools、scripts、build_vmap 等）都会
+# 生成/改动它，跟踪着就每次 `git status` 都脏。2026-09-19 从索引里剔掉。
+__pycache__/
+*.pyc
+
+# littlefs 构建缓存（构建时自动下载/解压）。跟踪它只会让 `git status` 常年脏。
+.cache/
