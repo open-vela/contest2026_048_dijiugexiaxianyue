@@ -1,36 +1,87 @@
-# contest2026_048_dijiugexiaxianyue
+# 低功耗离线全国矢量地图导航自行车码表（Helm One）
 
-👋 欢迎参加 **2026 首届 openvela AI 硬件开发者大赛**！
-
-这是组委会为你的队伍创建的**专属参赛仓库**（本仓为样例/模板，队伍编号 `048`；你看到的将是你自己的 `contest2026_<编号>_<队伍名>`）。比赛期间，你的全部参赛代码、打包产物与 AI Coding 日志都提交到这里。
-
-> 本仓既是「代码仓」，又内置了一键拉取整套 openvela 工程的 `repo` 清单（manifest）。你只需跟它打交道，**自始至终只动一个文件夹**。
+> 2026 首届 openvela AI 硬件开发者大赛 · 参赛队伍 **第九个下弦月**（编号 `048`）
+> 赛道：**AI 硬件产品创新** + **新硬件平台适配**
 
 ---
 
-## 一、先读这些官方文档
+## 一、作品简介
 
-**通用（所有赛道必读）：**
+**Helm One 是一台可以上路的开源骑行码表**：用 openvela + SF32LB52 做成一台完全离线、无触摸、双实体键的自行车码表，把「全国矢量路网 + 离线路径规划 + GPX 轨迹导航 + 返航」整套能力塞进一块 2.4 英寸半透半反屏里，全程不需要网络。
 
-| 文档                                                                                                                                     | 用途                                           |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| [《大赛总览》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/contest_overview.md)                        | 赛道、流程、评分、资源，建议先通读             |
-| [《参赛代码提交指南》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/code_submission_guide.md)           | 仓库获取、提交流程、时间与权限（**以此为准**） |
-| [《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md) | 如何导出 AI 对话日志并提交到 `logs/`           |
+**它解决什么问题**（骑行场景的四条真实痛点）：
 
-**按你的赛道选读（三选一）：**
+1. 车把正对太阳——电容屏反光、戴手套点不准、下雨点不准，还得低头伸手，危险；
+2. 手机支架耗电、分心，**没有信号就没有地图**；
+3. 成品码表价格高、固件闭源、生态锁死；
+4. 为了在阳光下看清，普通 IPS 必须把背光拉满，功耗高、画面还发灰。
 
-| 赛道                  | 教程导航                                                                                                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快应用 / 手表应用创新 | [快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)                         |
-| AI 硬件产品创新       | [AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)              |
-| 新硬件适配            | [新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md) |
+**核心亮点：**
+
+| 亮点 | 说明 |
+| --- | --- |
+| **双实体键无触摸交互** | 整机只有 KEY1 / KEY2（另有电源键），覆盖 7 个主页面、28 个菜单屏与完整的记录/导航状态机 |
+| **全国离线矢量地图** | 全国路网切成 3 km 网格存于 microSD，按需加载、PSRAM 缓存、软件光栅化，支持 z11–z15 |
+| **全国离线路网规划** | 堆式 Dijkstra + 跨网格 portal 拼接（读 `.vpk` 尾部 VPOR + 邻区图 BFS） |
+| **半透半反屏 + 低功耗驱动** | MIP 屏 + 重写 LCD / SD / GNSS / 蓝牙 / USB MTP 驱动 |
+| **蓝牙双角色（单射频）** | 对手机是 GATT Server，对心率/踏频/功率计是 GATT Client，可同时工作 |
+| **手机 App 只做"需要手指和网络"的事** | Flutter App 负责路线规划下发、星历注入、通知转发、OTA |
+
+**实测关键指标：**
+
+- LittleFS 挂载 **0.474 s**
+- SD 顺序读吞吐 **3.1 MB/s**（优化前约 1.0 MB/s）
+- 三座城市离线地图产物：**5 925 个分片 / 约 314 MB**
+- 自研代码规模：约 **25.7 万行**（C 386 文件 + Dart 107 文件）
 
 ---
 
-## 二、第一步：拉取完整工程
+## 二、选题方向
 
-用组委会提供的命令一键拉取「openvela 全量源码 + 你的专属仓」：
+**AI 硬件产品创新 + 新硬件平台适配**（本项目两个方向都做）：
+
+- **AI 硬件产品创新**：从产品定义出发做一台真实可用的骑行码表——无触摸双键交互、离线全国地图、低功耗形态，而不是把现成方案换个壳。
+- **新硬件平台适配**：在 SiFli **SF32LB52** 上完成全新板级适配，自研 vendor 树（`vendor/my_vendor`）与二级 boot（2SFBL），覆盖显示、存储、定位、蓝牙、USB 等驱动的重写与调试。
+
+**使用到的 openvela 核心能力（大赛要求至少落地图形 / AI / 多媒体之一）：**
+
+本作品落地的是 **【图形】** —— LVGL 9 骑行界面 + 自绘全国离线矢量地图 + FreeType 矢量字体渲染；
+同时使用了 openvela 自有（非 NuttX 内核仓库）的**蓝牙框架**与 **KVDB 框架**：
+
+| openvela 组件 | 仓库归属 | 配置证据 |
+| --- | --- | --- |
+| LVGL 图形框架 | `apps/graphics/lvgl` | `CONFIG_GRAPHICS_LVGL=y` |
+| FreeType 矢量字体 | `external/freetype` | `CONFIG_LV_USE_FREETYPE=y` |
+| 蓝牙框架 | `frameworks/connectivity/bluetooth` | `CONFIG_BLUETOOTH_FRAMEWORK=y`、`CONFIG_BLUETOOTH_SERVICE=y` |
+| zblue 主机栈 | `external/zblue` | `CONFIG_BLUETOOTH_STACK_LE_ZBLUE=y` |
+| KVDB 键值框架 | `frameworks/system/utils/kvdb` | `CONFIG_KVDB=y`、`CONFIG_KVDB_PERSIST_PATH="/mnt/kv/db"` |
+| Runtime Skill 规范 | `packages/ai_agent` | `/data/agent/skills/*.md` |
+
+---
+
+## 三、目录结构
+
+```text
+contest2026_048_dijiugexiaxianyue/
+├── README.md                 # 本文件（作品说明）
+├── docs/
+│   ├── report/               # 技术报告（.docx 可编辑版 + .pdf 提交版）
+│   ├── ai/                   # 自定义 Skill（硬性要求）与 AI 知识沉淀
+│   │   ├── vela-helm-one.md          # 运行时 Skill（可直接拷入 /data/agent/skills/）
+│   │   ├── vela-helm-one/            # 同源 PC 侧深读知识库（references/ 4 篇）
+│   │   └── ai_native_skill.md        # 沉淀过程与维护约定
+│   └── build/                # 构建、烧录、上板与探针说明
+├── logs/                     # AI Coding 日志
+├── board/                    # 板级适配代码（vendor 树，见「四、运行方式」）
+├── app/                      # 应用代码（如需要）
+└── openvela.xml / contest2026_048_dijiugexiaxianyue.xml   # repo manifest
+```
+
+---
+
+## 四、运行方式
+
+### 1. 拉取工程
 
 ```bash
 repo init -u https://github.com/open-vela/contest2026_048_dijiugexiaxianyue \
@@ -38,111 +89,123 @@ repo init -u https://github.com/open-vela/contest2026_048_dijiugexiaxianyue \
 repo sync -c -j8
 ```
 
-同步后，你的整个仓库位于工作区的 `contest2026_048_dijiugexiaxianyue/`，openvela 全量源码在外层（`nuttx/`、`apps/`、`packages/`、`vendor/` 等）。
+同步后，本仓内容位于工作区的 `contest2026_048_dijiugexiaxianyue/`，openvela 全量源码在外层。
 
----
+### 2. 引入自研 vendor 树
 
-## 三、第二步：在哪里写代码
+本作品的主体代码是一棵**自研 vendor 树**，与官方 `vendor/sifli/` 平行：
 
-**只在自己的仓目录 `contest2026_048_dijiugexiaxianyue/` 里开发。** 不同作品形态放在对应子目录，manifest 会通过 `<linkfile>` 把它们**软链**到 openvela 编译树该在的位置——你不用手动 copy：
+- 路径：openvela 工作区下的 `vendor/my_vendor/`
+- 源：Gitee `jinsc123654/vela_sifli`（开发期通过 `.repo/local_manifests/my_vendor.xml` 引入）
 
-| 作品形态 | 你的代码放这里             | 系统自动映射到                                 |
-| -------- | -------------------------- | ---------------------------------------------- |
-| 应用     | `app/hello_app/`           | `packages/demos/contest2026_048_hello_app`     |
-| 快应用   | `quickapp/hello_quickapp/` | `packages/apps/contest2026_048_hello_quickapp` |
-| 板级适配 | `board/contest_board/`     | `vendor/openvela/boards/contest2026_048_board` |
+`.repo/local_manifests/my_vendor.xml` 内容：
 
-> 用不到的形态目录可以删掉；新增作品时按同样规则加子目录，并在 `contest2026_048_dijiugexiaxianyue.xml` 里补一条 `<linkfile>` 映射即可。**生产仓库（packages/nuttx/vendor 等）零改动。**
-
-建议仓库目录约定（便于评委定位）：
-
-```text
-app/ | quickapp/ | board/   # 你的作品代码
-logs/                       # AI Coding 日志（主动导出后提交，格式见 logs/README.md）
-README.md                   # 作品说明（提交前请改成你自己的，见第六节）
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="my" fetch="https://gitee.com/jinsc123654" />
+  <project path="vendor/my_vendor" name="vela_sifli" remote="my" revision="master" />
+</manifest>
 ```
 
-> 仓内附带了一个 `.gitignore.example`，给出了**编译产物**等不需要进仓的文件示例。如需启用，`cp .gitignore.example .gitignore` 后按需增删即可。**注意 `logs/` 下最终导出的 AI Coding 日志必须提交，不要忽略。**
->
-> `logs/` 的目录结构与提交格式见 [logs/README.md](logs/README.md)。
+> 也可直接 `git clone` 到工作区的 `vendor/my_vendor/`，效果等价。
 
----
+### 3. 编译与烧录
 
-## 四、第三步：编译与运行
-
-编译/运行步骤随作品形态不同而不同，请参考你所在赛道的教程导航：
-
-- 快应用 / 手表应用：[快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)（含模拟器与开发板部署）。
-- AI 硬件产品创新：[AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)（环境搭建、编译烧录、Skill 开发）。
-- 新硬件适配：[新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md)（BSP 移植、最小 NSH 基线）。
-
-子目录已通过 manifest 中的 `<linkfile>` 软链进 openvela 编译树，因此构建在 openvela 工作区**根目录**（即你这个仓的上一级）进行。openvela 使用 `build.sh` 作为统一入口，接收一个 **board config 路径**作为参数：
+所有命令在 **openvela 工作区根目录**（含 `build.sh` 与 `nuttx/`）执行：
 
 ```bash
-# 进入 openvela 工作区根目录（你的仓的上一级）
-cd ..
+# 日常开发：编译产品固件
+python3 vendor/my_vendor/build_board.py build
 
-# 通用语法：第一个参数是 board config 路径，第二个参数可以是 menuconfig / distclean 等
-./build.sh <board-config-path> [menuconfig|distclean] [-j8]
+# 全量：main（产品）+ factory（工厂）+ 二级 boot（+ 文件系统）
+python3 vendor/my_vendor/build_board.py build-all
+
+# 打包 SD 整盘镜像（ftab + bootloader + main + factory + LFS 种子）
+python3 vendor/my_vendor/build_board.py pack-sd-img
+
+# 烧录
+python3 vendor/my_vendor/build_board.py flash              # 固件（ftab + boot + main）
+python3 vendor/my_vendor/build_board.py flash-all          # 全部条目
+python3 vendor/my_vendor/build_board.py burn-sd --sd /dev/sdX   # 整盘 SD
+
+# 串口监视（默认 1000000 波特）
+python3 vendor/my_vendor/build_board.py monitor
 ```
 
-> 具体的 board config 路径、目标产物、模拟器/真机部署方式请以你所在赛道的教程导航为准。本仓 `app/` `quickapp/` `board/` 三个示例骨架对应的 Kconfig 选项可通过 `menuconfig` 启用。
+**选择原则**：只改代码/固件 → `build` + `flash`；改了分区表或 boot → `build-boot`（或 `build`）再 `flash`；改了文件系统内容 → `pack-sd-img` + `burn-sd`。
+
+更细的构建/烧录/上板说明见 [`docs/build/`](docs/build/)。
+
+### 4. 硬件
+
+| 项 | 型号 |
+| --- | --- |
+| SoC | SiFli SF32LB52（双核，量产目标 SF32LB527UD6，16 MB PSRAM） |
+| 显示 | 2.4 英寸 NV3031A 240×320 RGB565，半透半反（MIP），**无触摸** |
+| 定位 | u-blox MAX-M10S + 外置天线 |
+| 惯导 | BMI270（IMU）、BMP388（气压计）、MMC5983（磁力计） |
+| 存储 | microSD（三卷：KV 256 MiB / LittleFS 512 MiB / FAT 余量） |
+| 输入 | KEY1、KEY2（+ 电源键） |
+| 软件 | openvela（NuttX 内核）+ LVGL 9 + FreeType |
 
 ---
-
-## 五、第四步：提交作品
-
-1. **fork** 你的专属仓 → 开发 → `git commit` 并推送 → 向专属仓发起 **Pull Request**，可**自行 review 并合入**（无需等组委会）。
-2. **AI Coding 日志**：与 AI 工具的对话会自动记录到本机 staging（不会自动上传），需你**主动导出/打包**选定会话到仓内 `logs/` 目录后一并提交。详见[《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md)。
-3. 若需改动 **nuttx 等公共仓库**，不在本仓改，而是 fork 对应公共仓、以 PR 提交到 `dev-ai-contest-2026` 分支，由组委会 review 后合入。
-
-> ⏰ **提交作品截止：9 月 20 日**。截止后统一收回 push 权限，仍可查看 / clone。
->
-> 获奖后再按要求将作品 PR 至 openvela 上游对应仓库（走标准 PR + CI 流程）。
-
-### 关于 PR 与 CLA
-
-- 本仓所有改动通过 **Pull Request** 合入（分支保护强制，可自行合入自己的 PR）。
-- 首次贡献需在[**官网签署 CLA**](https://openvela.com/#/community/cla)；PR 上会自动跑 `cla/signature` 检查，在官网签署成功后，在 PR 评论 `/check-cla` 复检即可通过。
-
----
-
-## 六、提交前：把本 README 改成你的作品说明
-
-本文件目前是组委会给的**使用说明书**。**作品提交前，请把它替换成你自己作品的说明**，方便评委快速了解你做了什么、怎么跑起来。建议至少包含以下内容：
-
-```markdown
-# <你的作品名>
-
-## 一、作品简介
-<一句话/一段话说明这个作品是什么、解决什么问题、亮点在哪>
-
-## 二、选题方向
-<快应用 / 手表应用创新 ｜ AI 硬件产品创新 ｜ 新硬件适配 ｜ 自定方向，并简述理由>
-
-## 三、目录结构
-<列出你这个仓里各目录/文件的作用，例如：>
-- `app/xxx/`        — <说明>
-- `board/xxx/`      — <说明>
-- `quickapp/xxx/`   — <说明>
-- `logs/`           — AI Coding 日志
-- `docs/` 或其他    — <说明>
-
-## 四、运行方式
-<拉取工程后，如何编译、烧录/部署、运行的完整步骤；最好能让评委照着一步步复现>
 
 ## 五、AI Coding 使用说明
-<说明本作品如何借助 AI 辅助开发：
-- 在需求拆解 / 方案设计 / 编码 / 调试 / 文档等环节如何与 AI 协作；
-- AI 对开发效率或质量带来的实际帮助。
-完整对话日志见 logs/ 目录>
+
+本作品在约三个半月内由单人完成约 25.7 万行自研代码，**AI 结对开发**是达成这一规模的关键。
+
+### 在哪些环节与 AI 协作
+
+| 环节 | AI 承担的工作 |
+| --- | --- |
+| 驱动改写 | SD、LCD、GNSS、蓝牙、USB MTP 的重写与排障 |
+| PC 端地图工具链 | OSM 解析、3 km 网格分片打包、路由图与 portal 构建 |
+| 双端协议实现 | 固件 Companion 协议 ↔ Flutter App 的同步落地 |
+| 需求与方案 | 状态机口径梳理、阈值取舍、文档一致性维护 |
+| 调试取证 | 读寄存器 / 外设状态、串口日志定位、机上探针编写 |
+
+### 三个真实案例（AI 定位根因）
+
+1. **SD 控制器死锁**：整卡假死、1 Hz 反复重识别。AI 读控制器状态与官方参考实现后，定位到控制器卡在 `CMD_BUSY`，给出**模块级 RCC 复位**方案，问题根治。
+2. **LittleFS 挂载 0.474 s**：AI 统计挂载期实际读取扇区数（10 904 → 868），定位到缓存与预读参数过大。
+3. **蓝牙双角色冲突**：AI 直接读 zblue 源码，定位到 LCPU 在已有连接时禁止设置随机地址并返回 `-EACCES`，据此产出上游补丁，实现「连手机的同时扫描传感器」。
+
+### 遇到的问题与解决方式
+
+最大的风险是 AI 会给出**看似合理但未经硬件验证**的改动。为此建立三层验证：
+
+1. **机上探针**——nsh 下 30 余条自测命令，直接读寄存器与外设状态；
+2. **串口结构化日志**——关键路径都有可检索的字段；
+3. **diag 巡检**——`ble` / `gnss` / `dvfs` / `fs` 四槽健康检查与自动重启。
+
+所有结论以**真机实测**为准。另引入钩子式代码审查在提交前检查改动，并把每次踩坑的原因与处置写入仓库文档，形成可复用的记忆。
+
+### 沉淀的自定义 Skill（硬性要求）
+
+本团队沉淀了 `vela-helm-one` —— 面向「openvela + SF32LB52 骑行整机」的板级知识与操作 Skill：
+
+- **运行时路径**：`/data/agent/skills/vela-helm-one.md`（单文件，遵循 `packages/ai_agent` 规范）
+- **源文件**：[`docs/ai/vela-helm-one.md`](docs/ai/vela-helm-one.md)
+- **内容**：权威值速查（分区/引脚/时钟/阈值/地图参数）、强制约束、故障速查表（现象 → 根因 → 处置）、机上探针清单
+- **触发场景**：板级/驱动开发、地图工程、双端协议修改、稳定性排查
+
+安装方式：
+
+```bash
+mkdir -p /data/agent/skills
+cp docs/ai/vela-helm-one.md /data/agent/skills/vela-helm-one.md
 ```
 
-> 提示：将会根据「作品本身 + 你的 README 说明 + `logs/` 里的 AI Coding 日志」来理解和评估你的作品，README 写清楚很重要。
+> 说明：openvela 的 `packages/ai_agent` 只扫描 `/data/agent/skills/` 下的**扁平 `.md` 文件**，
+> 并把每个文件的**首行标题 + 一段描述**拼进系统提示作为常驻索引，正文由助手 `read_file` 按需读取；
+> 文件名、大小与 mtime 参与哈希，改动后自动热重载。
 
 ---
 
-## 附：仓库命名规范
+## 六、注意事项
 
-`contest2026_<编号>_<队伍名>` — 编号三位零填充；队名 slug（全小写、英文/拼音、连字符）。例：`contest2026_048_dijiugexiaxianyue`。
-（仓库由组委会统一创建，**每队仅一个仓**，无需自行命名。）
+- 作品遵循 **Apache 2.0** 开源协议。
+- 本作品**不含语音唤醒功能**，因此不涉及「你好，openvela」唤醒词。
+- 项目在开发期**未改动 openvela 上游仓库**，板级差异通过 `vendor/my_vendor/boards/sf32lb52/my_vendor/vela_override/` 抽换机制实现（共 16 个上游 `.c` 替换）；
+  对上游的改进以补丁形式另行提交（如 zblue `id.c` 的随机地址设置、`scan.c` 空指针保护、HCI H4 接收重开的有界重试）。
