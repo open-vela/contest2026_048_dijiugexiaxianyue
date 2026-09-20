@@ -36,9 +36,13 @@
 
 **实机照片**（原图见 [`docs/photos/`](docs/photos/)）：
 
-| <img src="docs/photos/01-整机-骑行地图页.jpg" width="230"> | <img src="docs/photos/02-整机-系统状态页.jpg" width="230"> | <img src="docs/photos/03-夜间实拍-半透半反屏.jpg" width="230"> | <img src="docs/photos/04-样机-工厂自检页.jpg" width="230"> |
-| --- | --- | --- | --- |
-| **成品整机 · 骑行地图页**<br>离线矢量地图 + 速度/心率，双实体键 | **整机 · 系统状态页**<br>记录盘/地图盘/数据盘容量、RAM 剩余、CPU 空闲 | **夜间实拍 · 半透半反屏**<br>览山路/龙蟠大道，47.8 km/h、坡度 −5.9% | **样机 · 工厂自检页**<br>陀螺/BLE/存储 PASS，PASS 8 FAIL 1 |
+| <img src="docs/photos/01-整机-骑行地图页.jpg" width="250"> | <img src="docs/photos/02-整机-系统状态页.jpg" width="250"> | <img src="docs/photos/03-侧视-机身与底部开孔.jpg" width="250"> |
+| --- | --- | --- |
+| **正面 · 骑行地图页**<br>离线矢量地图 + 速度/心率，双实体键 | **正面 · 系统状态页**<br>记录盘/地图盘/数据盘、RAM 剩余、CPU 空闲 | **侧视 · 机身与底部**<br>机身厚度、底部开孔（测试飞线在插） |
+
+| <img src="docs/photos/04-后视-卡座与USB-C.jpg" width="250"> | <img src="docs/photos/05-夜间实拍-半透半反屏.jpg" width="250"> | <img src="docs/photos/06-样机-工厂自检页.jpg" width="250"> |
+| --- | --- | --- |
+| **后视 · 卡座与 USB-C**<br>四分之一转车把卡座、USB-C 调试口 | **夜间实拍 · 半透半反屏**<br>览山路/龙蟠大道，47.8 km/h、坡度 −5.9% | **样机 · 工厂自检页**<br>陀螺/BLE/存储 PASS，PASS 8 FAIL 1 |
 
 ---
 
