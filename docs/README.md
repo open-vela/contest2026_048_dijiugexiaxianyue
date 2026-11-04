@@ -2,12 +2,17 @@
 
 本目录是提交材料的**文档部分**。所有内容与仓库中的实现一一对应，可交叉核对。
 
-| 目录 | 内容 |
+| 目录 / 文件 | 内容 |
 | --- | --- |
 | [`report/`](report/) | **技术报告**（`.pdf` 提交版 + `.docx` 可编辑版） |
 | [`photos/`](photos/) | **实机照片**（成品整机 / 系统状态 / 夜间实拍 / 样机自检） |
 | [`ai/`](ai/) | **自定义 Skill**（大赛硬性要求）与 AI 知识沉淀 |
-| [`build/`](build/) | 构建、烧录、上板、分区、状态机口径等工程文档 |
+| [`build/`](build/) | 构建、烧录、上板、分区、状态机口径等工程文档（**提交材料版**） |
+| [`map_pipeline.md`](map_pipeline.md) | **离线矢量地图流水线单独说明**：数据分层、体积、仓里有什么/没有什么、怎么补齐、ODbL 义务 |
+
+> 更细的**工程全量文档**随作品主体发布在 [`helm-one/docs/`](../helm-one/docs/)
+> （OSM 流水线、地图渲染规范、蓝牙、引脚、启动链、diag、性能实测、上板探针工具等）。
+> `docs/build/` 是面向评审的入口整理版；两者内容一致处可直接对照。
 
 ---
 
@@ -49,9 +54,9 @@
 | `board_guide.md` | 板级适配指南：从官方 Sifli 板克隆新板、改 defconfig、改 BSP、编译验证 |
 | `sd_partition.md` | SD 卡分区布局（分区表唯一源）、三卷设计、LittleFS 窗口与溢出处置 |
 | `system_states.md` | 系统状态、按键矩阵、**阈值与上限的权威口径**、术语与降级策略 |
-| `vela_my_vendor_tools.md` | 开发期全量工具 `build_board.py` 的命令一览（该工具**未随仓发布**，仅作开发过程记录） |
+| `vela_my_vendor_tools.md` | 开发期全量工具 `build_board.py` 的命令一览（工具本体已随仓：`helm-one/build_board.py` + `helm-one/docs/tools/vela_my_vendor_tools.py`） |
 
-> **路径说明**：`build/` 下除 `reproduce.md` 外的文档是从开发树同步过来的副本，
-> 文中 `vendor/my_vendor/...` 在本仓/发布树里对应 **`vendor/HelmOne/...`**（即本仓 `helm-one/`，
-> 由清单 linkfile 挂载）。其中形如 `../xxx.md` 的相对链接指向开发树中的相邻文档，在本仓内可能无法直接跳转；
-> 文档内容本身是自包含的。日常构建请以 [`build/reproduce.md`](build/reproduce.md) 为准。
+> **路径说明**：`build/` 下的文档是从开发树同步过来的副本，文中路径已统一改写成本仓的
+> 发布树路径（`helm-one/…`，由清单 linkfile 挂到 `vendor/HelmOne/`）。相对链接也已按本仓
+> 结构校正，可直接点开；与 `helm-one/docs/` 中同名文档内容一致。日常构建请以
+> [`build/reproduce.md`](build/reproduce.md) 为准。
