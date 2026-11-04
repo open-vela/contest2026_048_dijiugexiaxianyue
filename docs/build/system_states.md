@@ -4,10 +4,10 @@
 
 | 这份文件管 | 不管（去别的文件） |
 |---|---|
-| 整机有哪些状态、进出条件、按键怎么切 | 产品卖点、受众、叙事 → [product.md](product.md) |
-| 阈值与上限（上屏 / 存储 / 交互 / 电源） | 地图运行细则 → [map/RUNTIME.md](map/RUNTIME.md) |
-| 术语与顶栏标记的中英口径 | 工厂流程与三槽细节 → [factory_firmware.md](factory_firmware.md) |
-| 某一路失效时的降级与恢复 | 功耗与频点 → [dvfs.md](dvfs.md) |
+| 整机有哪些状态、进出条件、按键怎么切 | 产品卖点、受众、叙事 → [product.md](../../helm-one/docs/product.md) |
+| 阈值与上限（上屏 / 存储 / 交互 / 电源） | 地图运行细则 → [map/RUNTIME.md](../../helm-one/docs/map/RUNTIME.md) |
+| 术语与顶栏标记的中英口径 | 工厂流程与三槽细节 → [factory_firmware.md](../../helm-one/docs/factory_firmware.md) |
+| 某一路失效时的降级与恢复 | 功耗与频点 → [dvfs.md](../../helm-one/docs/dvfs.md) |
 
 ---
 
@@ -42,7 +42,7 @@
 
 「蓝牙设备」页内：心率带 / 踏频器 / 功率计（各自的扫描·绑定·长按删除）与 **手机蓝牙** 子页
 （未配对提示配对 / 窗口内「配对中 + 倒计时」/ 已配对显示地址与链路状态）。文案与操作矩阵见
-[ble/pairing_and_radio.md](ble/pairing_and_radio.md) §1.2 与 §5。
+[ble/pairing_and_radio.md](../../helm-one/docs/ble/pairing_and_radio.md) §1.2 与 §5。
 
 ---
 
@@ -176,7 +176,7 @@ stateDiagram-v2
 
 ## 7. 演示锚点
 
-5 分钟演示脚本的每一段对应的状态（分镜与台词见 [product.md](product.md) §演示）：
+5 分钟演示脚本的每一段对应的状态（分镜与台词见 [product.md](../../helm-one/docs/product.md) §演示）：
 
 | 分镜 | 状态 | 这一屏该出现的元素 |
 |---|---|---|
