@@ -1,7 +1,7 @@
 # 从零复现：拉到源码、编出固件、烧进板子
 
 > 这一页只讲一件事：**别人拿到本参赛仓，怎么编出和作者手上一样的固件、并烧进板子**。
-> 板级细节（目录结构 / 配置职责 / LVGL 说明 / 离线构建）见 **[helm-one/README.md](../helm-one/README.md)**。
+> 板级细节（目录结构 / 配置职责 / LVGL 说明 / 离线构建）见 **[helm-one/README.md](../../helm-one/README.md)**。
 
 ---
 
@@ -9,10 +9,13 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `helm-one/` | **作品主体**：完整 vendor 树（板级 + chip 层 + 二级 boot + LVGL 覆盖层 + 构建脚本） |
+| `helm-one/` | **作品主体**：完整 vendor 树（板级 + chip 层 + 二级 boot + LVGL 覆盖层 + 构建脚本 + 工程文档 `docs/`） |
+| `companion/` | **手机端**：Flutter 伴侣 App + ESP32 踏频模拟器（不参与固件编译） |
+| `hardware/` | **自研 PCB**：EasyEDA Pro 工程 `speedometer.eprj2` |
 | `board/helmone/` | 板级适配目录（按赛方"板卡形态"约定放一份，评审可直接看板级代码；内容与 `helm-one/boards/sf32lb52/helmone/` 一致） |
+| `docs/` | 提交材料：技术报告、实机照片、AI Skill、构建说明、[地图流水线说明](../map_pipeline.md) |
 | `app/`、`quickapp/` | 赛方模板占位 |
-| `docs/` | 本页与作品文档 · `logs/` AI Coding 日志 |
+| `logs/` | AI Coding 日志 |
 
 ## 1. 拉工程（openvela 全量 + 本参赛仓）
 
@@ -85,8 +88,8 @@ openvela 自带一份 `apps/graphics/lvgl/`，本作品在 `vendor/HelmOne/apps/
 外加本板的 LCD 冲刷口（`lv_myvendor_lcd.c` / `lv_nuttx_myvendor_init.c`）——
 这些改动放在 vendor 树里才不会被 `repo sync` 冲掉。
 细节（含 Kconfig 补丁、blob 对照、完整 diff）见
-[helm-one/docs/pitch/lvgl.md](../helm-one/docs/pitch/lvgl.md) 与
-[helm-one/README.md](../helm-one/README.md)。
+[helm-one/docs/pitch/lvgl.md](../../helm-one/docs/pitch/lvgl.md) 与
+[helm-one/README.md](../../helm-one/README.md)。
 
 ## 3. 烧录
 

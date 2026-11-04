@@ -3,21 +3,21 @@
 SD/eMMC 启动时卡上的分区表、两卷 LittleFS + 一卷 FAT，以及 FAT 余量窗口的做法。
 **唯一源**是 `boot_loader/config/nsh/ptab.sdmmc.json`。改布局先改这份 JSON，再同步头文件并重新生成 `ptab_table.{c,h}`。
 
-相关：[build_guide.md](build_guide.md)、[boot_2sfbl.md](boot_2sfbl.md)、
-[factory_firmware.md](factory_firmware.md)、[fs_firmware.md](fs_firmware.md)、
-[sd_recovery.md](sd_recovery.md)、
-[tools/vela_my_vendor_tools.md](tools/vela_my_vendor_tools.md)、
-[debug/mklfs.md](debug/mklfs.md)、[debug/mtp_upload.md](debug/mtp_upload.md)、
-[nuttx_boot_flow.md](nuttx_boot_flow.md)。
+相关：[build_guide.md](../../helm-one/docs/build_guide.md)、[boot_2sfbl.md](../../helm-one/docs/boot_2sfbl.md)、
+[factory_firmware.md](../../helm-one/docs/factory_firmware.md)、[fs_firmware.md](../../helm-one/docs/fs_firmware.md)、
+[sd_recovery.md](../../helm-one/docs/sd_recovery.md)、
+[tools/vela_my_vendor_tools.md](../../helm-one/docs/tools/vela_my_vendor_tools.md)、
+[debug/mklfs.md](../../helm-one/docs/debug/mklfs.md)、[debug/mtp_upload.md](../../helm-one/docs/debug/mtp_upload.md)、
+[nuttx_boot_flow.md](../../helm-one/docs/nuttx_boot_flow.md)。
 
 日期：2026-09-03（二级 boot 槽 128 KiB → 160 KiB，从 BOOT_RESERVE 再匀 32 KiB）。
 2026-09-15：CMD17/写超时后先 CMD12+CMD13 回 TRAN，DATA 态禁止 CMD8，见 §4.5。
 2026-09-16：卡"死掉只能断电恢复"的根因找到并修掉 —— 控制器卡在 `CMD_BUSY`，
 靠**模块级 RCC 复位**救回（`HAL_RCC_ResetModule(RCC_MOD_SDMMC1)`）。
-**这一部分不在本文**，见 [sd_recovery.md](sd_recovery.md)：判死闸门、`sr=/why=` 取证、
+**这一部分不在本文**，见 [sd_recovery.md](../../helm-one/docs/sd_recovery.md)：判死闸门、`sr=/why=` 取证、
 硬复位轮询、开机挂载阶梯 rw→ro→重启、FAT-as-oracle 重挂、`ctl sd read|write`。
 另：诊断日志落盘到 `/mnt/kv/diag/`（独立于 `/mnt/kv/coredump/`），见
-[diag_log.md](diag_log.md)。
+[diag_log.md](../../helm-one/docs/diag_log.md)。
 
 ---
 
@@ -85,7 +85,7 @@ KV 与用户 LFS 都小于 4 GiB，`df` 乘法不会 32 位溢出；`/mnt/fat` �
 | 用户 FS | `/dev/sd0` | `/mnt/lfs` | GPX / 星历 / 图片；产品 MTP 只暴露 `/mnt/lfs/mtp`；工厂 MTP 全盘；BLE 文件管理器沙箱 | 普通 |
 | FAT | `/dev/mtdblock0`（FTL←`/dev/sdfat`） | `/mnt/fat` | `map/` 矢量瓦片、`fonts/` TTF。**产品只读**，**工厂读写** | 普通 |
 
-产品 MTP 根是 `/mnt/lfs/mtp`（开机 mkdir）。工厂 MTP 是 `/mnt/lfs` + `/mnt/kv` + `/mnt/fat` 三卷全盘。BLE 文件管理器仍沙箱 `/mnt/lfs`；OTA 专属路径 `fw/` 落到 `/mnt/kv/fw`。开机跳转标记是 **`/mnt/kv/db/persist.boot.target`**（msh `target` / NuttX `setprop`）。固件槽约定见 [fs_firmware.md](fs_firmware.md)。
+产品 MTP 根是 `/mnt/lfs/mtp`（开机 mkdir）。工厂 MTP 是 `/mnt/lfs` + `/mnt/kv` + `/mnt/fat` 三卷全盘。BLE 文件管理器仍沙箱 `/mnt/lfs`；OTA 专属路径 `fw/` 落到 `/mnt/kv/fw`。开机跳转标记是 **`/mnt/kv/db/persist.boot.target`**（msh `target` / NuttX `setprop`）。固件槽约定见 [fs_firmware.md](../../helm-one/docs/fs_firmware.md)。
 
 主机 `mkfs/` 对应三棵树：`kv/`、`lfs/`、`fat/`，`build-fs` 分别打 `kv_root.bin` / `fs_root.bin` / `fat_root.bin`。FAT 卷根是 `map/` + `fonts/`。
 
@@ -118,12 +118,12 @@ KV 与用户 LFS 都小于 4 GiB，`df` 乘法不会 32 位溢出；`/mnt/fat` �
 工厂固件是 `configs/nsh-factory` 变体（MTP 暴露 `/mnt/lfs`、`/mnt/kv`、`/mnt/fat` 三卷；产品只暴露 `/mnt/lfs/mtp`），构建/烧录：
 
 ```bash
-python3 vendor/my_vendor/build_board.py build-all     # main + factory + boot（+ fs）
-python3 vendor/my_vendor/build_board.py pack-sd-img   # 含 factory 槽 @ 卡偏移 5 MiB
-python3 vendor/my_vendor/build_board.py flash-factory # 也可只写 factory@0x62500000
+python3 vendor/HelmOne/build_board.py build-all     # main + factory + boot（+ fs）
+python3 vendor/HelmOne/build_board.py pack-sd-img   # 含 factory 槽 @ 卡偏移 5 MiB
+python3 vendor/HelmOne/build_board.py flash-factory # 也可只写 factory@0x62500000
 ```
 
-改工厂固件行为只需改 `configs/nsh-factory/defconfig` 再 `build-factory`（条件编译产出）。设计理由与 boot 不再做 MTP 见 [factory_firmware.md](factory_firmware.md)。
+改工厂固件行为只需改 `configs/nsh-factory/defconfig` 再 `build-factory`（条件编译产出）。设计理由与 boot 不再做 MTP 见 [factory_firmware.md](../../helm-one/docs/factory_firmware.md)。
 
 ### 2.4 不把 KV 做成 256 MiB 密集体
 
@@ -165,7 +165,7 @@ NuttX 自带 littlefs 要求 **磁盘 `block_count` == MTD `neraseblocks`**，�
 改过的文件：
 
 - `boot_loader/config/nsh/ptab.sdmmc.json`
-- `boards/sf32lb52/my_vendor/include/ptab_sdmmc.h`
+- `boards/sf32lb52/helmone/include/ptab_sdmmc.h`
 - `boot_loader/include/ptab_sdmmc.h`
 - 生成：`boards/.../bsp/ptab_table.c`、`include/ptab_table.h`（app）
 - 生成：`boot_loader/project/butterflmicro/board/ptab_table.{c,h}`（二级 boot）
@@ -198,7 +198,7 @@ KV 空白切片仍 `autoformat`。用户 LFS **从不** autoformat。
 
 ### 4.3 几何
 
-SD 对 LittleFS 报 **page 512 / erase 4096**（不是 NAND 的 2048/128KiB）。原因见 [debug/mklfs.md](debug/mklfs.md)。FAT 经 FTL 看到同样的 512 B 扇区。
+SD 对 LittleFS 报 **page 512 / erase 4096**（不是 NAND 的 2048/128KiB）。原因见 [debug/mklfs.md](../../helm-one/docs/debug/mklfs.md)。FAT 经 FTL 看到同样的 512 B 扇区。
 
 ### 4.4 新镜像第一次 `mkdir` 与 IWDT
 
@@ -236,7 +236,7 @@ LittleFS / FAT 一次 `CMD17` 超时，卡往往还停在 **DATA**。旧逻辑�
 5. 只有 R1 已经是 **IDLE**（`-ENOTCONN`）才允许 CMD0/CMD8。
 
 `sd1_reinit_card()` 1 秒内最多尝试一次全量识别。细节与日志见
-[debug/mklfs.md](debug/mklfs.md) 2026-09-15 补记。
+[debug/mklfs.md](../../helm-one/docs/debug/mklfs.md) 2026-09-15 补记。
 
 ---
 
@@ -247,8 +247,8 @@ NuttX 上游 `fs_procfs_mount.c` 用 `uint32_t` 做 `f_bsize * f_blocks`。
 
 处理方式与 `vela_override/bluetooth/` 相同：CMake 从 lib `fs` 去掉上游 `.c`，改用板级文件：
 
-- `boards/sf32lb52/my_vendor/vela_override/fs/fs_procfs_mount.c` — `uint64` 乘法
-- `boards/sf32lb52/my_vendor/vela_override/CMakeLists.txt` — `myvendor_patch_target_by_name(fs, …)`
+- `boards/sf32lb52/helmone/vela_override/fs/fs_procfs_mount.c` — `uint64` 乘法
+- `boards/sf32lb52/helmone/vela_override/CMakeLists.txt` — `myvendor_patch_target_by_name(fs, …)`
 
 配置日志应有：`my_vendor: fs uses board fs_procfs_mount.c`。
 
@@ -261,8 +261,8 @@ NuttX 上游 `fs_procfs_mount.c` 用 `uint32_t` 做 `f_bsize * f_blocks`。
 ## 6. 主机打包与烧卡
 
 ```bash
-python3 vendor/my_vendor/build_board.py pack-sd-img
-python3 vendor/my_vendor/build_board.py burn-sd --sd /dev/sdX
+python3 vendor/HelmOne/build_board.py pack-sd-img
+python3 vendor/HelmOne/build_board.py burn-sd --sd /dev/sdX
 ```
 
 | 步骤 | 行为 |
@@ -287,18 +287,18 @@ LittleFS 主机工具版本：**v2.5.1**（与设备端一致）。
 
 ```bash
 # app
-python3 vendor/my_vendor/boot_loader/scripts/gen_ptab_table.py \
-  --ptab vendor/my_vendor/boot_loader/config/nsh/ptab.sdmmc.json \
+python3 vendor/HelmOne/boot_loader/scripts/gen_ptab_table.py \
+  --ptab vendor/HelmOne/boot_loader/config/nsh/ptab.sdmmc.json \
   --storage sd \
-  --out-c vendor/my_vendor/boards/sf32lb52/my_vendor/bsp/ptab_table.c \
-  --out-h vendor/my_vendor/boards/sf32lb52/my_vendor/include/ptab_table.h
+  --out-c vendor/HelmOne/boards/sf32lb52/helmone/bsp/ptab_table.c \
+  --out-h vendor/HelmOne/boards/sf32lb52/helmone/include/ptab_table.h
 
 # 二级 boot（build-boot 也会跑）
-python3 vendor/my_vendor/boot_loader/scripts/gen_ptab_table.py \
-  --ptab vendor/my_vendor/boot_loader/config/nsh/ptab.sdmmc.json \
+python3 vendor/HelmOne/boot_loader/scripts/gen_ptab_table.py \
+  --ptab vendor/HelmOne/boot_loader/config/nsh/ptab.sdmmc.json \
   --storage sd \
-  --out-c vendor/my_vendor/boot_loader/project/butterflmicro/board/ptab_table.c \
-  --out-h vendor/my_vendor/boot_loader/project/butterflmicro/board/ptab_table.h
+  --out-c vendor/HelmOne/boot_loader/project/butterflmicro/board/ptab_table.c \
+  --out-h vendor/HelmOne/boot_loader/project/butterflmicro/board/ptab_table.h
 ```
 
 `build` 会经 `sync_ptab_table()` 刷新 app 侧；`boot_loader/build.sh` 刷新 boot 侧。NSH `ptab` 打印的是这张编译进去的表。

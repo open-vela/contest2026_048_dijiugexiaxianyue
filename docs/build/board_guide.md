@@ -22,7 +22,7 @@ git clone https://gitee.com/jinsc123654/vela_sifli.git
 
 ## 2. 修改 repo manifest
 
-**作用：** 告诉 repo 从 Gitee **拉取** `vela_sifli` 到本地 `vendor/my_vendor/`。
+**作用：** 告诉 repo 从 Gitee **拉取** `vela_sifli` 到本地 `vendor/HelmOne/`。
 
 `local_manifests` **默认不存在**，需要你自己建。它是 repo 留给用户的可选目录，官方 manifest 不会自动生成。
 
@@ -39,7 +39,7 @@ mkdir -p .repo/local_manifests
   <remote name="my"
           fetch="https://gitee.com/jinsc123654" />
 
-  <project path="vendor/my_vendor"
+  <project path="vendor/HelmOne"
            name="vela_sifli"
            remote="my"
            revision="master" />
@@ -56,7 +56,7 @@ SSH 示例：`fetch="git@gitee.com:jinsc123654"`
 | `<manifest>` | — | 根节点，包裹下面所有配置 |
 | `<remote name="my">` | `my` | remote 的别名，下面 `<project remote="my">` 引用它；可改成任意名字（如 `gitee`） |
 | `<remote fetch="...">` | `https://gitee.com/jinsc123654` | Git 服务器地址 + 用户名/组织名；**不含仓库名**。repo 会拼成 `fetch/name.git` |
-| `<project path="...">` | `vendor/my_vendor` | 同步到 OpenVela 工程里的**本地目录**；与官方 `vendor/sifli` 同级 |
+| `<project path="...">` | `vendor/HelmOne` | 同步到 OpenVela 工程里的**本地目录**；与官方 `vendor/sifli` 同级 |
 | `<project name="...">` | `vela_sifli` | Gitee 上的**仓库名**；完整 URL 为 `fetch/vela_sifli.git` |
 | `<project remote="...">` | `my` | 指定从哪个 `<remote>` 拉代码；必须与 `<remote name="...">` **同名**。`my` 只是别名，可改成 `gitee` 等 |
 | `<project revision="...">` | `master` | 拉取的分支或 tag；**须与 Gitee 远端实际分支一致**（Gitee 默认多为 `master`，不是 `main`） |
@@ -73,7 +73,7 @@ SSH 示例：`fetch="git@gitee.com:jinsc123654"`
 等价于手动执行：
 
 ```bash
-git clone https://gitee.com/jinsc123654/vela_sifli.git vendor/my_vendor
+git clone https://gitee.com/jinsc123654/vela_sifli.git vendor/HelmOne
 ```
 
 只有一个 Gitee 时用一个 remote 即可；多个服务器时可定义多个 `<remote>`，各 project 用 `remote="..."` 分别指定。
@@ -83,7 +83,7 @@ git clone https://gitee.com/jinsc123654/vela_sifli.git vendor/my_vendor
 ```xml
 <remote name="my" fetch="https://gitee.com/jinsc123654" />
 
-<project path="vendor/my_vendor"  name="vela_sifli"  remote="my" revision="master" />
+<project path="vendor/HelmOne"  name="vela_sifli"  remote="my" revision="master" />
 <project path="vendor/my_board2" name="vela_board2" remote="my" revision="master" />
 ```
 
@@ -100,7 +100,7 @@ https://gitee.com/jinsc123654/vela_sifli.git
 
 ```
 .repo/local_manifests/my_vendor.xml   ← 文件名随意，repo 会读取该目录下所有 .xml
-vendor/my_vendor/                     ← path（本地放哪）
+vendor/HelmOne/                     ← path（本地放哪）
 gitee.com/jinsc123654/vela_sifli      ← fetch + name（从哪拉）
 master                                ← revision（Gitee 默认分支）
 ```
@@ -115,14 +115,14 @@ master                                ← revision（Gitee 默认分支）
 
 ## 3. repo 同步
 
-**作用：** 从 Gitee 下载远端仓库到 `vendor/my_vendor/`。
+**作用：** 从 Gitee 下载远端仓库到 `vendor/HelmOne/`。
 
 ```bash
 # OpenVela 根目录
-repo sync vendor/my_vendor
+repo sync vendor/HelmOne
 ```
 
-`repo sync` 整棵 OpenVela 后，NuttX / apps / zblue 会回到上游干净树。SD 启动在 vendor 里即可；**手机广播 + 扫传感器同时开**还要改 zblue `id.c`，**本板 LVGL 栈**还要改官方 `apps/graphics/lvgl` 构建脚本。改法和可覆盖文件见 [pitch/README.md](pitch/README.md)，原因见 [required_patches.md](required_patches.md)。
+`repo sync` 整棵 OpenVela 后，NuttX / apps / zblue 会回到上游干净树。SD 启动在 vendor 里即可；**手机广播 + 扫传感器同时开**还要改 zblue `id.c`，**本板 LVGL 栈**还要改官方 `apps/graphics/lvgl` 构建脚本。改法和可覆盖文件见 [pitch/README.md](../../helm-one/docs/pitch/README.md)，原因见 [required_patches.md](../../helm-one/docs/required_patches.md)。
 
 ---
 
@@ -135,35 +135,35 @@ repo sync vendor/my_vendor
 **build.sh（推荐）：**
 
 ```bash
-./build.sh vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/ --cmake -j16
+./build.sh vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/ --cmake -j16
 ```
 
-固件：`cmake_out/my_vendor_nsh/nuttx.bin`
+固件：`cmake_out/helmone_nsh/nuttx.bin`
 
 **menuconfig / savedefconfig：**
 
 ```bash
-./build.sh vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/ --cmake menuconfig
-./build.sh vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/ --cmake savedefconfig
+./build.sh vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/ --cmake menuconfig
+./build.sh vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/ --cmake savedefconfig
 ```
 
 **清除重编：**
 
 ```bash
-rm -rf cmake_out/my_vendor_nsh
+rm -rf cmake_out/helmone_nsh
 rm -f nuttx/.config nuttx/.config.old nuttx/.version
-./build.sh vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/ --cmake -j16
+./build.sh vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/ --cmake -j16
 ```
 
 **cmake 直接构建（CLion 同款）：**
 
 ```bash
-cmake -B cmake_out/my_vendor_nsh -S nuttx -GNinja \
-  -DBOARD_CONFIG=../vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/ \
+cmake -B cmake_out/helmone_nsh -S nuttx -GNinja \
+  -DBOARD_CONFIG=../vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/ \
   -DCUSTOM_MODULE_PATH=$PWD/build/cmake \
   -DEXTRA_FLAGS="-Wno-cpp -Wno-deprecated-declarations"
 
-cmake --build cmake_out/my_vendor_nsh -j16
+cmake --build cmake_out/helmone_nsh -j16
 ```
 
 ### 4.2 官方 sifli 参考构建（对照用）
@@ -187,10 +187,10 @@ cmake --build cmake_out/sf32lb52_devkit_lcd_nsh -j16
 
 | | my_vendor | 官方 sifli |
 |--|-----------|------------|
-| build.sh 路径 | `vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/` | `vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/configs/nsh/` |
-| 输出目录 | `cmake_out/my_vendor_nsh/` | `cmake_out/sf32lb52_devkit_lcd_nsh/` |
+| build.sh 路径 | `vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/` | `vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/configs/nsh/` |
+| 输出目录 | `cmake_out/helmone_nsh/` | `cmake_out/sf32lb52_devkit_lcd_nsh/` |
 
-> 可选：`python3 vendor/my_vendor/build_board.py build` 是对上述 build.sh 的封装，命令说明见 [tools/vela_my_vendor_tools.md](tools/vela_my_vendor_tools.md)。
+> 可选：`python3 vendor/HelmOne/build_board.py build` 是对上述 build.sh 的封装，命令说明见 [tools/vela_my_vendor_tools.md](../../helm-one/docs/tools/vela_my_vendor_tools.md)。
 
 编译报错 `rc.sysinit missing` 见第 5 节；输出目录命名见第 6 节。
 
@@ -225,14 +225,14 @@ CMake 列表里写了的路径**必须存在**，否则 ninja 报 `rc.sysinit mi
 
 ```bash
 cp -r vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/src/etc/init.d \
-      vendor/my_vendor/boards/sf32lb52/my_vendor/bsp/etc/
+      vendor/HelmOne/boards/sf32lb52/helmone/bsp/etc/
 ```
 
 开机自动执行命令：编辑 `rcS` / `rc.sysinit` 写入 NSH 命令（如 `echo rcS start`）；新增文件需在 `CMakeLists.txt` 的 `RCRAWS` 中登记。上电应先后看到 `rc.sysinit start`、`rcS start`，再出现 `nsh>`。
 
-**ROMFS、`RCSRCS`/`RCRAWS`、builtin、踩坑排查** 见 [nuttx_boot_flow.md](nuttx_boot_flow.md)（建议从目录 **第 3 节「隐性资源注册」** 读起；Shell/rcS 见第 4 节）。
+**ROMFS、`RCSRCS`/`RCRAWS`、builtin、踩坑排查** 见 [nuttx_boot_flow.md](../../helm-one/docs/nuttx_boot_flow.md)（建议从目录 **第 3 节「隐性资源注册」** 读起；Shell/rcS 见第 4 节）。
 
-**板级 `test_app`**：默认在 `sf32lb52_devkit_lcd_bringup()` 末尾异步 `task_spawn`（`launch=board`，保留 `nsh_main`）；添加步骤、rcS/代码启动等见 [test_app_guide.md](test_app_guide.md) **第 4 节**。
+**板级 `test_app`**：默认在 `sf32lb52_devkit_lcd_bringup()` 末尾异步 `task_spawn`（`launch=board`，保留 `nsh_main`）；添加步骤、rcS/代码启动等见 [test_app_guide.md](../../helm-one/docs/test_app_guide.md) **第 4 节**。
 
 ---
 
@@ -252,16 +252,16 @@ cmake_out/
 | 构建 | 板目录 | 输出目录 |
 |------|--------|----------|
 | 官方 sifli | `vendor/sifli/.../sf32lb52_devkit_lcd` | `cmake_out/sf32lb52_devkit_lcd_nsh/` |
-| my_vendor | `vendor/my_vendor/.../my_vendor` | `cmake_out/my_vendor_nsh/` |
+| my_vendor | `vendor/HelmOne/.../my_vendor` | `cmake_out/helmone_nsh/` |
 
-板路径：`vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/`
+板路径：`vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/`
 
 **CLion**（Build directory 与官方用法相同，只是路径不同）：
 
 ```
--B cmake_out/my_vendor_nsh
+-B cmake_out/helmone_nsh
 -S nuttx
--DBOARD_CONFIG=../vendor/my_vendor/boards/sf32lb52/my_vendor/configs/nsh/
+-DBOARD_CONFIG=../vendor/HelmOne/boards/sf32lb52/helmone/configs/nsh/
 -DCUSTOM_MODULE_PATH=<openvela>/build/cmake
 -DEXTRA_FLAGS=-Wno-cpp -Wno-deprecated-declarations
 -GNinja
@@ -284,12 +284,12 @@ cmake_out/
 - 外设启用组合不同（无 SPI、换 I2C 口等）
 
 对照参考：`vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/`（只读）  
-在你仓库里改：`vendor/my_vendor/boards/sf32lb52/my_vendor/`（或克隆出的新板目录）
+在你仓库里改：`vendor/HelmOne/boards/sf32lb52/helmone/`（或克隆出的新板目录）
 
 ### 7.2 克隆新板目录
 
 ```bash
-cd vendor/my_vendor/boards/sf32lb52
+cd vendor/HelmOne/boards/sf32lb52
 cp -r my_vendor my_board
 ```
 
@@ -298,8 +298,8 @@ cp -r my_vendor my_board
 编辑 `my_board/configs/nsh/defconfig`：
 
 ```kconfig
-CONFIG_ARCH_BOARD_CUSTOM_DIR="../vendor/my_vendor/boards/sf32lb52/my_board"
-CONFIG_ARCH_CHIP_CUSTOM_DIR="../vendor/my_vendor/chips/sf32lb52"
+CONFIG_ARCH_BOARD_CUSTOM_DIR="../vendor/HelmOne/boards/sf32lb52/my_board"
+CONFIG_ARCH_CHIP_CUSTOM_DIR="../vendor/HelmOne/chips/sf32lb52"
 ```
 
 外设开关也在此文件，例如 UART / I2C / LCD / 触摸：
@@ -315,8 +315,8 @@ CONFIG_LCD_USING_CO5300=y
 可用 build.sh menuconfig 图形修改，再 savedefconfig 写回：
 
 ```bash
-./build.sh vendor/my_vendor/boards/sf32lb52/my_board/configs/nsh/ --cmake menuconfig
-./build.sh vendor/my_vendor/boards/sf32lb52/my_board/configs/nsh/ --cmake savedefconfig
+./build.sh vendor/HelmOne/boards/sf32lb52/my_board/configs/nsh/ --cmake menuconfig
+./build.sh vendor/HelmOne/boards/sf32lb52/my_board/configs/nsh/ --cmake savedefconfig
 ```
 
 **⚠ 直接编辑 defconfig 在增量构建里是不生效的。** CMake 只在 defconfig 的
@@ -328,10 +328,10 @@ CONFIG_LCD_USING_CO5300=y
 改完必须强制重新配置，并且**grep 生成的 `.config` 确认值真的落地**：
 
 ```bash
-rm -f cmake_out/my_vendor_nsh/.config cmake_out/my_vendor_nsh/.config.orig
+rm -f cmake_out/helmone_nsh/.config cmake_out/helmone_nsh/.config.orig
 touch nuttx/CMakeLists.txt          # 让 ninja/cmake 重跑 configure
 python3 vela_my_vendor_tools.py build
-grep -n '<CONFIG_NAME>' cmake_out/my_vendor_nsh/.config
+grep -n '<CONFIG_NAME>' cmake_out/helmone_nsh/.config
 ```
 
 `clean` 没用（它刻意保留 `.config`）；`fullclean` / `distclean` 也行但要全量重编。
@@ -344,6 +344,40 @@ grep -n '<CONFIG_NAME>' cmake_out/my_vendor_nsh/.config
 > （报 `Cannot find source file: …/myvendor_zblue/hci_core.c` 之类），
 > 极端情况下整个 `cmake_out/<cfg>/` 会被清掉、只能全量重编。
 > 恢复办法就是再 `touch` 同一个文件把时间戳拉回当下。
+
+### 7.3.1 两条已经踩过的配置经验
+
+**① 更省事的重配置入口：树内自带的 `resetconfig` 目标。** 它就是"把 defconfig 拷成
+`.config` 再跑 `olddefconfig`"（`nuttx/cmake/menuconfig.cmake` 里定义）：
+
+```bash
+cmake --build cmake_out/helmone_nsh --target resetconfig
+# 或： ninja -C cmake_out/helmone_nsh resetconfig
+```
+
+代价是会按 defconfig **重刷** `.config`（用 menuconfig 手工加的项会丢），所以适合
+"defconfig 是唯一真源"的用法。无论走哪条路，都要记住：`include/nuttx/config.h` 与
+`apps/builtin/builtin_list.h` 都是 **configure 期**产物 —— 只改 `.config`（哪怕改对了）
+它们也不会更新，必须有一步真正的 configure 重跑（`touch` 任一 `CMakeLists.txt`
+或 `resetconfig`）。验证方式：`ninja -n` 应打印 `Re-running CMake…`。
+
+**② LVGL 要求"可用栈"≥ 32768（开了 freetype/thorvg 时）。** 不够就会在开机打
+`[LVGL][Error] check_stack_size: Stack size is too small`（`lv_nuttx_entry.c`）。
+关键是**配置值 ≠ 可用值**：`lv_nuttx_init()` 用 `pthread_get_stacksize_np()` 取
+`adj_stack_size`，而 NuttX 启动任务时会用 `up_stack_frame()` 从栈顶切走两块 ——
+argv 块（`sched/task/task_setup.c`）与 TLS 块（`sched/tls/tls_initinfo.c`）。
+本板实测 `bicycle` 少 **96 B**（argv 16 + TLS 76→80），所以：
+
+| 配置值 | 可用值 | 结果 |
+| --- | --- | --- |
+| 32768 | 32672 | 差 96 B，开机 ERROR |
+| **34816**（现行） | 34720 | 通过，余量 ~1.9 KB |
+
+UI 线程只有一个创建点：`bsp/bringup.c` 的静态栈 `g_bicycle_stack[]`（`task_spawn` +
+`posix_spawnattr_setstackaddr`），所以 `CONFIG_MYVENDOR_BICYCLE_STACKSIZE` 一处配置
+同时决定它和 `builtin_list.h` 里 `bicycle` 的 STACKSIZE；这块栈在 **SRAM** `.bss`
+（不是 PSRAM 池），调大要算 SRAM 余量（`nuttx.map` 的 `_ebss` 距 `sram` 区尾）。
+现场复核：`nsh> ps` 的 STACK 列 = 34720、开机日志里 `check_stack_size` 那行同值。
 
 ### 7.4 修改 BSP 源文件
 
@@ -379,21 +413,21 @@ grep -n '<CONFIG_NAME>' cmake_out/my_vendor_nsh/.config
 改 `vela_my_vendor_tools.py` 中的 `BOARD_CONFIG`（若用封装脚本），或直接用 build.sh 路径：
 
 ```bash
-./build.sh vendor/my_vendor/boards/sf32lb52/my_board/configs/nsh/ --cmake -j16
+./build.sh vendor/HelmOne/boards/sf32lb52/my_board/configs/nsh/ --cmake -j16
 ```
 
 ### 7.6 编译验证
 
 ```bash
-./build.sh vendor/my_vendor/boards/sf32lb52/my_board/configs/nsh/ --cmake -j16
+./build.sh vendor/HelmOne/boards/sf32lb52/my_board/configs/nsh/ --cmake -j16
 ```
 
 diff 官方 DevKit：
 
 ```bash
 diff -ru vendor/sifli/boards/sf32lb52/sf32lb52_devkit_lcd/src/ \
-         vendor/my_vendor/boards/sf32lb52/my_board/src/
+         vendor/HelmOne/boards/sf32lb52/my_board/src/
 ```
 
-改完 push 到 Gitee：`vendor/my_vendor` 仓库提交板级改动。  
+改完 push 到 Gitee：`vendor/HelmOne` 仓库提交板级改动。  
 `vendor/sifli/` 保持官方原样，仅作参考。
