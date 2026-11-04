@@ -5,6 +5,7 @@
 
 #include "vmap_label.h"
 
+#include "myvendor_system_font.h"
 #include "vmap_alloc.h"
 #include "vmap_format.h"
 #include "vmap_style.h"
@@ -18,6 +19,71 @@
 #define VMAP_ROAD_LABEL_SPACING_MIN_Y 64
 #define VMAP_ROAD_LABEL_MAX_PER_WAY 8
 #define VMAP_LABEL_PAD              1
+
+/*
+ * 字号（STYLE.md §4）：地名 12.5 / 水名 10.5 / 路名 9.5~9.0 / POI 9.5。
+ *
+ * 设备侧的限制：`myvendor_system_font_get()` 只有 **6 个全局缓存槽**、整数 px，
+ * 而界面本身已占 14 / 15 / 16 / 22 四档 ⇒ 只能再要一档 **12**。于是：
+ *   地名 = 调用方传进来的地图字体（16px；§4 地名:路名 ≈ 12.5:9.5 ≈ 16:12）；
+ *   水名 / POI / 路名 = 12px。
+ * 水名的斜体拿不到（`myvendor_system_font_get()` 只给 NORMAL 字形），按常规体画。
+ */
+#define VMAP_LABEL_ROAD_PX          12
+
+/** @brief 一类标签的字体（按 STYLE.md §4 的表，不写死在调用处）。 */
+typedef struct {
+    const lv_font_t * place;
+    const lv_font_t * water;
+    const lv_font_t * poi;
+    const lv_font_t * road;
+} vmap_label_fonts_t;
+
+static const lv_font_t * label_font_px(int32_t px, const lv_font_t * fallback)
+{
+    /* 字体对象在 slot 里活到进程结束（没有 reset），取一次缓存住即可；
+     * 每帧都调 myvendor_system_font_get() 会把它的 refs 一直加上去。 */
+    static const lv_font_t * s_cached;
+    static int32_t s_cached_px;
+    static bool s_tried;
+
+    if (!s_tried || s_cached_px != px) {
+        s_cached = myvendor_system_font_get(px);
+        s_cached_px = px;
+        s_tried = true;
+    }
+
+    return s_cached ? s_cached : fallback;
+}
+
+static void label_fonts_init(vmap_label_fonts_t * fonts, const lv_font_t * map_font)
+{
+    fonts->place = map_font;
+    fonts->water = label_font_px(VMAP_LABEL_ROAD_PX, map_font);
+    fonts->poi = fonts->water;
+    fonts->road = fonts->water;
+}
+
+static const lv_font_t * label_font_for(const vmap_label_fonts_t * fonts, uint8_t kind)
+{
+    switch (kind) {
+    case VMAP_LABEL_PLACE:
+        return fonts->place;
+    case VMAP_LABEL_WATER:
+        return fonts->water;
+    case VMAP_LABEL_POI:
+        return fonts->poi;
+    default:
+        return fonts->road;
+    }
+}
+
+/** @brief 描边宽度（STYLE.md §4：地名 4px、其余 3px 是按 9~12px 字模的比例；
+ *  设备 16px 地名用 2px、12px 其余用 1px，再宽会把字糊死）。 */
+static lv_coord_t label_halo_width(uint8_t kind)
+{
+    return kind == VMAP_LABEL_PLACE ? 2 : 1;
+}
 
 typedef struct {
     int32_t road_idx[VMAP_LABEL_CAP];
@@ -60,15 +126,44 @@ static int32_t other_label_score(uint8_t kind, uint8_t prio,
     int32_t x, int32_t y, int32_t fx, int32_t fy, double scale)
 {
     int32_t score = (int32_t)prio;
+
+    /* STYLE.md §4 的优先级列：地名 +90、水名 +40、POI 最低（+0）。 */
     if (kind == VMAP_LABEL_PLACE) {
-        score += 20;
-    } else if (kind == VMAP_LABEL_POI) {
-        score += 5;
+        score += 90;
     } else if (kind == VMAP_LABEL_WATER) {
-        score -= 50;
+        score += 40;
     }
     score -= label_dist2_norm(x, y, fx, fy, scale) / 2000;
     return score;
+}
+
+/** @brief 同名标签是否已经烘进 retained 画布**且此刻在视口内**（在画布外不算）。 */
+static bool label_name_retained(const vmap_label_collector_t * col, uint8_t kind,
+    const char * name, int32_t retained_n,
+    int32_t vx0, int32_t vy0, int32_t vx1, int32_t vy1)
+{
+    int32_t j;
+
+    if (!col || !col->retained || !name) {
+        return false;
+    }
+
+    for (j = 0; j < retained_n; j++) {
+        const lv_area_t * rb;
+
+        if (col->retained[j].kind != kind
+            || lv_strcmp(col->retained[j].name, name) != 0) {
+            continue;
+        }
+        rb = &col->retained[j].box;
+        /* 用**视口**判，不是画布：画布带 margin，屏外的 retained 标签
+         * 不该压制屏内的同名标签（Codex 审查 [5]）。 */
+        if (rb->x2 >= vx0 && rb->x1 <= vx1 && rb->y2 >= vy0 && rb->y1 <= vy1) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static bool boxes_overlap(const lv_area_t * a, const lv_area_t * b,
@@ -305,6 +400,9 @@ static bool push_label(vmap_label_collector_t * col, int32_t sx, int32_t sy,
     c->kind = kind;
     c->prio = prio;
     c->road_vertical = road_vertical;
+    /* 点标签（地名/水名/POI）不沿路：屏幕方向按水平处理。 */
+    c->dir_x = 1.0f;
+    c->dir_y = 0.0f;
     copy_label_name(c, text, len);
     col->count++;
     return true;
@@ -410,10 +508,24 @@ static int32_t road_name_near_index(const vmap_label_collector_t * col,
 }
 
 static bool road_push_label(road_collect_ctx_t * ctx, int32_t sx, int32_t sy,
-    int32_t seg_dx, int32_t seg_dy)
+    int32_t seg_dx, int32_t seg_dy, bool dir_ok)
 {
     int32_t near_idx;
     uint8_t vertical;
+    float dir_x = 0.0f;
+    float dir_y = 0.0f;
+
+    if (dir_ok) {
+        const float fx = (float)seg_dx;
+        const float fy = (float)seg_dy;
+        const float len = sqrtf(fx * fx + fy * fy);
+
+        if (len > 0.5f) {
+            dir_x = fx / len;
+            dir_y = fy / len;
+        }
+        /* 方向退化（两端点重合/bbox 兜底）→ (0,0)：航向朝上回退横排。 */
+    }
 
     if (ctx->placed >= VMAP_ROAD_LABEL_MAX_PER_WAY) {
         return false;
@@ -443,6 +555,8 @@ static bool road_push_label(road_collect_ctx_t * ctx, int32_t sx, int32_t sy,
             old->y = sy;
             old->prio = road_prio_from_attr(ctx->road_attr);
             old->road_vertical = vertical;
+            old->dir_x = dir_x;
+            old->dir_y = dir_y;
         }
         return false;
     }
@@ -457,6 +571,8 @@ static bool road_push_label(road_collect_ctx_t * ctx, int32_t sx, int32_t sy,
         c->kind = VMAP_LABEL_ROAD;
         c->prio = road_prio_from_attr(ctx->road_attr);
         c->road_vertical = vertical;
+        c->dir_x = dir_x;
+        c->dir_y = dir_y;
         copy_label_name(c, ctx->name_text, ctx->name_len);
         ctx->col->count++;
     }
@@ -492,6 +608,10 @@ static void collect_road_labels(vmap_label_collector_t * col,
         uint16_t i;
 
         if (col->count >= col->cap || !vmap_feature_has_name(&f) || f.point_count < 2) {
+            continue;
+        }
+        /* STYLE.md §4 规则 5：几何不可见的路不出名字，否则会有"有路名没路"的鬼影。 */
+        if (!vmap_style_road_visible(f.attr, scale)) {
             continue;
         }
 
@@ -586,7 +706,7 @@ static void collect_road_labels(vmap_label_collector_t * col,
                 {
                     int32_t sx = (int32_t)lround(x0 + dx * (pos / seg_len));
                     int32_t sy = (int32_t)lround(y0 + dy * (pos / seg_len));
-                    road_push_label(&ctx, sx, sy, (int32_t)dx, (int32_t)dy);
+                    road_push_label(&ctx, sx, sy, (int32_t)dx, (int32_t)dy, true);
                 }
             }
         }
@@ -608,16 +728,17 @@ static void collect_road_labels(vmap_label_collector_t * col,
             }
             if (!dup_near) {
                 road_push_label(&ctx, ctx.near_x, ctx.near_y,
-                    ctx.near_seg_dx, ctx.near_seg_dy);
+                    ctx.near_seg_dx, ctx.near_seg_dy, true);
             }
         }
 
         if (ctx.placed == 0) {
+            /* bbox 兜底：跨度不是真实道路切向，方向按未知处理（回退横排）。 */
             road_push_label(&ctx,
                 (ctx.vis_min_x + ctx.vis_max_x) / 2,
                 (ctx.vis_min_y + ctx.vis_max_y) / 2,
                 ctx.vis_max_x - ctx.vis_min_x,
-                ctx.vis_max_y - ctx.vis_min_y);
+                ctx.vis_max_y - ctx.vis_min_y, false);
         }
     }
 }
@@ -868,6 +989,101 @@ void vmap_label_collector_add_tile(vmap_label_collector_t * col,
     collect_road_labels(col, tile, base_x, base_y, scale);
 }
 
+/** 放置阶段的记账状态（见 label_place_candidate()）。 */
+typedef struct {
+    vmap_label_collector_t * col;
+    lv_area_t * placed;
+    int32_t * final_idx;
+    char (*layout_buf)[64];
+    int32_t retained_n;
+    int32_t vis_x0;
+    int32_t vis_y0;
+    int32_t vis_x1;
+    int32_t vis_y1;
+    int32_t selected_count;
+    int32_t collision_count;
+} label_place_state_t;
+
+/**
+ * @brief 这个候选的名字是否已经放下过（同一帧内）。
+ *
+ * "同名一屏只出一个"的判定放在**放置成功之后**：候选被碰撞/出界挡掉时不记账，
+ * 后面的同名锚点仍可顶上（Codex 审查 [5]）。
+ */
+static bool label_name_selected(const label_place_state_t * st, int32_t idx)
+{
+    const char * name = st->col->items[idx].name;
+    int32_t k;
+
+    if (name == NULL) {
+        return false;
+    }
+    for (k = 0; k < st->selected_count; k++) {
+        const char * other = st->col->items[st->final_idx[k]].name;
+
+        if (other != NULL && lv_strcmp(other, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief 放置一个已选中的候选：量字、夹回画布、碰撞；放下就记账。
+ * @return true 已放下（selected_count / collision_count 已更新）。
+ */
+static bool label_place_candidate(label_place_state_t * st, int32_t idx,
+    const lv_font_t * font, int32_t gap_x, int32_t gap_y)
+{
+    vmap_label_collector_t * col = st->col;
+    const vmap_label_cand_t * c = &col->items[idx];
+    lv_point_t sz;
+    int32_t box_w;
+    int32_t box_h;
+    lv_area_t box;
+    int32_t ki;
+
+    if (c->x < st->vis_x0 || c->x > st->vis_x1
+        || c->y < st->vis_y0 || c->y > st->vis_y1) {
+        return false;
+    }
+    if (!label_in_clip(col, c->x, c->y)) {
+        return false;
+    }
+    if (st->selected_count >= VMAP_LABEL_MAX_DRAWN) {
+        return false;
+    }
+    if (col->retained && col->retained_cap > 0
+        && st->retained_n + st->selected_count >= col->retained_cap) {
+        return false;
+    }
+
+    road_label_measure(c->kind, c->road_vertical, c->name, font,
+        st->layout_buf[st->selected_count], sizeof(st->layout_buf[0]), &sz);
+    box_w = sz.x + VMAP_LABEL_PAD * 2;
+    box_h = sz.y + VMAP_LABEL_PAD * 2;
+    box.x1 = c->x - box_w / 2;
+    box.y1 = c->y - box_h / 2;
+    box.x2 = box.x1 + box_w - 1;
+    box.y2 = box.y1 + box_h - 1;
+    if (box.x1 < st->vis_x0 || box.y1 < st->vis_y0
+        || box.x2 > st->vis_x1 || box.y2 > st->vis_y1) {
+        return false;
+    }
+
+    for (ki = 0; ki < st->collision_count; ki++) {
+        if (boxes_overlap(&box, &st->placed[ki], gap_x, gap_y)) {
+            return false;
+        }
+    }
+
+    st->placed[st->retained_n + st->selected_count] = box;
+    st->final_idx[st->selected_count] = idx;
+    st->selected_count++;
+    st->collision_count++;
+    return true;
+}
+
 /**
  * @brief 把选中的标签盖进地图画布（导航线之上、REC 之下）。
  */
@@ -903,8 +1119,9 @@ bool vmap_label_paint_to_canvas(lv_obj_t * canvas, vmap_label_collector_t * col,
     int32_t road_gap_y;
     int32_t oth_gap_x;
     int32_t oth_gap_y;
-    int32_t same_name_gap;
     int32_t max_road;
+    vmap_label_fonts_t fonts;
+    label_place_state_t st;
     lv_layer_t draw_layer;
     lv_draw_label_dsc_t label_dsc;
     lv_display_t * disp;
@@ -985,58 +1202,43 @@ bool vmap_label_paint_to_canvas(lv_obj_t * canvas, vmap_label_collector_t * col,
     }
 
     /*
-     * First attempt one closest candidate for every distinct road name, then
-     * consider repeats. This prevents one long arterial from consuming the
-     * collision budget before shorter visible roads get a label.
+     * 同名一屏只出一个（STYLE.md §4 规则 3）：这里**不再把同名候选删掉**，
+     * 只按等级排序（cls1 最先，prio 最大），同级保持"离焦点近的在前"。
+     * 真正的"只出一个"在放置阶段用已选名字集合判断 —— 最近的那个锚点撞上
+     * 地名或框出界时，后面的同名候选还能顶上（Codex 审查 [5]）。
+     * 已经烘进 retained 画布**且此刻在视口内**的同名标签也算"出过"。
      */
     {
-        int32_t unique_n = 0;
-        int32_t out_n;
+        int32_t pick_n = 0;
 
         for (i = 0; i < road_n; i++) {
-            vmap_label_cand_t * c = &col->items[road_idx[i]];
-            bool known = false;
-            int32_t j;
+            const vmap_label_cand_t * c = &col->items[road_idx[i]];
 
-            for (j = 0; j < retained_n; j++) {
-                const lv_area_t * rb;
-
-                if (col->retained[j].kind != VMAP_LABEL_ROAD
-                    || lv_strcmp(col->retained[j].name, c->name) != 0) {
-                    continue;
-                }
-                rb = &col->retained[j].box;
-                if (rb->x1 >= 0 && rb->y1 >= 0
-                    && rb->x2 < col->canvas_w && rb->y2 < col->canvas_h) {
-                    known = true;
-                    break;
-                }
+            if (label_name_retained(col, VMAP_LABEL_ROAD, c->name, retained_n,
+                    vis_x0, vis_y0, vis_x1, vis_y1)) {
+                continue;
             }
-            for (j = 0; !known && j < unique_n; j++) {
-                if (lv_strcmp(col->items[oth_idx[j]].name, c->name) == 0) {
-                    known = true;
-                }
-            }
-            if (!known) {
-                oth_idx[unique_n++] = road_idx[i];
-            }
+            oth_idx[pick_n++] = road_idx[i];
         }
 
-        out_n = unique_n;
-        for (i = 0; i < road_n; i++) {
-            bool is_unique = false;
-            int32_t j;
+        for (a = 1; a < pick_n; a++) {
+            const int32_t v = oth_idx[a];
+            const vmap_label_cand_t * cv = &col->items[v];
 
-            for (j = 0; j < unique_n; j++) {
-                if (road_idx[i] == oth_idx[j]) {
-                    is_unique = true;
+            b = a - 1;
+            while (b >= 0) {
+                const vmap_label_cand_t * cb = &col->items[oth_idx[b]];
+
+                if (cb->prio >= cv->prio) {
                     break;
                 }
+                oth_idx[b + 1] = oth_idx[b];
+                b--;
             }
-            if (!is_unique) {
-                oth_idx[out_n++] = road_idx[i];
-            }
+            oth_idx[b + 1] = v;
         }
+
+        road_n = pick_n;
         lv_memcpy(road_idx, oth_idx, (size_t)road_n * sizeof(road_idx[0]));
     }
 
@@ -1062,7 +1264,9 @@ bool vmap_label_paint_to_canvas(lv_obj_t * canvas, vmap_label_collector_t * col,
                 break;
             }
         }
-        if (best) {
+        if (best && !label_name_retained(col, col->items[i].kind,
+                col->items[i].name, retained_n,
+                vis_x0, vis_y0, vis_x1, vis_y1)) {
             oth_idx[oth_n++] = i;
         }
     }
@@ -1093,18 +1297,6 @@ bool vmap_label_paint_to_canvas(lv_obj_t * canvas, vmap_label_collector_t * col,
     if (road_gap_y < 4) {
         road_gap_y = 4;
     }
-    {
-        double spacing_x;
-        double spacing_y;
-
-        road_label_spacing_from_viewport(col->view_w, col->view_h,
-            &spacing_x, &spacing_y);
-        same_name_gap = (int32_t)lround((spacing_x + spacing_y) * 0.5);
-        if (same_name_gap < 60) {
-            same_name_gap = 60;
-        }
-    }
-
     max_road = VMAP_LABEL_MAX_ROAD;
     if (scale < 0.85) {
         max_road = (int32_t)(VMAP_LABEL_MAX_ROAD * (0.55 + 0.45 * scale));
@@ -1113,160 +1305,79 @@ bool vmap_label_paint_to_canvas(lv_obj_t * canvas, vmap_label_collector_t * col,
         }
     }
 
-    /* road_idx is sorted nearest-focus first; keep that order for collisions. */
+    label_fonts_init(&fonts, font);
+
+    st.col = col;
+    st.placed = placed;
+    st.final_idx = final_idx;
+    st.layout_buf = layout_buf;
+    st.retained_n = retained_n;
+    st.vis_x0 = vis_x0;
+    st.vis_y0 = vis_y0;
+    st.vis_x1 = vis_x1;
+    st.vis_y1 = vis_y1;
+    st.selected_count = 0;
+    st.collision_count = collision_count;
+
+    /*
+     * 放置顺序 = STYLE.md §4 的优先级列：地名/水名（点标注）→ 路名（按等级）
+     * → POI/公园（最低）。碰撞箱按放置顺序累积，所以先放的赢。
+     */
+    for (a = 0; a < oth_n && oth_drawn < VMAP_LABEL_MAX_OTHER; a++) {
+        const vmap_label_cand_t * c = &col->items[oth_idx[a]];
+
+        if (c->kind == VMAP_LABEL_POI) {
+            continue;                       /* POI 留到最后 */
+        }
+        if (label_place_candidate(&st, oth_idx[a],
+                label_font_for(&fonts, c->kind), oth_gap_x, oth_gap_y)) {
+            oth_drawn++;
+        }
+    }
+
     for (a = 0; a < road_n && road_drawn < max_road; a++) {
-        int32_t idx = road_idx[a];
-        vmap_label_cand_t * c = &col->items[idx];
-        int32_t clip_x0 = vis_x0;
-        int32_t clip_y0 = vis_y0;
-        int32_t clip_x1 = vis_x1;
-        int32_t clip_y1 = vis_y1;
-        lv_point_t sz;
-        int32_t box_w;
-        int32_t box_h;
-        lv_area_t box;
-        int32_t ki;
-        bool overlap = false;
-
-        if (c->x < clip_x0 || c->x > clip_x1 || c->y < clip_y0 || c->y > clip_y1) {
+        /* 同名只出一个：已经放下过同名的候选就跳过（含地名/水名/POI 占用的同名）。
+         * 放不下的候选不记账，所以后面的同名锚点还能顶上。 */
+        if (label_name_selected(&st, road_idx[a])) {
             continue;
         }
-        if (!label_in_clip(col, c->x, c->y)) {
-            continue;
-        }
-        if (selected_count >= VMAP_LABEL_MAX_DRAWN) {
-            break;
-        }
-        if (col->retained && col->retained_cap > 0
-            && retained_n + selected_count >= col->retained_cap) {
-            break;
-        }
-
-        road_label_measure(c->kind, c->road_vertical, c->name, font,
-            layout_buf[selected_count], sizeof(layout_buf[0]), &sz);
-        box_w = sz.x + VMAP_LABEL_PAD * 2;
-        box_h = sz.y + VMAP_LABEL_PAD * 2;
-        box.x1 = c->x - box_w / 2;
-        box.y1 = c->y - box_h / 2;
-        box.x2 = box.x1 + box_w - 1;
-        box.y2 = box.y1 + box_h - 1;
-        if (box.x1 < clip_x0 || box.y1 < clip_y0
-            || box.x2 > clip_x1 || box.y2 > clip_y1) {
-            continue;
-        }
-        for (ki = 0; ki < collision_count; ki++) {
-            const char * pk_name;
-            uint8_t pk_kind;
-            int32_t pk_x;
-            int32_t pk_y;
-            int32_t dx;
-            int32_t dy;
-
-            if (ki < retained_n) {
-                pk_name = col->retained[ki].name;
-                pk_kind = col->retained[ki].kind;
-                pk_x = col->retained[ki].x;
-                pk_y = col->retained[ki].y;
-            } else {
-                vmap_label_cand_t * pk =
-                    &col->items[final_idx[ki - retained_n]];
-
-                pk_name = pk->name;
-                pk_kind = pk->kind;
-                pk_x = pk->x;
-                pk_y = pk->y;
-            }
-            dx = pk_x - c->x;
-            dy = pk_y - c->y;
-            if (pk_kind == VMAP_LABEL_ROAD
-                && lv_strcmp(pk_name, c->name) == 0
-                && (dx * dx + dy * dy) < same_name_gap * same_name_gap) {
-                overlap = true;
-                break;
-            }
-            if (boxes_overlap(&box, &placed[ki], road_gap_x, road_gap_y)) {
-                overlap = true;
-                break;
-            }
-        }
-        if (!overlap) {
-            placed[retained_n + selected_count] = box;
-            final_idx[selected_count] = idx;
-            selected_count++;
-            collision_count++;
+        if (label_place_candidate(&st, road_idx[a], fonts.road,
+                road_gap_x, road_gap_y)) {
             road_drawn++;
         }
     }
 
     for (a = 0; a < oth_n && oth_drawn < VMAP_LABEL_MAX_OTHER; a++) {
-        int32_t idx = oth_idx[a];
-        vmap_label_cand_t * c = &col->items[idx];
-        int32_t clip_x0 = vis_x0;
-        int32_t clip_y0 = vis_y0;
-        int32_t clip_x1 = vis_x1;
-        int32_t clip_y1 = vis_y1;
-        lv_point_t sz;
-        int32_t box_w;
-        int32_t box_h;
-        lv_area_t box;
-        int32_t ki;
-        bool overlap = false;
+        const vmap_label_cand_t * c = &col->items[oth_idx[a]];
 
-        if (c->x < clip_x0 || c->x > clip_x1 || c->y < clip_y0 || c->y > clip_y1) {
+        if (c->kind != VMAP_LABEL_POI) {
             continue;
         }
-        if (!label_in_clip(col, c->x, c->y)) {
-            continue;
-        }
-        if (selected_count >= VMAP_LABEL_MAX_DRAWN) {
-            break;
-        }
-        if (col->retained && col->retained_cap > 0
-            && retained_n + selected_count >= col->retained_cap) {
-            break;
-        }
-
-        road_label_measure(c->kind, c->road_vertical, c->name, font,
-            layout_buf[selected_count], sizeof(layout_buf[0]), &sz);
-        box_w = sz.x + VMAP_LABEL_PAD * 2;
-        box_h = sz.y + VMAP_LABEL_PAD * 2;
-        box.x1 = c->x - box_w / 2;
-        box.y1 = c->y - box_h / 2;
-        box.x2 = box.x1 + box_w - 1;
-        box.y2 = box.y1 + box_h - 1;
-        if (box.x1 < clip_x0 || box.y1 < clip_y0
-            || box.x2 > clip_x1 || box.y2 > clip_y1) {
-            continue;
-        }
-        for (ki = 0; ki < collision_count; ki++) {
-            if (boxes_overlap(&box, &placed[ki], oth_gap_x, oth_gap_y)) {
-                overlap = true;
-                break;
-            }
-        }
-        if (!overlap) {
-            placed[retained_n + selected_count] = box;
-            final_idx[selected_count] = idx;
-            selected_count++;
-            collision_count++;
+        if (label_place_candidate(&st, oth_idx[a], fonts.poi,
+                oth_gap_x, oth_gap_y)) {
             oth_drawn++;
         }
     }
+
+    selected_count = st.selected_count;
 
     lv_canvas_init_layer(canvas, &draw_layer);
     lv_draw_label_dsc_init(&label_dsc);
     label_dsc.font = font;
     label_dsc.align = LV_TEXT_ALIGN_LEFT;
     label_dsc.text_local = 1;
-    label_dsc.outline_stroke_width = 1;
-    label_dsc.outline_stroke_opa = LV_OPA_70;
-    label_dsc.outline_stroke_color = lv_color_white();
 
     for (k = 0; k < selected_count; k++) {
         vmap_label_cand_t * c = &col->items[final_idx[k]];
         const vmap_style_t * style = vmap_style_current();
         lv_area_t text_area;
         lv_area_t * box = &placed[retained_n + k];
+
+        /* 字号/描边按 STYLE.md §4 的类型表；量字用的是同一个字体（见放置阶段）。 */
+        label_dsc.font = label_font_for(&fonts, c->kind);
+        label_dsc.outline_stroke_width = label_halo_width(c->kind);
+        label_dsc.outline_stroke_opa = (lv_opa_t)style->lbl_halo_opa;
+        label_dsc.outline_stroke_color = lv_color_hex(style->lbl_halo);
 
         switch (c->kind) {
         case VMAP_LABEL_PLACE:

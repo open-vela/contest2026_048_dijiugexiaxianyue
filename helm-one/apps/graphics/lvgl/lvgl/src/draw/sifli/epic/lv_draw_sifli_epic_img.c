@@ -17,6 +17,10 @@
 
 #if LV_USE_SIFLI_EPIC
 #include "lv_sifli_epic_utils.h"
+#if LV_SIFLI_EPIC_USE_ROUND_CLIP
+#include "../epic_mw/epic_mw.h"
+#include "../epic_mw/epic_mw_mask.h"
+#endif
 #include "../../../draw/lv_draw_image_private.h"
 #include "../../../draw/lv_image_decoder_private.h"
 #include "../../../misc/lv_area_private.h"
@@ -37,13 +41,23 @@ static void epic_img_draw_core(lv_draw_task_t * task, const lv_draw_image_dsc_t 
                                const lv_image_decoder_dsc_t * decoder_dsc, lv_draw_image_sup_t * sup,
                                const lv_area_t * img_coords, const lv_area_t * clipped_img_area);
 
+#if LV_SIFLI_EPIC_USE_ROUND_CLIP
+/**
+ * Image blend with clip_radius: the corners are cut by an A8 mask generated
+ * by the epic_mw radius mask engine and fed to the EPIC IMAGE renderer
+ * (epic_mw.c: render_image) as its third input layer.
+ */
+static void epic_img_blend_rounded(lv_draw_task_t * task, const lv_draw_image_dsc_t * draw_dsc,
+                                   const EPIC_LayerConfigTypeDef * fg_layer,
+                                   const lv_area_t * img_coords, const lv_area_t * clipped_img_area);
+#endif
+
 /**********************
  *   GLOBAL FUNCTIONS
  **********************/
 
 void lv_draw_sifli_epic_img(lv_draw_task_t * task)
-{
-    const lv_draw_image_dsc_t * dsc = (const lv_draw_image_dsc_t *)task->draw_dsc;
+{    const lv_draw_image_dsc_t * dsc = (const lv_draw_image_dsc_t *)task->draw_dsc;
     const lv_area_t * coords = &task->area;
 
     if(dsc->opa <= LV_OPA_MIN) {
@@ -81,7 +95,11 @@ static void epic_img_draw_core(lv_draw_task_t * task, const lv_draw_image_dsc_t 
         return;
     }
 
-    if(draw_dsc->clip_radius != 0 || draw_dsc->blend_mode != LV_BLEND_MODE_NORMAL) {
+    if(draw_dsc->clip_radius != 0 && !LV_SIFLI_EPIC_USE_ROUND_CLIP) {
+        return;
+    }
+
+    if(draw_dsc->blend_mode != LV_BLEND_MODE_NORMAL) {
         return;
     }
 
@@ -225,11 +243,129 @@ static void epic_img_draw_core(lv_draw_task_t * task, const lv_draw_image_dsc_t 
         }
     }
 
-    (void)lv_epic_blend(input_layers, input_layer_cnt, &output_layer);
+#if LV_SIFLI_EPIC_USE_ROUND_CLIP
+    if(draw_dsc->clip_radius != 0 && input_layer_cnt == 2 && draw_dsc->rotation == 0 &&
+       draw_dsc->scale_x == LV_SCALE_NONE && draw_dsc->scale_y == LV_SCALE_NONE) {
+        epic_img_blend_rounded(task, draw_dsc, &input_layers[1], img_coords, clipped_img_area);
+    }
+    else
+#endif
+    {
+        lv_epic_blend(input_layers, input_layer_cnt, &output_layer);
+    }
 
     if(mask_decoder_opened) {
         lv_image_decoder_close(&mask_decoder_dsc);
     }
 }
+
+#if LV_SIFLI_EPIC_USE_ROUND_CLIP
+static void epic_img_blend_rounded(lv_draw_task_t * task, const lv_draw_image_dsc_t * draw_dsc,
+                                   const EPIC_LayerConfigTypeDef * fg_layer,
+                                   const lv_area_t * img_coords, const lv_area_t * clipped_img_area)
+{
+    lv_layer_t * layer = task->target_layer;
+
+    if(layer == NULL || layer->draw_buf == NULL) {
+        return;
+    }
+
+    int32_t w = lv_area_get_width(clipped_img_area);
+    int32_t h = lv_area_get_height(clipped_img_area);
+    if(w <= 0 || h <= 0) {
+        return;
+    }
+
+    uint8_t * mask_buf = lv_malloc((size_t)w * (size_t)h);
+    if(mask_buf == NULL) {
+        LV_LOG_WARN("epic: no memory for rounded image mask (%dx%d)", (int)w, (int)h);
+        return;
+    }
+
+    /* The radius is relative to the whole image, like the SW renderer
+     * (lv_draw_sw_img.c uses draw_dsc->image_area). */
+    const lv_area_t * radius_area = (lv_area_get_width(&draw_dsc->image_area) >= 0) ?
+                                    &draw_dsc->image_area : img_coords;
+
+    epic_mw_mask_area_t radius_rect;
+    radius_rect.x1 = radius_area->x1;
+    radius_rect.y1 = radius_area->y1;
+    radius_rect.x2 = radius_area->x2;
+    radius_rect.y2 = radius_area->y2;
+
+    epic_mw_mask_radius_param_t radius_param;
+    epic_mw_mask_radius_init(&radius_param, &radius_rect, draw_dsc->clip_radius, false);
+
+    void * masks[2] = {&radius_param, NULL};
+    uint8_t * row = mask_buf;
+    for(int32_t y = clipped_img_area->y1; y <= clipped_img_area->y2; y++, row += w) {
+        memset(row, 0xFF, (size_t)w);
+        (void)epic_mw_mask_apply(masks, row, clipped_img_area->x1, y, w);
+    }
+    epic_mw_mask_free_param(&radius_param);
+
+    /* CPU-written mask read by the GPU: not covered by the layer cache
+     * maintenance of lv_epic_blend. */
+    lv_epic_flush_cache_range(mask_buf, (uint32_t)w * (uint32_t)h);
+
+    EPIC_LayerConfigTypeDef mask_layer;
+    HAL_EPIC_LayerConfigInit(&mask_layer);
+    mask_layer.alpha = LV_OPA_COVER;
+    mask_layer.x_offset = clipped_img_area->x1;
+    mask_layer.y_offset = clipped_img_area->y1;
+    mask_layer.color_mode = EPIC_INPUT_A8;
+    mask_layer.data = mask_buf;
+    mask_layer.data_size = (uint32_t)w * (uint32_t)h;
+    mask_layer.ax_mode = ALPHA_BLEND_OVERWRITE;
+    mask_layer.width = w;
+    mask_layer.height = h;
+    mask_layer.total_width = w;
+
+    lv_color_format_t dest_cf = layer->color_format;
+    epic_mw_buf_t buf;
+    buf.cf = lv_img_cf_to_epic_cf(dest_cf);
+    buf.data = (uint8_t *)lv_draw_layer_go_to_xy(layer, 0, 0);
+    buf.area.x0 = layer->buf_area.x1;
+    buf.area.y0 = layer->buf_area.y1;
+    buf.area.x1 = layer->buf_area.x2;
+    buf.area.y1 = layer->buf_area.y2;
+    buf.total_width = lv_epic_stride_to_width(layer->draw_buf->header.stride, dest_cf);
+
+    epic_mw_rl_t rl = epic_mw_begin(&buf, NULL);
+    if(rl == NULL) {
+        LV_LOG_WARN("epic_mw: no free render list for rounded image");
+        lv_free(mask_buf);
+        return;
+    }
+
+    epic_mw_op_t * o = epic_mw_alloc_op(&buf);
+    if(o == NULL) {
+        epic_mw_discard(rl);
+        lv_free(mask_buf);
+        return;
+    }
+
+    o->op = DRV_EPIC_DRAW_IMAGE;
+    o->clip_area.x0 = clipped_img_area->x1;
+    o->clip_area.y0 = clipped_img_area->y1;
+    o->clip_area.x1 = clipped_img_area->x2;
+    o->clip_area.y1 = clipped_img_area->y2;
+    o->desc.blend.use_dest_as_bg = EPIC_BLEND_MODE_NORMAL;
+    o->desc.blend.layer = *fg_layer;
+    o->mask = mask_layer;
+
+    if(epic_mw_commit_op(o) != 0) {
+        epic_mw_discard(rl);
+        lv_free(mask_buf);
+        return;
+    }
+
+    (void)epic_mw_flush(rl);
+
+    /* epic_mw_flush() is synchronous (HAL_EPIC_BlendStartEx waits), so the
+     * mask buffer can be released here. */
+    lv_free(mask_buf);
+}
+#endif /*LV_SIFLI_EPIC_USE_ROUND_CLIP*/
 
 #endif /*LV_USE_SIFLI_EPIC*/

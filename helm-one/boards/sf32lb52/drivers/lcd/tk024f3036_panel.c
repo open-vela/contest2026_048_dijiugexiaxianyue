@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/tk024f3036_panel.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/tk024f3036_panel.c
  *
  * TK024F3036 helpers. Gamma/MADCTL from vendor LCD.c; RGB test on boot.
  *

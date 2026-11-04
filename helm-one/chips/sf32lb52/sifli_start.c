@@ -251,6 +251,15 @@ void __start(void)
 #define NVIC_SYSTICK_CTRL_REG   (*((volatile uint32_t *)0xE000E010))
   NVIC_SYSTICK_CTRL_REG = 0;  /* Disable SysTick completely */
 
+  /* HAL_InitTick() above enabled the SysTick exception while interrupts were
+   * masked (cpsid i), so a tick may still be pending.  Clear PENDSTCLR before
+   * nx_start() unmasks interrupts; otherwise NuttX reports "irq_unexpected_isr:
+   * ERROR irq: 15" on the first tick.
+   */
+#define SCB_ICSR_REG            (*((volatile uint32_t *)0xE000ED04))
+#define SCB_ICSR_PENDSTCLR      (1u << 25)
+  SCB_ICSR_REG = SCB_ICSR_PENDSTCLR;
+
 
   arm_lowputc('E'); /* about to start system */
 

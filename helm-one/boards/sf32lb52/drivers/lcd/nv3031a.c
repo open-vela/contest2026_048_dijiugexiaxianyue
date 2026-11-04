@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/nv3031a.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/nv3031a.c
  *
  * NV3031A-AI 240x320 RGB565, 4-bit QSPI (QAD-SPI) panel driver.
  *
@@ -45,6 +45,21 @@
 static LCDC_InitTypeDef lcdc_int_cfg_qadspi =
 {
   .lcd_itf = QAD_SPI_ITF,
+  /* ⚠ **24 MHz 是实测过的上限，别再往上试。**
+   *
+   * 面板手册给的名义上限：`NV3031A-AI Datasheet V1.6` §9.3.3
+   * 「4-wire QSPI system」第 203 页，`TSCYCW` Serial Clock Cycle (Write) ≥ **27 ns
+   * ⇒ 37.04 MHz**（读的 `TSCYCR` ≥ 155 ns 只 6.45 MHz，但我们只写 GRAM）。
+   * 注意是 **4 线 QSPI** 那一节；§9.3.1/§9.3.2 的 15.15 ns（66 MHz）是单线 SPI 的。
+   *
+   * **2026-10-01 实测：改成 36 MHz 后开机花屏、画面不动。** 按 `SetFreq` 的
+   * `ceil(HCLK/freq)` 算，36 会给出 240档÷7=34.3 MHz、144档÷4=36.0 MHz，
+   * 两个都在 27 ns 之内 —— 但仍然坏了。**⇒ 真实上限低于名义值**，多半是
+   * SoC 侧的输出时序（`TSDS` ≥7.575 ns 建立 / `TSDH` ≥1.515 ns 保持 相对 SCL）
+   * 在高频下先掉出去，而不是面板本身接不住。所以 24 就这么留着。
+   *
+   * 24 这个值本身也有讲究：分频必须是整数，而 24 是"能同时整除 144 与 240"
+   * 的最大值（gcd(144,240)=48，其 ≤37 的最大约数是 24）⇒ 换档时频率不跳。 */
   .freq = 24000000,
   .color_mode = LCDC_PIXEL_FORMAT_RGB565,
   .cfg =

@@ -1,8 +1,9 @@
 /**
  * @file myvendor_lcd_disp.h
- * @brief LCD 刷新区管道（在自行车 App 之外）：UI 提交 SRAM 条带指针，ui_flush 零拷贝 PUTAREA/DMA。
+ * @brief LCD 刷新区管道（在自行车 App 之外）：UI 直接启动 LCDC/QSPI DMA。
  *
- * 两块 LVGL 局部缓冲乒乓：worker 传上一片时，UI 可填下一片。
+ * 两块 LVGL 局部缓冲乒乓：flush_cb 启动条带 A 后立即返回，UI 渲染 B；
+ * LCDC EOF 中断里调 done 回调 -> lv_display_flush_ready()。无 worker 线程。
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -61,17 +62,18 @@ typedef struct
   uint16_t strip_rows;/**< 单条带行数。 */
   uint32_t stride;    /**< 每行字节。 */
   size_t   buf_bytes; /**< 单缓冲字节数。 */
+  struct lcddev_area_align_s area_align; /**< 驱动要求的刷新区域/缓冲对齐。 */
 } myvendor_lcd_disp_info_t;
 
 /**
- * @brief 打开 `/dev/lcd0` 并拉起 ui_flush worker。
+ * @brief 打开 `/dev/lcd0`，读取几何（无 worker 线程）。
  * @param lcd_path 设备路径，NULL 则用默认 `/dev/lcd0`。
  * @return 0 成功，负值为错误码。
  */
 int myvendor_lcd_disp_init(const char *lcd_path);
 
 /**
- * @brief 停 worker 并关闭设备。
+ * @brief 等在途 DMA 后关闭设备。
  */
 void myvendor_lcd_disp_deinit(void);
 
@@ -107,12 +109,12 @@ int myvendor_lcd_disp_register_recover_cbs(myvendor_lcd_disp_refr_cb_t refr_cb,
 void myvendor_lcd_disp_unregister_recover_cbs(void);
 
 /**
- * @brief 排队一次刷新：等到 ui_flush 空闲，传入 LVGL SRAM 指针（零拷贝）。
+ * @brief 启动一条带的 LCDC DMA 后立即返回（完成由中断回调通知）。
  * @param area 矩形。
- * @param color_p 像素缓冲。
+ * @param color_p 像素缓冲（LVGL SRAM 指针，零拷贝）。
  * @param stride_bytes 行跨距。
- * @param is_last 本帧最后一条带。
- * @return 0 成功，负值为繁忙/错误。
+ * @param is_last 本帧最后一条带（保留参数）。
+ * @return 0 已启动；负值失败（调用方需自行 lv_display_flush_ready）。
  */
 int myvendor_lcd_disp_submit_flush(const myvendor_lcd_disp_area_t *area,
                                    const void *color_p,
@@ -120,13 +122,13 @@ int myvendor_lcd_disp_submit_flush(const myvendor_lcd_disp_area_t *area,
                                    bool is_last);
 
 /**
- * @brief worker 在忙、有排队任务、或正在 recover。
+ * @brief LCDC 在途 DMA 未完成或正在 recover。
  */
 bool myvendor_lcd_disp_flush_busy(void);
 
 /**
- * @brief 等到刷新区空闲。
- * @param max_ms 最长等待；0 表示等到 ui_flush 结束。
+ * @brief 等到在途 DMA 完成。
+ * @param max_ms 最长等待；0 表示无限等待。
  * @param[out] waited_ms_out 实际等待毫秒，可为 NULL。
  * @return true 已空闲，false 超时。
  */
@@ -140,7 +142,7 @@ typedef struct
   uint32_t submit_ok;         /**< 提交成功。 */
   uint32_t submit_busy;       /**< 提交时管道忙。 */
   uint32_t submit_err;        /**< 提交失败。 */
-  uint32_t worker_done;       /**< worker 完成次数。 */
+  uint32_t worker_done;       /**< DMA 完成中断次数（原 worker 完成）。 */
   uint32_t putarea_fail;      /**< PUTAREA ioctl 失败。 */
   uint32_t flush_ready;       /**< 调用 flush_ready。 */
   uint32_t wait_calls;        /**< wait_idle 次数。 */
@@ -201,10 +203,11 @@ void myvendor_lcd_disp_poll_recover_ui(void);
 bool myvendor_lcd_disp_recover_hold_active(void);
 
 /**
- * @brief 手动重启 ui_flush 管道（NSH `lcd_recover`）。
+ * @brief 轻量 recover（NSH `lcd_recover`）：空闲时排队全屏重绘；DMA 卡死
+ *        时等待超时后安全返回 -EBUSY（无 worker 可重启）。
  *
  * bicycle_ui 必须跑 poll_recover_ui 才能让 LVGL 跟上。
- * @return 0 成功，负值为错误码。
+ * @return 0 成功，-EBUSY 表示 LCDC 仍在传，负值为其他错误。
  */
 int myvendor_lcd_disp_trigger_recover(void);
 

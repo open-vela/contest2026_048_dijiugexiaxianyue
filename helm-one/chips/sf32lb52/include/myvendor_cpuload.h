@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/include/myvendor_cpuload.h
+ * vendor/HelmOne/chips/sf32lb52/include/myvendor_cpuload.h
  *
  * External hardware timer for NuttX cpuload (accurate ps CPU%).
  *

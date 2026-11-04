@@ -4,7 +4,9 @@
  *
  * CMake 去掉上游 sal_le_advertise_interface.c。相对上游：SF32 无 Ext Adv HCI，
  * 上游即使用 LEGACY 也会 bt_le_ext_adv_create，导致 Command Disallowed /
- * advertising status=2；本版改 bt_le_adv_start/stop 并取消 1 s 超时定时器。
+ * advertising status=2；本版改 bt_le_adv_start/stop，**成功后才发 STARTED** ——
+ * 框架收到 STARTED 才会取消自己的 1 s 定时器。所以 ticket 等待一旦 ≥1 s
+ * （scan 占着射频等），即使 bt_le_adv_start 最终返回 0，上层仍会先报 status=2。
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -37,6 +39,8 @@
  * - 与扫描 SAL 共用 ticket 队列，禁止 libuv worker 并行执行 GAP HCI。
  ***************************************************************************/
 #define LOG_TAG "adver"
+
+#include <nuttx/config.h>
 
 #include "sal_le_advertise_interface.h"
 
@@ -102,6 +106,7 @@ typedef struct {
     uint8_t adv_id;
     sal_func_t func;
     uint32_t radio_ticket;
+    uint32_t issued_ms;          /* 提交时刻：量 ticket 等待是否吃掉框架的 1 s */
     sal_adapter_args_t adpt;
 } sal_adapter_req_t;
 
@@ -110,6 +115,32 @@ static pthread_mutex_t g_radio_order_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_radio_order_cond = PTHREAD_COND_INITIALIZER;
 static uint32_t g_radio_ticket_next;
 static uint32_t g_radio_ticket_serving;
+
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+/* 定向广播实验旋钮（只在 CONFIG_MYVENDOR_BLE_TEST_APP 的测试构建里存在）。
+ *
+ * -1 = 用产品默认（低占空比、不开 DIR_ADDR_RPA）
+ *  0 = 强制关
+ *  1 = 强制开
+ *
+ * 为什么旋钮必须放在 SAL：framework 的 ble_adv_params_t 没有
+ * "RPA target" / "high duty" 字段（见 bt_le_advertiser.h），而这两件事
+ * 恰好都只能在 zblue 的 bt_le_adv_param.options 里表达。 */
+static int g_advtest_rpa_opt = -1;
+static int g_advtest_low_duty = -1;
+static int g_advfault_async;
+
+void myvendor_sal_advtest_set(int rpa_opt, int low_duty)
+{
+    g_advtest_rpa_opt = rpa_opt;
+    g_advtest_low_duty = low_duty;
+}
+
+void myvendor_sal_advfault_set(int mode)
+{
+    g_advfault_async = mode;
+}
+#endif
 
 /* 等待上界的单位：超过就强制推进并报错。 */
 #define MYVENDOR_SAL_TICKET_WAIT_MS 2000u
@@ -193,6 +224,39 @@ static bt_status_t zblue_le_convert_param(ble_adv_params_t* params, struct bt_le
     case BT_LE_LEGACY_ADV_DIRECT_IND:
         param->options |= BT_LE_ADV_OPT_CONN;
         param->options |= BT_LE_ADV_OPT_DIR_MODE_LOW_DUTY;
+
+        /* **不要无条件加 BT_LE_ADV_OPT_DIR_ADDR_RPA。**
+         *
+         * CONFIG_BT_PRIVACY=1 时，zblue 的 valid_adv_param()
+         * （external/zblue/zblue/subsys/bluetooth/host/adv.c:443）对
+         * `param->peer && USE_IDENTITY && DIR_ADDR_RPA` 直接返回 false
+         * ⇒ bt_le_adv_start() 返回 -EINVAL，连一条 HCI 都不会发出。
+         * 而本函数下面的 own_addr_type 映射对 PUBLIC 恰好会置
+         * USE_IDENTITY —— 旧代码把这两个无条件置位撞在一起，才是
+         * "定向广播必失败"的直接原因，不是控制器能力。
+         *
+         * 正确做法（Zephyr 提交 a5be0c8228 的说明）：用 RPA 做定向目标
+         * 时不能同时用本地 identity 地址，必须让 zblue 生成/使用本地
+         * RPA（own_addr_type = RANDOM），并且目标地址本身应是 RPA
+         * （peer_addr_type = RANDOM）。 */
+        /* **产品规则**：own=RANDOM 的定向广播必须带 DIR_ADDR_RPA。
+         * 只置这个位不会引入 USE_IDENTITY（RANDOM 分支不置），所以不会
+         * 撞 zblue 的 -EINVAL；控制器据此用 RAL 里的 IRK 把对端身份地址
+         * 解析成当前 RPA（Zephyr direct_adv 样例同款）。 */
+        if (params->own_addr_type == BT_LE_ADDR_TYPE_RANDOM)
+            param->options |= BT_LE_ADV_OPT_DIR_ADDR_RPA;
+
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+        if (g_advtest_low_duty == 0)
+            param->options &= ~BT_LE_ADV_OPT_DIR_MODE_LOW_DUTY;
+        else if (g_advtest_low_duty > 0)
+            param->options |= BT_LE_ADV_OPT_DIR_MODE_LOW_DUTY;
+
+        if (g_advtest_rpa_opt > 0)
+            param->options |= BT_LE_ADV_OPT_DIR_ADDR_RPA;
+        else if (g_advtest_rpa_opt == 0)
+            param->options &= ~BT_LE_ADV_OPT_DIR_ADDR_RPA;
+#endif
         break;
     case BT_LE_SCAN_RSP:
     case BT_LE_EXT_SCAN_RSP:
@@ -235,10 +299,44 @@ static bt_status_t zblue_le_convert_param(ble_adv_params_t* params, struct bt_le
     if (params->adv_type == BT_LE_ADV_DIRECT_IND
         || params->adv_type == BT_LE_EXT_ADV_DIRECT_IND
         || params->adv_type == BT_LE_LEGACY_ADV_DIRECT_IND) {
-        addr.type = params->peer_addr_type;
+        /* HCI LE Set Advertising Parameters 的 Peer_Address_Type 只允许
+         * 0x00 public / 0x01 random；Core Vol 4 Part E 7.8.5 规定
+         * ADV_DIRECT_IND 不能用 0x02/0x03（identity）。framework 的
+         * BT_LE_ADDR_TYPE_PUBLIC_ID / RANDOM_ID 直接透传会被控制器以
+         * 0x12 Invalid HCI Command Parameters 拒绝，这里先归一化。
+         * 注意：这不改变"目标是身份地址还是 RPA"的语义 —— 身份地址
+         * 作为定向目标时，privacy 对端用 RPA 发起连接仍然匹配不上，
+         * 见 docs 里的第四组测试。 */
+        switch (params->peer_addr_type) {
+        case BT_LE_ADDR_TYPE_PUBLIC_ID:
+            addr.type = BT_LE_ADDR_TYPE_PUBLIC;
+            break;
+        case BT_LE_ADDR_TYPE_RANDOM_ID:
+            addr.type = BT_LE_ADDR_TYPE_RANDOM;
+            break;
+        default:
+            addr.type = params->peer_addr_type;
+            break;
+        }
+
         memcpy(&addr.a, &params->peer_addr, sizeof(bt_address_t));
         param->peer = &addr;
+
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+        syslog(LOG_INFO,
+               "adver: convert directed peer_type=%u peer=%02x:%02x:%02x:%02x:%02x:%02x\n",
+               (unsigned)addr.type, addr.a.val[5], addr.a.val[4],
+               addr.a.val[3], addr.a.val[2], addr.a.val[1],
+               addr.a.val[0]);
+#endif
     }
+
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+    syslog(LOG_INFO,
+           "adver: convert adv_type=%u own=%u interval=%u options=0x%08x\n",
+           (unsigned)params->adv_type, (unsigned)params->own_addr_type,
+           (unsigned)params->interval, (unsigned)param->options);
+#endif
 
     return BT_STATUS_SUCCESS;
 }
@@ -291,6 +389,14 @@ static void sal_invoke_async(service_work_t* work, void* userdata)
     free(userdata);
 }
 
+static uint32_t sal_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
 static bt_status_t sal_send_req(sal_adapter_req_t* req)
 {
     if (!req) {
@@ -299,6 +405,7 @@ static bt_status_t sal_send_req(sal_adapter_req_t* req)
     }
 
     req->radio_ticket = myvendor_sal_radio_ticket_issue();
+    req->issued_ms = sal_now_ms();
     if (!service_loop_work((void*)req, sal_invoke_async, NULL)) {
         BT_LOGE("%s, service_loop_work failed", __func__);
         myvendor_sal_radio_ticket_wait(req->radio_ticket);
@@ -318,6 +425,7 @@ static void STACK_CALL(start_adv)(void* args)
     size_t ad_n;
     size_t sd_n;
     int ret;
+    uint32_t wait_ms = sal_now_ms() - req->issued_ms;
 
     if (sf32lb52_bt_hci_skip_sync()) {
         BT_LOGE("%s, skip HCI (recovering)", __func__);
@@ -336,6 +444,21 @@ static void STACK_CALL(start_adv)(void* args)
         g_legacy_adv_id = 0;
     }
 
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+    if (g_advfault_async && req->adpt.start_adv.param.peer != NULL) {
+        /* 延迟 100 ms 再发 STOPPED：framework 的 advertiser_start_event
+         * 是先 bt_sal_le_start_adv()、后 list_add_tail()；立即发 STOPPED
+         * 会撞上“advertiser 还没登记”的窗口，事件被丢弃。真实 HCI 失败
+         * 至少经过 ticket/HCI，不会这么快。 */
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100 * 1000 * 1000 };
+        g_advfault_async = 0;
+        syslog(LOG_WARNING, "adver: injected async directed failure\n");
+        nanosleep(&ts, NULL);
+        advertising_on_state_changed(req->adv_id, LE_ADVERTISING_STOPPED);
+        goto done;
+    }
+#endif
+
     ret = bt_le_adv_start(&req->adpt.start_adv.param,
         ad_n ? ad : NULL, ad_n,
         sd_n ? sd : NULL, sd_n);
@@ -346,8 +469,22 @@ static void STACK_CALL(start_adv)(void* args)
             sd_n ? sd : NULL, sd_n);
     }
 
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+    /* 这一行是区分三种 status=2 的关键：
+     *   wait >= 1000 ms  ⇒ 框架 1 s 定时器先到（ticket/扫描占射频），
+     *                      即使 ret=0 上层也会报 START_TIMEOUT；
+     *   ret != 0         ⇒ 参数/HCI 失败，看紧接着的 err:；
+     *   ret = 0          ⇒ 控制器已接受，问题只可能在回调链路。 */
+    syslog(LOG_INFO, "adver: start id=%u ticket=%u wait=%u ms ret=%d\n",
+           (unsigned)req->adv_id, (unsigned)req->radio_ticket,
+           (unsigned)wait_ms, ret);
+#endif
+
     if (ret) {
         BT_LOGE("%s, bt_le_adv_start fail, err:%d", __func__, ret);
+        /* 不通知 STARTED → 框架 1 s 超时 status=2。这里立刻 STOPPED，
+         * 让上层清句柄并（若已禁定向）下一拍改走无名 ADV。 */
+        advertising_on_state_changed(req->adv_id, LE_ADVERTISING_STOPPED);
         goto done;
     }
 
@@ -405,7 +542,12 @@ bt_status_t bt_sal_le_start_adv(bt_controller_id_t id, uint8_t adv_id, ble_adv_p
         req->adpt.start_adv.scan_rsp_len = scan_rsp_len;
     }
 
-    return sal_send_req(req);
+    ret = sal_send_req(req);
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+    syslog(LOG_INFO, "adver: request id=%u accepted=%d\n",
+           (unsigned)adv_id, ret);
+#endif
+    return ret;
 
 error:
     if (req->adpt.start_adv.adv_data)

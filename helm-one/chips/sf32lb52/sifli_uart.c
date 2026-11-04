@@ -441,6 +441,24 @@ static int sifli_receive(struct uart_dev_s *dev, unsigned int *status)
         ch = __HAL_UART_GETC(&uart->handle);
     if (status)
       *status = 0x00;
+
+    /** 板级直连通道（GNSS）：**中断式 RX 这条路上也要喂**。
+     *
+     *  DMA 那条路是在 `sifli_uart_rx_put()` 里喂的；而 SDK 式的纯中断 RX
+     *  （`uart_rx_dma_flag == 0`，框架在 RXNE 中断里逐字节调 `ops->receive()`）
+     *  走的是这里 —— 不补这一处，关掉 DMA 后 GNSS 的环形就没人喂了。
+     *  只在非 DMA 模式喂，避免 DMA 模式下同一字节"从环里来 + 从硬件 FIFO 来"各算一次。 */
+    if (ch >= 0 && !uart->uart_rx_dma_flag && uart->handle.Instance == USART2)
+      {
+        extern void myvendor_gnss_uart_feed(const uint8_t *buf, size_t n) __attribute__((weak));
+        uint8_t b = (uint8_t)ch;
+
+        if (myvendor_gnss_uart_feed != NULL)
+          {
+            myvendor_gnss_uart_feed(&b, 1);
+          }
+      }
+
     return ch;
 }
 
@@ -634,6 +652,56 @@ static void sifli_uart_rx_put(struct sifli_uart *uart,
     {
         uart_datareceived(&uart->serial);
     }
+
+    /* 板级直连通道（GNSS）：USART2 的字节**同时**喂给板级的环形缓冲 ——
+     * 那条路不注册 pollfd、不等 tick 超时（见 myvendor_gnss_uart.h 的背景）。
+     * 弱符号：没有该模块的构建里这一句自动消失，行为与从前完全一致。
+     *
+     * 用 `Instance == USART2` 判断而不是索引：本文件本来就按 `uart_config[]`
+     * 的 Instance 工作，不依赖索引常量的数值。 */
+    {
+        extern void myvendor_gnss_uart_feed(const uint8_t *buf, size_t n) __attribute__((weak));
+
+        if (myvendor_gnss_uart_feed != NULL && uart->handle.Instance == USART2)
+        {
+            myvendor_gnss_uart_feed(src, (size_t)n);
+        }
+    }
+}
+
+/* GNSS 直连通道用的发送口：同一个 HAL 句柄，阻塞发小帧（UBX 命令/NMEA 配置）。
+ * 不经过 NuttX serial 的发送环与互斥锁 —— 那条路的锁诊断见本文件 sifli_uart_diag。 */
+int sifli_uart_direct_tx(const uint8_t *buf, size_t n)
+{
+    struct sifli_uart *uart = NULL;
+    int i;
+
+    if (buf == NULL || n == 0)
+    {
+        return -EINVAL;
+    }
+
+    for (i = 0; i < (int)(sizeof(uart_obj) / sizeof(uart_obj[0])); i++)
+    {
+        if (uart_obj[i].config != NULL && uart_obj[i].config->Instance == USART2)
+        {
+            uart = &uart_obj[i];
+            break;
+        }
+    }
+
+    if (uart == NULL || uart->handle.Instance == NULL)
+    {
+        return -ENODEV;
+    }
+
+    /* 1 字节 ≈ 26 us @38400；给 10 倍余量，上限 2 s。 */
+    if (HAL_UART_Transmit(&uart->handle, (uint8_t *)buf, (uint16_t)n, 2000) != HAL_OK)
+    {
+        return -EIO;
+    }
+
+    return 0;
 }
 
 static void sifli_uart_rx_drain_fifo(struct sifli_uart *uart)
@@ -1056,10 +1124,25 @@ static void sifli_send(struct uart_dev_s *dev, int c)
 {
     struct sifli_uart *uart = (struct sifli_uart *)dev->priv;
 
+    /* 这里**刻意不**计"中断里打印"（2026-09-24 更正）：
+     * `sifli_send()` 是驱动逐字节写硬件的那一层，而 NuttX 的发送完成中断
+     * （`nuttx/drivers/serial/serial.c` 的 `uart_xmitchars()`）**本来就**从 ISR
+     * 里调它推下一个字节 —— 那属于设计如此，计数在这里会把正常发包全记成
+     * "中断里打印"（现场 delta=9 的误报就是这么来的）。
+     * 真正的哨兵放在**轮询式控制台出口** `arm_lowputc()`（见 sifli_lowput.c）。 */
+
     /* Do not wait for TC: uart_xmitchars holds a spinlock. Busy-waiting
      * here masked RX DMA IRQs long enough to drop 1 Mbps USB-UART packets.
      */
     __HAL_UART_PUTC(&uart->handle, c);
+}
+
+/* 供 diag 线程读取"中断里打印"的哨兵计数（见 sifli_lowput.c 的说明）。 */
+uint32_t sifli_isr_console_chars(void)
+{
+    extern volatile uint32_t g_isr_console_chars;
+
+    return g_isr_console_chars;
 }
 
 
@@ -1456,7 +1539,15 @@ static void sifli_uart_get_dma_config(void)
 #endif
 
 #ifdef CONFIG_BSP_UART2_RX_USING_DMA
-    uart_obj[UART2_INDEX].uart_rx_dma_flag = 1;
+    /** A1 实验（分支 `retire-eval`，见 docs/retire_eval.md）：**UART2 关掉 DMA RX**，
+     *  退到 SDK 式纯中断 RX（`uart_rx_dma_flag == 0` ⇒ setup 走 RXNE 分支、
+     *  `sifli_receive()` 逐字节喂框架 + 我们那份 feed 钩子）。
+     *
+     *  目的：判"我们给 UART 写的那 ~950 行 DMA/IDLE/harvest/recover 是否还需要"。
+     *  判据（观察窗 ≥30 min）：`gnss_uart` 的 `drop=0`、`feed` 持续增长、
+     *  `gnss: cnt link` 的 `bad=junk=0`、`[ ERROR]` 不新增。
+     *  ⚠ UART1（控制台，1 Mbaud）**保持 DMA**，不动。 */
+    uart_obj[UART2_INDEX].uart_rx_dma_flag = 0;   /* ← 原来是 1 */
     static struct dma_config uart2_dma_rx = { .Instance = (void *)-1 };
     uart2_dma_rx = (struct dma_config)UART2_RX_DMA_CONFIG;
     uart_config[UART2_INDEX].dma_rx = &uart2_dma_rx;

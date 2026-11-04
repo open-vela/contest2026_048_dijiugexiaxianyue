@@ -12,6 +12,7 @@
 
 #include "../misc/lv_log.h"
 #include <pthread.h>
+#include <sched.h>
 #include <string.h>
 
 #ifndef __linux__
@@ -31,6 +32,10 @@
  **********************/
 static void * generic_callback(void * user_data);
 
+#if defined(SCHED_PRIORITY_DEFAULT) && defined(SCHED_PRIORITY_MIN) && defined(SCHED_PRIORITY_MAX)
+    static int _nuttx_prio_from_lv(lv_thread_prio_t prio);
+#endif
+
 
 /**********************
  *  STATIC VARIABLES
@@ -48,12 +53,31 @@ lv_result_t lv_thread_init(lv_thread_t * thread, const char * const name,
                            lv_thread_prio_t prio, void (*callback)(void *),
                            size_t stack_size, void * user_data)
 {
-    LV_UNUSED(prio);
     pthread_attr_t attr;
     int ret;
 
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, stack_size);
+
+#if defined(SCHED_PRIORITY_DEFAULT) && defined(SCHED_PRIORITY_MIN) && defined(SCHED_PRIORITY_MAX)
+    /* NuttX: pthread_attr_init() uses PTHREAD_EXPLICIT_SCHED with the creator's
+     * priority, so without this the render thread always inherits the UI
+     * thread's priority (usually SCHED_PRIORITY_DEFAULT) and RR-shares the CPU
+     * with it.  Honour the requested LVGL priority instead.  Note that on
+     * NuttX a numerically higher priority value means a higher priority. */
+    {
+        struct sched_param param;
+        memset(&param, 0, sizeof(param));
+        param.sched_priority = _nuttx_prio_from_lv(prio);
+        ret = pthread_attr_setschedparam(&attr, &param);
+        if(ret != 0) {
+            LV_LOG_WARN("pthread_attr_setschedparam failed: %d", ret);
+        }
+    }
+#else
+    LV_UNUSED(prio);
+#endif
+
     thread->callback = callback;
     thread->user_data = user_data;
     ret = pthread_create(&thread->thread, &attr, generic_callback, thread);
@@ -206,6 +230,43 @@ static void * generic_callback(void * user_data)
     thread->callback(thread->user_data);
     return NULL;
 }
+
+#if defined(SCHED_PRIORITY_DEFAULT) && defined(SCHED_PRIORITY_MIN) && defined(SCHED_PRIORITY_MAX)
+static int _nuttx_prio_from_lv(lv_thread_prio_t prio)
+{
+    int p;
+
+    switch(prio) {
+        case LV_THREAD_PRIO_LOWEST:
+            p = SCHED_PRIORITY_DEFAULT - 20;
+            break;
+        case LV_THREAD_PRIO_LOW:
+            p = SCHED_PRIORITY_DEFAULT - 10;
+            break;
+        case LV_THREAD_PRIO_MID:
+            p = SCHED_PRIORITY_DEFAULT;
+            break;
+        case LV_THREAD_PRIO_HIGH:
+            p = SCHED_PRIORITY_DEFAULT + 10;
+            break;
+        case LV_THREAD_PRIO_HIGHEST:
+            p = SCHED_PRIORITY_DEFAULT + 20;
+            break;
+        default:
+            p = SCHED_PRIORITY_DEFAULT;
+            break;
+    }
+
+    if(p < SCHED_PRIORITY_MIN) {
+        p = SCHED_PRIORITY_MIN;
+    }
+    if(p > SCHED_PRIORITY_MAX) {
+        p = SCHED_PRIORITY_MAX;
+    }
+
+    return p;
+}
+#endif
 
 
 #endif /*LV_USE_OS == LV_OS_PTHREAD*/

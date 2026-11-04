@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/sf32lb52_idle.c
+ * vendor/HelmOne/chips/sf32lb52/sf32lb52_idle.c
  *
  * Custom up_idle(): WFI + DWT cycle accounting (CONFIG_ARCH_IDLE_CUSTOM).
  *

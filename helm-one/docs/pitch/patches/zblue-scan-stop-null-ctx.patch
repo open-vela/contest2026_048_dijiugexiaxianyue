@@ -1,5 +1,4 @@
 diff --git a/subsys/bluetooth/host/scan.c b/subsys/bluetooth/host/scan.c
-index 8d6ff66b5ff..7f2d034e12b 100644
 --- a/subsys/bluetooth/host/scan.c
 +++ b/subsys/bluetooth/host/scan.c
 @@ -108,6 +108,21 @@ static struct bt_le_per_adv_sync *get_pending_per_adv_sync(struct bt_dev *hdev);
@@ -24,7 +23,36 @@ index 8d6ff66b5ff..7f2d034e12b 100644
  	hdev->scan_ctx->scan_dev_found_cb = NULL;
  #if defined(CONFIG_BT_EXT_ADV)
  	reset_reassembling_advertiser(hdev);
-@@ -1838,7 +1853,12 @@ int bt_le_scan_stop_mc(uint8_t dev_id)
+@@ -515,6 +530,14 @@ int bt_le_scan_user_add(struct bt_dev *hdev, enum bt_le_scan_user flag)
+ {
+ 	uint32_t err;
+ 
++	/* 板级改动（my_vendor）：同 user_remove —— scan_check_if_state_allowed()
++	 * 第一行就解引用 scan_ctx。这里返回 -ENODEV 而不是 0：返回 0 会让上层
++	 * 以为 flag 已经置上、不再重试。 */
++	if (hdev == NULL || hdev->scan_ctx == NULL) {
++		LOG_WRN("scan state add skipped, scan ctx not ready");
++		return -ENODEV;
++	}
++
+ 	if (flag == BT_LE_SCAN_USER_NONE) {
+ 		/* Only check if the scanner parameters should be updated / the scanner should be
+ 		 * started. This is mainly triggered once connections are established.
+@@ -539,6 +562,13 @@ int bt_le_scan_user_remove(struct bt_dev *hdev, enum bt_le_scan_user flag)
+ 
+ int bt_le_scan_user_remove(struct bt_dev *hdev, enum bt_le_scan_user flag)
+ {
++	/* 板级改动（my_vendor）：适配器拆栈 / HCI 复位未回的窗口里 scan_ctx 是
++	 * NULL，本函数与它调用的 scan_update() 都会解引用。见脚本头注释。 */
++	if (hdev == NULL || hdev->scan_ctx == NULL) {
++		LOG_WRN("scan state remove skipped, scan ctx not ready");
++		return 0;
++	}
++
+ 	if (flag == BT_LE_SCAN_USER_NONE) {
+ 		/* Only check if the scanner parameters should be updated / the scanner should be
+ 		 * started. This is mainly triggered once connections are established.
+@@ -1838,7 +1868,12 @@ int bt_le_scan_stop_mc(uint8_t dev_id)
  	}
  
  	bt_scan_softreset(hdev);

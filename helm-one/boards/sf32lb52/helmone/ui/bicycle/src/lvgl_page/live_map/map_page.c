@@ -3,7 +3,8 @@
  * @brief LiveMap：retained 画布、开机文件预载、Helm 翻页隐藏、导航/REC。
  *
  * 开机：空壳进栈，splash 底下 `boot_prepare` 只加载文件；淡入完成后才泵
- * 首帧，canvas 隐藏到 `render_finish`。还没进过地图页时禁止 GNSS
+ * 首帧，canvas 隐藏到 `render_finish`。首帧前地图卡里是「地图加载中…」占位，
+ * 收帧后画布 180 ms 淡入、占位淡出删除。还没进过地图页时禁止 GNSS
  * `set_center` rebase。
  * 约定见 `doc/splash.md` 与 `docs/map/LIVEMAP.md` §4.4。
  */
@@ -11,6 +12,7 @@
 #include "map_page.h"
 
 #include "bicycle_page_anima.h"
+#include "helm_anim.h"
 #include "helm_palette.h"
 #include "helm_shell.h"
 #include "myvendor_watchdog.h"
@@ -21,6 +23,8 @@
 #include "bicycle_env.h"
 #include "bicycle_c_debug.h"
 #include "bicycle_page_ids.h"
+#include "../lvgl_page.h"
+#include "bicycle_mtp_ui.h"
 #include "lv_pm_theme.h"
 #include "lv_pm_port.h"
 #include "lv_pm_bar.h"
@@ -28,6 +32,9 @@
 #include "myvendor_devctl.h"
 #include "myvendor_sound.h"
 #include "gpx_decode.h"
+/* SD 判死闸门（见 map_page_gpx_load）：弱符号，模拟器/单测里没有 SD 驱动时
+ * 链接成 0，闸门恒开。 */
+extern bool sf32lb_sd_dead(void) __attribute__((weak));
 #include "vmap/vmap_config.h"
 #include "vmap/vmap_style.h"
 #if VMAP_TRACK_ENABLE
@@ -78,6 +85,8 @@
 #define MAP_PAGE_QUIET_MS          300u
 /** 位移小于此则复用上次 DEM 节点，避免每拍 haversine 扫全图。 */
 #define MAP_PAGE_DEM_CACHE_M       25.0
+/** 首帧画布淡入 / 占位淡出：同一条一次性 lv_anim，结束即释放。 */
+#define MAP_PAGE_FIRST_FADE_MS     180u
 
 struct map_page {
     lv_obj_t * root;
@@ -86,6 +95,10 @@ struct map_page {
     lv_obj_t * rec_lbl;
 #endif
     lv_obj_t * map_area;
+    lv_obj_t * map_placeholder;      /**< 首帧占位底（与地图卡同色，画布之下） */
+    lv_obj_t * map_placeholder_lbl;  /**< 占位中央的「地图加载中…」 */
+    lv_obj_t * map_reveal_canvas;    /**< 首帧淡入：正北画布 */
+    lv_obj_t * map_reveal_rcanvas;   /**< 首帧淡入：航向朝上旋转画布 */
     vmap_view_t * map;
 #if VMAP_TRACK_ENABLE
     vmap_track_t * track;
@@ -104,6 +117,7 @@ struct map_page {
     bool map_ui_visible;     /**< Helm 当前是否显示地图区。 */
     bool map_ui_seen;        /**< 开机后是否进过地图页；未进过禁止隐藏跟车 rebase。 */
     bool map_refresh_pending;
+    bool map_first_shown;    /**< 首帧已收帧并启动淡入；占位层此后不再存在。 */
     uint32_t map_last_follow_ms;
     uint32_t map_quiet_until;
     uint32_t dem_last_ms;
@@ -178,6 +192,13 @@ static lv_pm_page_t s_live_map_page;
 static bool s_boot_deferred;
 static bool s_boot_center_ready;
 static bool s_boot_files_ready;
+/** 盖住主界面的是哪一页（`map_will_disappear` 时记录，`map_will_appear` 取用）。
+ *  菜单返回要走"无动画"（见 bicycle_page_anima.c 的口径），开机 splash / USB 仍保留淡入。 */
+static lv_pm_id s_cover_page_id = 0xffu;
+
+/** cover 兜底的起始时刻（0 = 当前不满足"矛盾条件"）。见 on_gpx_timer 里的说明。 */
+static uint32_t s_cover_stale_since;
+
 #if VMAP_ROUTE_ENABLE
 static vmap_route_graph_t * s_route_graph;
 static vmap_cell_id_t s_graph_region = VMAP_CELL_NONE;
@@ -375,6 +396,36 @@ static void map_page_trip_ahead_clear(map_page_t * page)
 }
 #endif
 
+/**
+ * @brief 首帧占位的配色（跟着当前主题）。
+ *
+ * @details 占位只在第一帧收帧前存在，删除后本函数就是一次空指针判断。
+ *          底色跟地图卡一致（HELM_COLOR_SCR），不另造一种"白"；小字用弱化色。
+ */
+static void map_page_apply_placeholder_chrome(map_page_t * page)
+{
+    lv_font_t * font;
+
+    if (page == NULL || page->map_placeholder == NULL) {
+        return;
+    }
+
+    lv_obj_set_style_bg_color(page->map_placeholder, helm_color(HELM_COLOR_SCR), 0);
+    lv_obj_set_style_bg_opa(page->map_placeholder, LV_OPA_COVER, 0);
+
+    if (page->map_placeholder_lbl != NULL) {
+        font = myvendor_system_font_get(16);
+        if (font == NULL) {
+            font = myvendor_system_font_get(14);
+        }
+        lv_obj_set_style_text_color(page->map_placeholder_lbl,
+            helm_color(HELM_COLOR_MUTE), 0);
+        if (font) {
+            lv_obj_set_style_text_font(page->map_placeholder_lbl, font, 0);
+        }
+    }
+}
+
 static void map_page_apply_panel_chrome(map_page_t * page)
 {
     lv_font_t * font;
@@ -464,6 +515,7 @@ static void map_page_apply_style(map_page_t * page)
     }
 #endif
     map_page_apply_panel_chrome(page);
+    map_page_apply_placeholder_chrome(page);
 }
 
 static void map_page_sync_arrow(map_page_t * page)
@@ -520,6 +572,170 @@ static void map_page_ensure_boot_paint(map_page_t * page)
         vmap_view_redraw_keep_pan(page->map);
     }
     map_page_kick_render(page);
+}
+
+/**
+ * @brief 航向朝上的旋转画布（`vmap_view_get_obj()` 只暴露正北那块）。
+ *
+ * @details rcanvas 与 canvas 都是 vmap 在 map_area 下建的 canvas 类别对象；按类别
+ *          取"除 canvas 之外的那一块"即可，不必去碰 vmap 内部结构。
+ */
+static lv_obj_t * map_page_rot_canvas(map_page_t * page)
+{
+    lv_obj_t * canvas;
+    uint32_t i;
+    uint32_t n;
+
+    if (page == NULL || page->map_area == NULL || page->map == NULL) {
+        return NULL;
+    }
+
+    canvas = vmap_view_get_obj(page->map);
+    n = lv_obj_get_child_count(page->map_area);
+    for (i = 0u; i < n; i++) {
+        lv_obj_t * child = lv_obj_get_child(page->map_area, (int32_t)i);
+
+        if (child != canvas && lv_obj_check_type(child, &lv_canvas_class)) {
+            return child;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief 首帧占位：地图卡里的浅底 + 中央一行小字。
+ *
+ * @details 挂在 map_area 最底层（画布之下）。首帧 render_finish() 之前画布一直是
+ *          HIDDEN，露出来的是这一层，而不是"卡片突然空一块"；画布可见时由
+ *          map_page_reveal_first_frame() 淡出并删除。静态对象，不挂定时器。
+ */
+static void map_page_placeholder_create(map_page_t * page)
+{
+    if (page == NULL || page->map_area == NULL || page->map_placeholder != NULL) {
+        return;
+    }
+
+    page->map_placeholder = lv_obj_create(page->map_area);
+    lv_obj_remove_style_all(page->map_placeholder);
+    lv_obj_set_size(page->map_placeholder, lv_pct(100), lv_pct(100));
+    lv_obj_set_pos(page->map_placeholder, 0, 0);
+    lv_obj_remove_flag(page->map_placeholder, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(page->map_placeholder, LV_OBJ_FLAG_SCROLLABLE);
+    /* 画布建好后会被 move_background() 压到最底；占位必须再压回它下面。 */
+    lv_obj_move_background(page->map_placeholder);
+
+    page->map_placeholder_lbl = lv_label_create(page->map_placeholder);
+    lv_label_set_text(page->map_placeholder_lbl, "地图加载中…");
+    lv_obj_set_style_text_align(page->map_placeholder_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    /* 不能居中：地图中心的箭头（`vmap_view_bind_arrow_layer`）就画在正中，
+     * 两者叠在一起会读成“地图[箭头]中…”。往上挪一个箭头高度多一点。 */
+    lv_obj_align(page->map_placeholder_lbl, LV_ALIGN_CENTER, 0, -38);
+    map_page_apply_placeholder_chrome(page);
+}
+
+/**
+ * @brief 首帧淡入 exec：画布 0→COVER，占位 COVER→0（同一条动画）。
+ *
+ * @details var 是 map_page 而不是某块画布：正北 / 航向朝上两条显示路径在这里合并，
+ *          两块画布一起复位；销毁时也能按 page 一次删掉，不留半个状态。
+ */
+static void map_page_first_fade_exec(void * var, int32_t v)
+{
+    map_page_t * page = (map_page_t *)var;
+    lv_opa_t opa;
+
+    if (page == NULL || helm_anim_is_suspended()) {
+        return;
+    }
+
+    if (v <= (int32_t)LV_OPA_TRANSP) {
+        opa = LV_OPA_TRANSP;
+    } else if (v >= (int32_t)LV_OPA_COVER) {
+        opa = LV_OPA_COVER;
+    } else {
+        opa = (lv_opa_t)v;
+    }
+
+    if (page->map_reveal_canvas != NULL) {
+        lv_obj_set_style_opa(page->map_reveal_canvas, opa, 0);
+    }
+    if (page->map_reveal_rcanvas != NULL) {
+        lv_obj_set_style_opa(page->map_reveal_rcanvas, opa, 0);
+    }
+    if (page->map_placeholder != NULL) {
+        lv_obj_set_style_opa(page->map_placeholder,
+            (lv_opa_t)(LV_OPA_COVER - opa), 0);
+    }
+}
+
+/**
+ * @brief 首帧淡入完成：opa 复位 COVER、删除占位。
+ *
+ * @details 画布必须回到 LV_OPA_COVER（否则之后每一帧都跟着变淡）；占位只服务首帧，
+ *          淡出后连对象一起删，后续页面/主题不再有它的开销。
+ */
+static void map_page_first_fade_done(lv_anim_t * a)
+{
+    map_page_t * page = (a != NULL) ? (map_page_t *)a->var : NULL;
+
+    if (page == NULL) {
+        return;
+    }
+
+    if (page->map_reveal_canvas != NULL) {
+        lv_obj_set_style_opa(page->map_reveal_canvas, LV_OPA_COVER, 0);
+    }
+    if (page->map_reveal_rcanvas != NULL) {
+        lv_obj_set_style_opa(page->map_reveal_rcanvas, LV_OPA_COVER, 0);
+    }
+    if (page->map_placeholder != NULL) {
+        lv_obj_delete(page->map_placeholder);
+        page->map_placeholder = NULL;
+        page->map_placeholder_lbl = NULL;
+    }
+    page->map_reveal_canvas = NULL;
+    page->map_reveal_rcanvas = NULL;
+}
+
+/**
+ * @brief 首帧收帧：画布淡入 + 占位淡出（一次 180 ms 动画，用完即删）。
+ *
+ * @details 唯一入口是 on_render_pump() 里 vmap_view_render_pump() 报告整帧完成的
+ *          那一拍（render_finish() 只清 HIDDEN，不会自己带过渡）。正北的 canvas 与
+ *          航向朝上的 rcanvas 在这里收敛成同一条路径。之后 map_first_shown 为 true，
+ *          每帧只多一次 bool 判断；动画结束不留定时器，占位对象也删掉。
+ */
+static void map_page_reveal_first_frame(map_page_t * page)
+{
+    lv_anim_t a;
+
+    if (page == NULL || page->map == NULL || page->map_first_shown) {
+        return;
+    }
+    /* pump 在 LFS hold 等路径会提前返回 true 而没走到 render_finish：以帧计数为准。 */
+    if (vmap_view_render_revision(page->map) == 0u) {
+        return;
+    }
+
+    if (page->map_reveal_canvas == NULL) {
+        page->map_reveal_canvas = vmap_view_get_obj(page->map);
+    }
+    if (page->map_reveal_rcanvas == NULL) {
+        page->map_reveal_rcanvas = map_page_rot_canvas(page);
+    }
+    page->map_first_shown = true;
+
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, page);
+    lv_anim_set_values(&a, (int32_t)LV_OPA_TRANSP, (int32_t)LV_OPA_COVER);
+    lv_anim_set_duration(&a, MAP_PAGE_FIRST_FADE_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, map_page_first_fade_exec);
+    lv_anim_set_completed_cb(&a, map_page_first_fade_done);
+    if (lv_anim_start(&a) == NULL) {
+        /* 动画节点分配失败（罕见）：直接落到终态，不能把画布留在全透明。 */
+        map_page_first_fade_done(&a);
+    }
 }
 
 static void map_page_stamp_route_overlay(map_page_t * page)
@@ -593,6 +809,19 @@ static void map_page_on_pm_theme(void * pm_page, lv_pm_theme_id_t id, void * use
         return;
     }
 
+    /* 主题没变：`lv_pm_close_page_msg()` 在每次覆盖页返回时都会重放一次当前
+     * 主题（`_on_back_open_animation_complete()` → `lv_pm_theme_apply()`），
+     * 而下面几步都是幂等重设 —— 其中 `vmap_view_set_arrow_image()` 一次就要
+     * ~60 ms（WP-FADE/R1 板测：351 ms → 290 ms）。转场中（`lv_pm_nav_busy()`）
+     * + 主题 id 没变 + 画布已就绪时直接跳过，只保留层级抬升（菜单覆盖期间
+     * chrome 可能被压过）。显式的 `map_page_redraw()` 不在转场里，仍走完整路径；
+     * 覆盖中/主题变了/首帧还没出也走完整路径。 */
+    if (lv_pm_nav_busy() && !page->covered && page->map_theme_id == id
+        && vmap_view_render_revision(page->map) > 0
+        && !page->map_refresh_pending) {
+        helm_shell_raise_chrome();
+        return;
+    }
     map_page_apply_style(page);
     lv_pm_status_bar_apply_theme(lv_pm_theme_current());
     arrow = vmap_style_current()->ui_navi_arrow_dark ? NAVI_ARROW_DARK
@@ -662,7 +891,7 @@ static void on_track_lap(vmap_track_t * track, uint16_t lap, void * user_data)
     (void)user_data;
 
     snprintf(buf, sizeof(buf), "开始第 %u 圈", (unsigned)lap);
-    lv_pm_notify_show("Lap", buf, 3000);
+    lv_pm_notify_show("圈数", buf, 3000);
     myvendor_sound_ok();
     bicycle_c_debug_track_lap(lap);
 }
@@ -682,6 +911,9 @@ static void map_page_plan_hint_update(map_page_t * page)
         spin[page->plan_hint_phase & 3u]);
     page->plan_hint_phase++;
     lv_label_set_text(page->plan_hint, text);
+    /* ⚠ 先按新文本重排再居中：旋转字符 |/-\ 宽度不同，直接 align 会用到旧宽度，
+     * 提示条会短暂偏左（用户 2026-10-18 报）。 */
+    lv_obj_update_layout(page->plan_hint);
     lv_obj_align(page->plan_hint, LV_ALIGN_CENTER, 0, 0);
 }
 
@@ -782,10 +1014,21 @@ static bool map_page_nav_mtp_acquire(map_page_t * page)
         return true;
     }
 
-    map_page_plan_hint_show(page, "正在关闭 MTP");
+    /* 只在**UI 真停在 MTP 传输页**时才说"正在关闭 MTP"：quiesce 为真还有一个与
+     * MTP 无关的成因 —— 别人拿着有效的 LFS hold（手机 BLE 文件传输的
+     * `myvendor_mtp_lfs_hold("companion")`、星历注入的 `("gnss")`，保鲜期 30 s）。
+     * 以前不分缘由一律报"MTP"，骑行时手机一传文件就在地图上弹出这句话，
+     * 看着像误触发（用户 2026-09-25 报："MCU 根本没开 MTP"）。*/
+    if (myvendor_mtp_page_active()) {
+        map_page_plan_hint_show(page, "正在退出文件传输");
+    }
     for (i = 0u; i < 50u; i++) {
         usleep(20000);
         if (!myvendor_mtp_lfs_quiesce()) {
+            /* 让位成功要把提示收掉（调用方随后会显示"规划路线中"）。
+             * 2026-09-25 修：这条提前 return 原来漏了 hide ⇒ 提示会一直挂在屏上，
+             * 表现为"这句话关不掉"。 */
+            map_page_plan_hint_hide(page);
             return true;
         }
         if ((i % 5u) == 4u) {
@@ -857,9 +1100,57 @@ static bool map_page_ensure_route_graph(map_page_t * page)
     return true;
 }
 
-static void map_page_sync_route_region(map_page_t * page, double lon, double lat)
+/**
+ * @brief 按**规划起点坐标**装路网图（不是当前显示区域）。
+ *
+ * @details 2026-11-03 上板实测：地图还停在上一站（比如滁州）时发起北京城区的
+ *          坐标点导航，`map_page_ensure_route_graph()` 按 `active_region`（显示区域）
+ *          装的是上一站的图 —— 北京的点被吸到 869 km 外，日志 `both ends off-road`，
+ *          规划永远失败。
+ *          规划真正需要的是 **from/to 所在格子** 的图；跨格由 corridor 走另一条路，
+ *          所以这里只处理"同一格"的情况。
+ * @return 装好/已缓存返回 true；坐标算不出格子或读图失败时退回旧行为。
+ */
+static bool map_page_ensure_plan_graph(map_page_t * page, double from_lon,
+    double from_lat)
 {
-    vmap_cell_id_t rid;
+    vmap_cell_id_t rid = VMAP_CELL_NONE;
+
+    if (!vmap_map_catalog_is_regional()) {
+        return map_page_ensure_route_graph(page);   /* 旧版单图包 */
+    }
+    if (!vmap_map_catalog_find_region(from_lon, from_lat, &rid)) {
+        /* 坐标越界/该格没有 vpk：保持旧行为（按显示区域） */
+        return map_page_ensure_route_graph(page);
+    }
+    if (s_route_graph && rid == s_graph_region) {
+        return true;
+    }
+    if (myvendor_mtp_lfs_quiesce()) {
+        VMAP_NAV_WARN("plan graph load blocked: lfs quiesce");
+        return false;
+    }
+    if (s_route_graph) {
+        vmap_route_graph_unload(s_route_graph);
+        s_route_graph = NULL;
+        map_page_dem_cache_clear();
+    }
+    if (!vmap_route_graph_load_from_region(&s_route_graph, VMAP_TILE_DIR, rid)) {
+        return false;
+    }
+    s_graph_region = rid;
+    if (page && page->route) {
+        vmap_route_set_graph(page->route, s_route_graph);
+    }
+    VMAP_NAV_LOG("graph ready (plan) nodes=%u edges=%u region=%u",
+        (unsigned)vmap_route_graph_node_count(s_route_graph),
+        (unsigned)vmap_route_graph_edge_count(s_route_graph),
+        (unsigned)s_graph_region);
+    return true;
+}
+
+static void map_page_sync_route_region(map_page_t * page, double lon, double lat)
+{    vmap_cell_id_t rid;
     vmap_tile_cache_t * tc;
     uint16_t ix;
     uint16_t iy;
@@ -1375,7 +1666,7 @@ static void map_page_nav_plan_done(void * user, bool ok,
             const double course_m = page->nav_gpx_true_m > page->nav_gpx_total_m
                 ? page->nav_gpx_true_m : page->nav_gpx_total_m;
 
-            snprintf(msg, sizeof(msg), "GPX %.1f / %.1f km · %u 路口",
+            snprintf(msg, sizeof(msg), "路线 %.1f / %.1f km · %u 路口",
                 page->nav_gpx_win_end_m / 1000.0,
                 course_m / 1000.0, (unsigned)junction_n);
         } else if (page->nav_replanning) {
@@ -1428,6 +1719,9 @@ static void map_page_nav_plan_done(void * user, bool ok,
         }
         map_page_nav_refresh_map(page, cx, cy);
     }
+    /* 规划落地后同步一次箭头：定位/航向/层级都按最新 fix 摆正。
+     * （规划期间菜单盖住地图时 refresh_map 会早退，这里兜住那一拍。） */
+    map_page_sync_arrow(page);
 }
 
 static bool map_page_nav_rolling_submit(map_page_t * page, double from_lon,
@@ -1614,6 +1908,15 @@ static bool map_page_nav_plan_begin(map_page_t * page, double from_lon,
         return false;
     }
 
+    /* 新起航（不是偏航重规划）必须退出"只看轨迹/回放"审阅态：否则 gpx_timer
+     * 在 `nav_review` 分支早退，箭头不再更新、导航也不会推进。
+     * 同时把箭头显式打开并提到 map_area 最前 —— "只看轨迹"会把它藏起来，
+     * 而规划导航原先没有任何一处恢复它（用户 2026-10-18：坐标点导航没有 ^ 箭头）。 */
+    if (!reroute) {
+        page->nav_review = false;
+    }
+    map_page_set_arrow_visible(page, true);
+
     if (myvendor_mtp_lfs_quiesce()) {
         VMAP_NAV_WARN("plan_begin: blocked lfs quiesce");
         if (!mtp_was_held) {
@@ -1673,8 +1976,8 @@ static bool map_page_nav_plan_begin(map_page_t * page, double from_lon,
             from_lon, from_lat, to_lon, to_lat);
 
         if (!corridor) {
-            map_page_plan_hint_show(page, "加载路网");
-            if (!map_page_ensure_route_graph(page)) {
+            map_page_plan_hint_show(page, "正在加载路网");
+            if (!map_page_ensure_plan_graph(page, from_lon, from_lat)) {
                 page->nav_planning = false;
                 page->nav_replanning = false;
                 map_page_plan_hint_hide(page);
@@ -1766,6 +2069,39 @@ static void map_page_apply_companion_sensors(void)
     bicycle_runtime_sync_companion_sensors();
 }
 
+/* 诊断用：计时两个 UI 线程定时器回调的占用（每 2 s 一行 `[ui]`，LOG_DEBUG）。
+ * 目的：`[vperf]` 只覆盖地图自己的一帧，ps 里 bicycle_ui 的其余时间在这里。 */
+static struct
+{
+    uint32_t gpx_ms;
+    uint32_t pump_ms;
+    uint32_t n_gpx;
+    uint32_t n_pump;
+    uint32_t win;
+} s_ui_pf;
+
+static void ui_pf_flush(void)
+{
+    uint32_t win;
+
+    if (s_ui_pf.win == 0u) {
+        s_ui_pf.win = lv_tick_get();
+        return;
+    }
+    win = lv_tick_elaps(s_ui_pf.win);
+    if (win < 2000u) {
+        return;
+    }
+    syslog(LOG_DEBUG, "[ui] gpx=%ums/%u pump=%ums/%u win=%ums",
+        (unsigned)s_ui_pf.gpx_ms, (unsigned)s_ui_pf.n_gpx,
+        (unsigned)s_ui_pf.pump_ms, (unsigned)s_ui_pf.n_pump, (unsigned)win);
+    s_ui_pf.gpx_ms = 0u;
+    s_ui_pf.pump_ms = 0u;
+    s_ui_pf.n_gpx = 0u;
+    s_ui_pf.n_pump = 0u;
+    s_ui_pf.win = lv_tick_get();
+}
+
 static void on_render_pump(lv_timer_t * timer)
 {
     map_page_t * page = (map_page_t *)lv_timer_get_user_data(timer);
@@ -1779,6 +2115,10 @@ static void on_render_pump(lv_timer_t * timer)
     }
 
     if (vmap_view_render_pump(page->map, VMAP_RENDER_PUMP_MAX_TILES)) {
+        /* 只在首帧完成那一拍走淡入；之后稳态这里就是一次 bool 判断。 */
+        if (!page->map_first_shown) {
+            map_page_reveal_first_frame(page);
+        }
         map_page_sync_arrow(page);
         helm_shell_raise_chrome();
 #if VMAP_TRACK_ENABLE
@@ -1792,20 +2132,45 @@ static void on_render_pump(lv_timer_t * timer)
     }
 }
 
+/* 分段计时（诊断）：`on_gpx_timer` 里几段重活的耗时，整拍 >=60 ms 时打一行
+ * `[gpx] total=… nav=… follow=… track=… dem=…`（LOG_DEBUG）。 */
+#define MAP_GPX_STALL_PARTS 8
+static const char * s_stall_tag[MAP_GPX_STALL_PARTS];
+static uint32_t s_stall_ms[MAP_GPX_STALL_PARTS];
+static int s_stall_n;
+
 static void map_page_gpx_stall_log(uint32_t t0, bool vis0, bool cov0,
     bool pending0, bool fix_ok)
 {
-    LV_UNUSED(t0);
+    const uint32_t total = lv_tick_elaps(t0);
+
     LV_UNUSED(vis0);
     LV_UNUSED(cov0);
     LV_UNUSED(pending0);
     LV_UNUSED(fix_ok);
+
+    if (total >= 60u && s_stall_n > 0) {
+        char buf[128];
+        int off = 0;
+        int i;
+
+        for (i = 0; i < s_stall_n && off < (int)sizeof(buf) - 24; i++) {
+            off += snprintf(buf + off, sizeof(buf) - (size_t)off, "%s=%ums ",
+                s_stall_tag[i], (unsigned)s_stall_ms[i]);
+        }
+        syslog(LOG_DEBUG, "[gpx] total=%ums %s", (unsigned)total, buf);
+    }
+    s_stall_n = 0;
 }
 
 static void map_page_gpx_stall_part(const char * tag, uint32_t t0)
 {
-    LV_UNUSED(tag);
-    LV_UNUSED(t0);
+    if (s_stall_n >= MAP_GPX_STALL_PARTS) {
+        return;
+    }
+    s_stall_tag[s_stall_n] = tag;
+    s_stall_ms[s_stall_n] = lv_tick_elaps(t0);
+    s_stall_n++;
 }
 
 /* 定义在 map_page_nav_arrived() 上方；tick 里收尾判定也要用。 */
@@ -1825,10 +2190,57 @@ static void on_gpx_timer(lv_timer_t * timer)
         return;
     }
 
+    /* ── cover 状态兜底（现场修复）────────────────────────────────────────────
+     * map_page_pause_for_cover() 会：covered=true、暂停 shell 的 1 Hz ui_timer/
+     * rot_timer、**清空全部页面按键回调**；恢复只在 map_did_appear() 里做。
+     * 一旦那次 did_appear 因为任何原因没来，就永久停在"主界面被盖住"：
+     *   · 屏定格在最后一帧（现场：P02 骑行表盘，时钟不再走）；
+     *   · 翻页/换视图全部被 ui_covered 挡掉，按键也没了回调 ⇒ 用户视角"卡死"；
+     *   · 地图泵停（pump=0）、`[gpx] total=` 消失，但 UI 主循环、看门狗都正常。
+     * 判据：**covered 为真、而 lv_pm 当前页已经是地图页自己** —— 这两个状态互相
+     * 矛盾（地图页不可能盖住自己）。持续 2 s 就补一次 resume，把定时器与按键
+     * 回调装回去。5 Hz 的 gpx 定时器在 cover 期间仍然在跑，正好当兜底钩子。 */
+    if (page->covered && !bicycle_mtp_ui_storage_held() &&
+        lvgl_page_current_id() == BICYCLE_PM_ID_MAP) {
+        uint32_t now = lv_tick_get();
+
+        if (s_cover_stale_since == 0u) {
+            s_cover_stale_since = now ? now : 1u;
+        } else if (lv_tick_elaps(s_cover_stale_since) >= 2000u) {
+            syslog(LOG_WARNING,
+                   "[map] cover stale %ums -> force resume\n",
+                   (unsigned)lv_tick_elaps(s_cover_stale_since));
+            s_cover_stale_since = 0u;
+            map_page_resume_after_cover(page);
+            return;
+        }
+    } else {
+        s_cover_stale_since = 0u;
+    }
+
     t0 = lv_tick_get();
     pending0 = page->map_refresh_pending;
     vis0 = page->map_ui_visible;
     cov0 = page->covered;
+
+    /* 导航横幅盖住地图顶部：把画布内容与箭头一起下移**半个横幅高**，让骑手落在
+     * 「横幅以下那块可见区」的中心（用户 2026-09-25 定；实测箭头原本落在整块
+     * 地图区的中心 132，而可见区中心是 161，差 29 = HELM_NAV_BAN_H/2）。
+     *
+     * **必须放在本函数所有早退之前**：无定位（骑手停在规划起点）、被别的页盖住、
+     * 静音期这三种情况都会在下面 return，而那时箭头同样需要跟着横幅偏 —— 第一版
+     * 放在函数尾部的正常跟车分支里，结果"有横幅但无 fix"时一点都不偏（用户实测）。
+     * 每次都按横幅实际状态重算，谁隐藏横幅都不会留下陈旧偏置；偏置只作用于显示
+     * 位置，不进跟车/rebase 的数学。 */
+    vmap_view_set_y_bias(page->map,
+        helm_shell_nav_ban_shown() ? (HELM_NAV_BAN_H / 2) : 0);
+
+    /* 主题切换等"整帧重绘"请求必须在**本函数所有早退之前**消费：无定位、
+     * nav_review、静音期三条早退分支都不会再走到函数尾的 pending 处理，
+     * 请求会被永久吞掉（Codex R1 P2-7 反例 B）。转入 5 Hz 的心跳路径，
+     * 不额外开定时器。 */
+    map_page_ensure_boot_paint(page);
+
     have_fix = bicycle_runtime_poll_fix(&fix);
     bicycle_runtime_tick(lv_tick_get());
     bicycle_runtime_update_gnss(&fix);
@@ -1913,6 +2325,7 @@ static void on_gpx_timer(lv_timer_t * timer)
             page->nav_last_update_ms = now;
             vmap_route_nav_update(page->nav, fix.longitude, fix.latitude,
                 fix.course_deg, fix.speed_kph);
+            map_page_gpx_stall_part("navupd", t_nav);
             st = vmap_route_nav_state(page->nav);
             if (st && st->active) {
                 bool gpx_window_busy = false;
@@ -1922,8 +2335,11 @@ static void on_gpx_timer(lv_timer_t * timer)
                     st->off_route_m, st->turn_rel_deg);
                 map_page_nav_announce_if_needed(page);
                 if (page->nav_gpx_pts && page->nav_gpx_n >= 2u) {
+                    uint32_t t_win = lv_tick_get();
+
                     gpx_window_busy = map_page_gpx_tick_window(page, st,
                         fix.longitude, fix.latitude);
+                    map_page_gpx_stall_part("gpxwin", t_win);
                     if (gpx_window_busy) {
                         st = vmap_route_nav_state(page->nav);
                         if (st && st->active) {
@@ -1941,10 +2357,12 @@ static void on_gpx_timer(lv_timer_t * timer)
                     if (page->nav_gpx_pts && page->nav_gpx_n >= 2u
                         && off_m >= threshold * 0.5) {
                         double gpx_d = 1e300;
+                        uint32_t t_near = lv_tick_get();
 
                         (void)map_page_gpx_nearest_along(page->nav_gpx_pts,
                             page->nav_gpx_n, fix.longitude, fix.latitude,
                             &gpx_d);
+                        map_page_gpx_stall_part("gpxnear", t_near);
                         off_m = gpx_d;
                     }
                     bicycle_runtime_update_nav(
@@ -2192,6 +2610,9 @@ static void on_gpx_timer(lv_timer_t * timer)
         return;
     }
 
+    /* 航向朝上：速度门与低通都在 vmap_view_set_heading 里（首个航向无条件接受，
+     * 之后低速保持上次朝向）。 */
+    vmap_view_set_heading(page->map, fix.course_deg, fix.speed_kph);
     vmap_view_update_arrow(page->map, fix.longitude, fix.latitude, fix.course_deg);
     if (page->map_quiet_until != 0u
         && lv_tick_elaps(page->map_quiet_until) < MAP_PAGE_QUIET_MS) {
@@ -2206,14 +2627,23 @@ static void on_gpx_timer(lv_timer_t * timer)
         return;
     }
     if (page->map_refresh_pending) {
+        /* 帧还在跑时**不能清 pending**：这时只能 kick 当前帧，而当前帧是按
+         * 旧几何/旧样式起的，收帧回调也不会补做整帧重绘 —— 清掉就等于把
+         * "换主题后整屏重画"的请求丢了，已画一半的画布会留下旧色
+         *（Codex R1 P2-7 反例 A）。留着，下一个 tick 再消费。 */
+        if (vmap_view_render_busy(page->map)) {
+            map_page_kick_render(page);
+            map_page_gpx_stall_log(t0, vis0, cov0, pending0,
+                have_fix && fix.valid);
+            return;
+        }
+
         page->map_refresh_pending = false;
         page->map_last_follow_ms = lv_tick_get();
         if (vmap_view_render_revision(page->map) == 0) {
             vmap_view_set_view(page->map, fix.longitude, fix.latitude,
                 vmap_view_get_zoom(page->map));
             vmap_view_render(page->map);
-            map_page_kick_render(page);
-        } else if (vmap_view_render_busy(page->map)) {
             map_page_kick_render(page);
         } else {
             vmap_view_set_center(page->map, fix.longitude, fix.latitude);
@@ -2241,6 +2671,27 @@ static void on_gpx_timer(lv_timer_t * timer)
 #endif
 
     map_page_gpx_stall_log(t0, vis0, cov0, pending0, have_fix && fix.valid);
+}
+
+/* 计时包装：真正注册给 LVGL 的是这两个（见 s_ui_pf 的说明）。 */
+static void on_gpx_timer_wrap(lv_timer_t * timer)
+{
+    const uint32_t t0 = lv_tick_get();
+
+    on_gpx_timer(timer);
+    s_ui_pf.gpx_ms += lv_tick_elaps(t0);
+    s_ui_pf.n_gpx++;
+    ui_pf_flush();
+}
+
+static void on_render_pump_wrap(lv_timer_t * timer)
+{
+    const uint32_t t0 = lv_tick_get();
+
+    on_render_pump(timer);
+    s_ui_pf.pump_ms += lv_tick_elaps(t0);
+    s_ui_pf.n_pump++;
+    ui_pf_flush();
 }
 
 static void map_page_build_status_panel(map_page_t * page, lv_font_t * font16)
@@ -2288,8 +2739,13 @@ map_page_t * map_page_create(lv_obj_t * parent)
     /* Map viewport: scrollable parent clips the 192px canvas overscan. */
     page->map_area = lv_obj_create(page->root);
     lv_obj_remove_style_all(page->map_area);
-    lv_obj_set_size(page->map_area, PAGE_HOR_RES, HELM_MAP_BODY_H);
-    lv_obj_align(page->map_area, LV_ALIGN_TOP_LEFT, 0, HELM_SUBBAR_H);
+    /* 地图为常驻导航横幅让位：整体下移半个横幅高度并相应加高，多出的底部被数据条
+     * 盖住看不见 —— 于是骑手箭头落在**可见区域**的中心（用户 2026-09-25 指出）。
+     * 未导航（横幅隐藏）时地图会略偏下这半个横幅，属可接受的取舍。 */
+    lv_obj_set_size(page->map_area, PAGE_HOR_RES,
+                    HELM_MAP_BODY_H + HELM_NAV_BAN_SHIFT);
+    lv_obj_align(page->map_area, LV_ALIGN_TOP_LEFT, 0,
+                 HELM_SUBBAR_H + HELM_NAV_BAN_SHIFT);
     lv_obj_set_style_bg_opa(page->map_area, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(page->map_area, helm_color(HELM_COLOR_SCR), 0);
     lv_obj_set_style_radius(page->map_area, 1, 0);
@@ -2299,12 +2755,18 @@ map_page_t * map_page_create(lv_obj_t * parent)
     lv_obj_set_scrollbar_mode(page->map_area, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_dir(page->map_area, LV_DIR_NONE);
 
-    page->map = vmap_view_create(page->map_area, VMAP_MAP_W, HELM_MAP_BODY_H,
+    page->map = vmap_view_create(page->map_area, VMAP_MAP_W,
+        HELM_MAP_BODY_H + HELM_NAV_BAN_SHIFT,
         VMAP_CANVAS_MARGIN);
     if (!page->map) {
         map_page_destroy(page);
         return NULL;
     }
+    /* 地图朝向来自设置（`persist.ui.map_heading_up`）：
+     *   开 = 随航向旋转、箭头恒指上，路名走独立正立文本（不烘进底图）；
+     *   关 = 原样（正北朝上、路名烘进地图图片，性能更好）。默认关。
+     * 首帧之前只是记录状态：set_heading_up 在 render_rev==0 时不会提前开帧。 */
+    vmap_view_set_heading_up(page->map, myvendor_devctl_map_heading_up_get());
 
 #if VMAP_TRACK_ENABLE
     page->track = vmap_track_create_on_view(page->map);
@@ -2338,6 +2800,21 @@ map_page_t * map_page_create(lv_obj_t * parent)
     map_page_sync_zoom_state(page);
     lv_obj_move_background(vmap_view_get_obj(page->map));
 
+    /* 首帧占位：垫在画布之下，收帧后淡出删除（见 map_page_reveal_first_frame）。 */
+    map_page_placeholder_create(page);
+
+    /* 首帧前两块画布都还是 HIDDEN；先把 opa 压到 0，收帧后由上面那条一次性动画
+     * 淡入 —— render_finish() 只清 HIDDEN，不会自己带过渡。航向朝上时
+     * vmap_view_set_heading_up() 会提前露出 rcanvas，这一步也挡住它。 */
+    page->map_reveal_canvas = vmap_view_get_obj(page->map);
+    if (page->map_reveal_canvas != NULL) {
+        lv_obj_set_style_opa(page->map_reveal_canvas, LV_OPA_TRANSP, 0);
+    }
+    page->map_reveal_rcanvas = map_page_rot_canvas(page);
+    if (page->map_reveal_rcanvas != NULL) {
+        lv_obj_set_style_opa(page->map_reveal_rcanvas, LV_OPA_TRANSP, 0);
+    }
+
     vmap_view_bind_arrow_layer(page->map, page->map_area);
     vmap_view_set_follow_mode(page->map, true);
     {
@@ -2356,13 +2833,13 @@ map_page_t * map_page_create(lv_obj_t * parent)
     vmap_track_set_recording(page->track, cfg->record_on_start);
 #endif
 
-    page->gpx_timer = lv_timer_create(on_gpx_timer, cfg->gnss_update_ms, page);
+    page->gpx_timer = lv_timer_create(on_gpx_timer_wrap, cfg->gnss_update_ms, page);
     if (s_boot_deferred && page->gpx_timer) {
         lv_timer_pause(page->gpx_timer);
     }
 
-    page->render_timer = lv_timer_create(on_render_pump, MAP_PAGE_RENDER_PUMP_MS,
-        page);
+    page->render_timer = lv_timer_create(on_render_pump_wrap,
+        MAP_PAGE_RENDER_PUMP_MS, page);
     if (page->render_timer) {
         lv_timer_pause(page->render_timer);
     }
@@ -2458,6 +2935,21 @@ bool map_page_set_style_by_name(map_page_t * page, const char * name)
 void map_page_redraw(map_page_t * page)
 {
     map_page_style_refresh(page);
+}
+
+void map_page_set_arrow_visible(map_page_t * page, bool visible)
+{
+    if (page == NULL || page->map == NULL) {
+        return;
+    }
+
+    vmap_view_set_arrow_visible(page->map, visible);
+    if (visible) {
+        /* 显隐只看 HIDDEN 标志，不保证层级：画布/提示条/航点 pin 都可能后建。
+         * 打开时一并提到最前，避免"箭头已显示但被盖住"。 */
+        vmap_view_bring_arrow_to_front(page->map);
+        map_page_kick_render(page);
+    }
 }
 
 /**
@@ -2618,6 +3110,34 @@ bool map_page_nav_active(const map_page_t * page)
     (void)page;
     return false;
 #endif
+}
+
+void map_page_center_on(map_page_t * page, double lon, double lat)
+{
+    if (!page || !page->map) {
+        return;
+    }
+
+    /* 显式跳转：清掉跟车余量、强制整帧重绘（`set_view` 把 paint_zoom 置 -1）。 */
+    vmap_view_set_view(page->map, lon, lat, vmap_view_get_zoom(page->map));
+    page->map_last_follow_ms = lv_tick_get();
+    page->map_quiet_until = 0u;
+    page->map_refresh_pending = true;
+
+    if (!page->covered) {
+        vmap_view_render(page->map);
+        map_page_kick_render(page);
+    }
+}
+
+bool map_page_render_ready(const map_page_t * page)
+{
+    if (!page || !page->map) {
+        return false;
+    }
+
+    return vmap_view_render_revision(page->map) > 0
+        && !vmap_view_render_busy(page->map);
 }
 
 bool map_page_nav_planning(const map_page_t * page)
@@ -2878,6 +3398,141 @@ double map_page_nav_off_warn_m(const map_page_t * page)
     return 25.0;
 }
 
+double map_page_nav_turn_dist_m(const map_page_t * page)
+{
+#if VMAP_ROUTE_ENABLE
+    const vmap_route_nav_state_t * st;
+
+    if (page == NULL || page->nav == NULL) {
+        return -1.0;
+    }
+    st = vmap_route_nav_state(page->nav);
+    if (st == NULL || !st->active) {
+        return -1.0;
+    }
+    /* 没有下一个转向点（纯轨迹跟随、或前方无路口）不是"临近路口"。 */
+    if (st->next_kind == VMAP_MANEUVER_NONE || st->maneuver_idx == UINT32_MAX) {
+        return -1.0;
+    }
+    return st->dist_to_maneuver_m;
+#else
+    (void)page;
+    return -1.0;
+#endif
+}
+
+double map_page_nav_remain_m(const map_page_t * page)
+{
+#if VMAP_ROUTE_ENABLE
+    const vmap_route_nav_state_t * st;
+
+    if (page == NULL || page->nav == NULL) {
+        return -1.0;
+    }
+    st = vmap_route_nav_state(page->nav);
+    if (st == NULL || !st->active) {
+        return -1.0;
+    }
+    return map_page_nav_remain_display_m(page, st);
+#else
+    (void)page;
+    return -1.0;
+#endif
+}
+
+double map_page_nav_route_total_m(const map_page_t * page)
+{
+    if (page == NULL || page->route == NULL) {
+        return -1.0;
+    }
+
+    /* 剖面窗口的坐标系是**当前应用的这条 route**：GPX 密集跟线时它是一个
+     * 窗口片（不是整条课程），所以窗口长度必须用它，不能用课程全长
+     *（2026-11-04：P02 用 20 km 课程全长开窗、地图按当前路线报剩余，两个数对不上）。*/
+    return vmap_route_total_length_m(page->route);
+}
+
+double map_page_nav_total_m(const map_page_t * page)
+{
+    double t;
+
+    if (page == NULL) {
+        return -1.0;
+    }
+
+    /* **以当前这条路线为准**。`nav_gpx_total_m` 是上一次 GPX 课程留下的全长：
+     * 换成坐标点规划（几百米）后它并不清零，于是 P02 剖面条按 20 km 开窗、
+     * 实际路线只有 750 m —— 折线挤在左边十几像素里，游标走完全程看着还在
+     * 起点附近（2026-11-04 用户实测"走完了还显示开始的位置"）。
+     * 只有 GPX 课程态才用课程全长（与 nav_gpx_pts 的窗口推进同源）。 */
+    if (page->nav_gpx_course && page->nav_gpx_total_m > 0.0) {
+        return page->nav_gpx_total_m;
+    }
+
+    if (page->route != NULL) {
+        t = vmap_route_total_length_m(page->route);
+        if (t > 0.0) {
+            return t;
+        }
+    }
+
+    return -1.0;
+}
+
+double map_page_map_mpp(const map_page_t * page)
+{
+    const double k_mercator = 156543.03392; /* 赤道处 zoom 0 的米/像素（256 px 瓦片） */
+    double lon = 0.0;
+    double lat = 0.0;
+    double scale;
+    int zoom;
+
+    if (page == NULL || page->map == NULL) {
+        return 0.0;
+    }
+    zoom = vmap_view_get_zoom(page->map);
+    scale = vmap_view_get_scale(page->map);
+    if (zoom < 0 || scale <= 0.0) {
+        return 0.0;
+    }
+    vmap_view_get_center(page->map, &lon, &lat);
+    return k_mercator * cos(lat * M_PI / 180.0) / (double)(1u << zoom) / scale;
+}
+
+void map_page_set_banner_inset(map_page_t * page, int32_t px)
+{
+    static int32_t s_inset = -1;
+
+    if (page == NULL || page->map_area == NULL) {
+        return;
+    }
+    if (px < 0) {
+        px = 0;
+    }
+    if (px > HELM_MAP_BODY_H / 2) {
+        px = HELM_MAP_BODY_H / 2;
+    }
+    if (px == s_inset) {
+        return;                      /* 幂等：几何只在值变化时动，避免每拍重排 */
+    }
+    s_inset = px;
+
+    /* 可见窗口：容器上移半个预留高度、底部收掉同样多 —— 于是**视图中心**（跟车点）
+     * 正好落在"横幅下沿 → 数据条"这段可见窗口的中心；容器顶部那半个横幅被横幅挡住，
+     * 看不见。关键是**整体移动容器**（视图与箭头都在容器坐标系里），不能只挪视图。 */
+    lv_obj_set_pos(page->map_area, 0, HELM_SUBBAR_H + px / 2);
+    lv_obj_set_height(page->map_area, HELM_MAP_BODY_H - px / 2);
+
+    /* 只动容器，**不动视图对象**：箭头图层就是 map_area 本身
+     * （vmap_view_bind_arrow_layer(page->map, page->map_area)），箭头对象挂在它下面。
+     * 把视图在容器里上移会让"画布内容"和"箭头坐标"差半个横幅 ——
+     * 用户 2026-09-25 实测"指针和实际地图位置出现偏差"正是这个原因。 */
+
+    /* 几何变了要重画一次：否则画布/覆盖层（含 GPX 细蓝线）会留下按旧尺寸烘的残图，
+     * 表现为轨迹线缺段（用户 2026-09-25 同时报的那一条）。 */
+    vmap_view_redraw_keep_pan(page->map);
+}
+
 #if VMAP_ROUTE_ENABLE
 int16_t map_page_sample_ele_m(const map_page_t * page, double lon, double lat)
 {
@@ -2962,6 +3617,31 @@ uint32_t map_page_nav_profile_ele(const map_page_t * page, int16_t * out,
         }
     }
     return n;
+}
+
+double map_page_nav_along_m(const map_page_t * page)
+{
+    const vmap_route_nav_state_t * st;
+
+    if (page == NULL || page->nav == NULL) {
+        return 0.0;
+    }
+    st = vmap_route_nav_state(page->nav);
+    if (st == NULL || !st->active) {
+        return 0.0;
+    }
+    return (st->along_m > 0.0) ? st->along_m : 0.0;
+}
+
+uint32_t map_page_nav_profile_span(const map_page_t * page, double from_m,
+    double span_m, int16_t * out, uint32_t cap)
+{
+    if (page == NULL || page->route == NULL || out == NULL || span_m <= 0.0) {
+        return 0;
+    }
+
+    return vmap_route_profile_ele_span(page->route, from_m, from_m + span_m,
+                                       out, cap);
 }
 
 bool map_page_nav_progress(const map_page_t * page, uint32_t * pts,
@@ -3123,6 +3803,52 @@ bool map_page_apply_zoom_cmd(map_page_t * page, const char * arg)
     return true;
 }
 
+/**
+ * @brief 航向朝上开关 ctl：on/off。
+ */
+bool map_page_apply_rot_cmd(map_page_t * page, const char * arg)
+{
+    bool on;
+
+    if (!page || !page->map || arg == NULL) {
+        return false;
+    }
+
+    /* "label,on|off"：航向朝上时是否也烘路名（A/B 用）。 */
+    if (strncmp(arg, "label,", 6) == 0) {
+        const char * v = arg + 6;
+
+        if (strcmp(v, "on") != 0 && strcmp(v, "off") != 0) {
+            return false;
+        }
+        vmap_view_set_rot_labels(page->map, strcmp(v, "on") == 0);
+        map_page_kick_render(page);
+        return true;
+    }
+
+    if (strcmp(arg, "on") == 0) {
+        on = true;
+    } else if (strcmp(arg, "off") == 0) {
+        on = false;
+    } else {
+        return false;
+    }
+
+    /* 设置页/NSH 都从这里落一次盘：重启后保持用户的选择。 */
+    (void)myvendor_devctl_map_heading_up_set(on);
+    vmap_view_set_heading_up(page->map, on);
+    /* set_heading_up 自己会开一帧；这里只补泵与叠层，不要再调 vmap_view_render。 */
+    map_page_kick_render(page);
+    vmap_view_bring_arrow_to_front(page->map);
+    helm_shell_raise_chrome();
+#if VMAP_TRACK_ENABLE
+    if (page->track) {
+        vmap_track_refresh(page->track);
+    }
+#endif
+    return true;
+}
+
 #if VMAP_ROUTE_ENABLE
 /**
  * @brief 规划单点路线。from 为 NAN 则用当前 GNSS。
@@ -3212,6 +3938,12 @@ bool map_page_nav_trip_plan(map_page_t * page,
         }
         return false;
     }
+
+    /* 同 `map_page_nav_plan_begin()`：途经点导航也是一次新起航，先退出审阅态、
+     * 恢复定位箭头（这条路径不经过 plan_begin，必须单独补）。 */
+    page->nav_review = false;
+    map_page_set_arrow_visible(page, true);
+
     if (!bicycle_runtime_poll_fix(&fix) || !fix.valid) {
         fix.longitude = (float)waypoints[0].lon;
         fix.latitude = (float)waypoints[0].lat;
@@ -3288,7 +4020,7 @@ bool map_page_nav_trip_plan(map_page_t * page,
     VMAP_NAV_LOG("nav_trip: %u waypoints, start leg %u/%u", (unsigned)count,
         (unsigned)(vmap_route_trip_leg_index(&page->nav_trip) + 1u),
         (unsigned)count);
-    map_page_plan_hint_show(page, "加载路网");
+    map_page_plan_hint_show(page, "正在加载路网");
     if (!vmap_route_trip_begin_leg(VMAP_TILE_DIR, &page->nav_trip,
             fix.longitude, fix.latitude)) {
         page->nav_trip_active = false;
@@ -3367,6 +4099,7 @@ void map_page_nav_stop(map_page_t * page)
     page->nav_review = false;
     if (page->map) {
         vmap_view_set_arrow_visible(page->map, true);
+        vmap_view_bring_arrow_to_front(page->map);
     }
     vmap_route_worker_cancel();
     page->nav_planning = false;
@@ -3412,8 +4145,19 @@ void map_page_nav_stop(map_page_t * page)
 /** @brief 相邻点平均间距不超过此值则沿 GPX 折线跟线，否则按窗口走两点路网规划。 */
 #define MAP_PAGE_GPX_DENSE_AVG_M     200.0
 #define MAP_PAGE_GPX_MIN_KEEP_M      1.0
-#define MAP_PAGE_GPX_TURN_WINDOW_M   25.0
-#define MAP_PAGE_GPX_TURN_MIN_GAP_M  40.0
+/* 量航向的窗口。原来是 25 m —— 2026-09-25 用用户实测轨迹（20260529户外骑行.gpx，20.3 km，
+ * 抽稀后 1493 点）离线复算：±25 m 只测出 2 个转向点，且把 9.1 km 处那个 40° 的**真实路口**
+ * 漏掉了（该弯摊在 ~150 m 上，±25 m 窗口内只累积约 23°，卡在 VMAP_ROUTE_MANEUVER_DEG 之下）。
+ * 实测窗口敏感性：±25 m ⇒ 2 个、±40 m ⇒ 5 个、±60 m ⇒ 8~11 个；用户 2026-09-25 选定 60 m，
+ * 提示更勤（代价：河堤那种长半径缓弯也会被算成"微转"，图标与转向同级都是箭头，无碍）。
+ * 窗口是**按距离**量的（见 map_page_gpx_turn_window），所以抽稀到 13.6 m 点距不影响判据。 */
+#define MAP_PAGE_GPX_TURN_WINDOW_M   60.0
+#define MAP_PAGE_GPX_TURN_MIN_GAP_M  30.0
+/* GPX 自己的转向阈值。路网规划按路口（出度）判，天然又准又密；GPX 只能量
+ * 折线航向，用路网那套 25° 会在河堤/环湖这种长半径弯上几乎不出点 ——
+ * 用户 2026-11-04 实测："明湖骑行转弯提醒明显比模拟点规划少"。
+ * 这里降到 16°（窗口仍是 60 m，点距无关），只影响 GPX 这一路。 */
+#define MAP_PAGE_GPX_TURN_DEG        16.0f
 
 static void map_page_gpx_store_pt(vmap_route_pt_t * dst, const gpx_point_t * src)
 {
@@ -3451,6 +4195,13 @@ static bool map_page_gpx_load(const char * path, vmap_route_pt_t * pts,
         return false;
     }
 
+    /* SD 判死期间不开 GPX 文件：这条解码跑在 UI 线程上，卡不应答时一次 open
+     * 能拖到十几秒（现场 `SLOW pump gap 14007ms` 就紧跟在 GPX/瓦片读之后）。
+     * 返回 false 让调用方保持上一份轨迹/空轨迹，等后台复活后下一轮自然重试。*/
+    if (sf32lb_sd_dead != NULL && sf32lb_sd_dead()) {
+        return false;
+    }
+
     memset(&st, 0, sizeof(st));
     memset(batch, 0, sizeof(batch));
     gpx_decode_cfg_sparse(&cfg, cap);
@@ -3464,8 +4215,14 @@ static bool map_page_gpx_load(const char * path, vmap_route_pt_t * pts,
 
         memset(batch, 0, sizeof(batch));
         ret = gpx_decode_read(dec, batch, 16, &n);
+
+        /* `gpx_decode_read`：0 = 还有数据、1 = EOF/limit、<0 = 解析或 I/O 错。
+         * 原来把负值也当 EOF 跳出，只要已经读到 ≥2 个点就返回 true ⇒ 一次中途中
+         * 的 SD 读失败会被当成"整条轨迹读完了"，用半条轨迹替换旧状态
+         *（Codex R4/R5 P2-R1-9）。错误就要如实报失败。 */
         if (ret < 0) {
-            break;
+            gpx_decode_close(&dec);
+            return false;
         }
 
         for (i = 0; i < n; i++) {
@@ -3807,7 +4564,7 @@ static uint32_t map_page_gpx_build_maneuvers(const vmap_route_pt_t * pts,
                 pts[i].lon, pts[i].lat),
             vmap_geo_bearing_deg(pts[i].lon, pts[i].lat,
                 pts[next].lon, pts[next].lat));
-        if (fabsf(turn) < VMAP_ROUTE_MANEUVER_DEG) {
+        if (fabsf(turn) < MAP_PAGE_GPX_TURN_DEG) {
             continue;
         }
 
@@ -4008,7 +4765,7 @@ static void map_page_nav_gpx_rejoin_done(void * user, bool ok,
     map_page_plan_hint_hide(page);
     if (!ok || !pts || pt_count < 2u || !page->nav_gpx_suffix
         || page->nav_gpx_suffix_count == 0u) {
-        lv_pm_notify_show("导航", "回归轨迹规划失败", 4000);
+        lv_pm_notify_show("导航", "接回原路线失败", 4000);
         myvendor_sound_warn();
         vmap_free(page->nav_gpx_suffix);
         page->nav_gpx_suffix = NULL;
@@ -4023,7 +4780,7 @@ static void map_page_nav_gpx_rejoin_done(void * user, bool ok,
             page->nav_gpx_suffix, page->nav_gpx_suffix_count, merged,
             &merged_n)) {
         vmap_free(merged);
-        lv_pm_notify_show("导航", "回归轨迹内存不足", 4000);
+        lv_pm_notify_show("导航", "内存不足，无法接回原路线", 4000);
         myvendor_sound_warn();
         vmap_free(page->nav_gpx_suffix);
         page->nav_gpx_suffix = NULL;
@@ -4056,7 +4813,7 @@ static void map_page_nav_gpx_rejoin_done(void * user, bool ok,
             fix.course_deg, fix.speed_kph);
         map_page_nav_refresh_map(page, fix.longitude, fix.latitude);
     }
-    lv_pm_notify_show("导航", "已规划路线返回 GPX", 4000);
+    lv_pm_notify_show("导航", "接回路线已规划", 4000);
     myvendor_sound_ok();
     VMAP_NAV_LOG("GPX rejoin ready pts=%u man=%u len=%.0fm",
         (unsigned)merged_n, (unsigned)n_man, merged_m);
@@ -4110,7 +4867,7 @@ static bool map_page_nav_gpx_rejoin_begin(map_page_t * page,
     page->nav_plan_to_lon = target_lon;
     page->nav_plan_to_lat = target_lat;
     page->nav_maneuver_announced = UINT32_MAX;
-    map_page_plan_hint_show(page, "规划路线返回 GPX");
+    map_page_plan_hint_show(page, "正在接回原路线");
 
     if (!vmap_route_worker_submit(VMAP_TILE_DIR,
             corridor ? NULL : s_route_graph, lon, lat, target_lon, target_lat,
@@ -4193,6 +4950,11 @@ static bool map_page_nav_gpx_follow(map_page_t * page, const vmap_route_pt_t * p
 
     n_man = map_page_gpx_build_maneuvers(pts, n, total_m, mans,
         VMAP_ROUTE_MAX_MANEUVERS);
+    /* 每 2 km 一行：GPX 这一路只能靠折线量航向，转向点够不够是现场最容易
+     * 争议的一项，留个可核对的数（VMAP_NAV_LOG 默认被编译掉，这里显式打）。 */
+    syslog(LOG_INFO, "gpx mans=%u pts=%u len=%.0fm start=%.0fm\n",
+        (unsigned)n_man, (unsigned)n, total_m,
+        first ? 0.0 : page->nav_gpx_win_start_m);
     vmap_route_nav_apply(page->nav, pts, n, total_m, mans, n_man);
     if (!vmap_route_is_active(page->route)) {
         page->nav_gpx_course = false;
@@ -4221,7 +4983,7 @@ static bool map_page_nav_gpx_follow(map_page_t * page, const vmap_route_pt_t * p
 
     map_page_nav_refresh_map(page, cx, cy);
     if (first) {
-        snprintf(msg, sizeof(msg), "GPX %.1f / %.1f km",
+        snprintf(msg, sizeof(msg), "路线 %.1f / %.1f km",
             total_m / 1000.0,
             (page->nav_gpx_true_m > page->nav_gpx_total_m
                 ? page->nav_gpx_true_m : page->nav_gpx_total_m) / 1000.0);
@@ -4393,33 +5155,15 @@ bool map_page_nav_from_gpx(map_page_t * page, const char * path, bool reverse)
         return false;
     }
 
-    if (bicycle_gpx_sim_active()) {
-        bicycle_gpx_sim_stop();
-    }
-    map_page_nav_gnss_for_gps(page);
-    page->nav_review = false;
-    if (page->route) {
-        vmap_route_set_review(page->route, false);
-    }
-    if (page->map) {
-        vmap_view_set_arrow_visible(page->map, true);
+    /* 同 map_page_show_gpx：判死时先返回，别在一定会失败的加载之前先停模拟、
+     * 退 review、改标题与箭头（Codex R1 P2-9）。 */
+    if (sf32lb_sd_dead != NULL && sf32lb_sd_dead()) {
+        return false;
     }
 
-    {
-        const char * base = path;
-        const char * slash = strrchr(path, '/');
-        char * dot;
-
-        if (slash && slash[1] != '\0') {
-            base = slash + 1;
-        }
-        lv_snprintf(page->nav_title, sizeof(page->nav_title), "%s", base);
-        dot = strrchr(page->nav_title, '.');
-        if (dot) {
-            *dot = '\0';
-        }
-    }
-
+    /* 同 show_gpx：**先读文件，成功了再动状态**（Codex R3 P2-R1-9）。停模拟、
+     * 退 review、显示箭头、改标题都会改变骑手看到的东西，加载失败时必须原样
+     * 保留（尤其是"正在导航时换一条坏文件"这种场景）。 */
     pts = (vmap_route_pt_t *)vmap_malloc(
         (size_t)VMAP_ROUTE_MAX_PTS * sizeof(*pts));
     if (!pts) {
@@ -4436,6 +5180,34 @@ bool map_page_nav_from_gpx(map_page_t * page, const char * path, bool reverse)
 
     if (reverse) {
         map_page_reverse_pts(pts, kept);
+    }
+
+    if (bicycle_gpx_sim_active()) {
+        bicycle_gpx_sim_stop();
+    }
+    map_page_nav_gnss_for_gps(page);
+    page->nav_review = false;
+    if (page->route) {
+        vmap_route_set_review(page->route, false);
+    }
+    if (page->map) {
+        vmap_view_set_arrow_visible(page->map, true);
+        vmap_view_bring_arrow_to_front(page->map);
+    }
+
+    {
+        const char * base = path;
+        const char * slash = strrchr(path, '/');
+        char * dot;
+
+        if (slash && slash[1] != '\0') {
+            base = slash + 1;
+        }
+        lv_snprintf(page->nav_title, sizeof(page->nav_title), "%s", base);
+        dot = strrchr(page->nav_title, '.');
+        if (dot) {
+            *dot = '\0';
+        }
     }
 
     map_page_gpx_course_clear(page);
@@ -4581,13 +5353,18 @@ bool map_page_show_gpx(map_page_t * page, const char * path)
         return false;
     }
 
-    if (bicycle_gpx_sim_active()) {
-        bicycle_gpx_sim_stop();
+    /* 判死期间**先返回再动状态**：下面 `course_clear()` 会释放旧点列、清窗口
+     * 参数，而 `map_page_gpx_load()` 这时一定会失败 —— 先清后失败等于把一条
+     * 正在用的 GPX 导航拆成"图还在、推进用的点列没了"（Codex R1 P2-9）。
+     * 保持旧状态，等复活后下一次调用再换。 */
+    if (sf32lb_sd_dead != NULL && sf32lb_sd_dead()) {
+        return false;
     }
-    map_page_nav_gnss_for_gps(page);
-    map_page_gpx_set_title(page, path);
-    map_page_gpx_course_clear(page);
 
+    /* **先把文件读进来，成功之后再动旧状态**（Codex R3 P2-R1-9）：
+     * 原来先 stop 模拟 / 改标题 / `course_clear()` 再加载，一旦加载失败
+     * （SD 抖动、文件坏）旧的点列已经被释放，屏幕上还留着旧路线图 —— 变成
+     * "图在、推进用的点列没了"。读取只依赖 path，不依赖任何页面状态。 */
     pts = (vmap_route_pt_t *)vmap_malloc(
         (size_t)VMAP_ROUTE_MAX_PTS * sizeof(*pts));
     if (!pts) {
@@ -4601,6 +5378,13 @@ bool map_page_show_gpx(map_page_t * page, const char * path)
         return false;
     }
     (void)file_n;
+
+    if (bicycle_gpx_sim_active()) {
+        bicycle_gpx_sim_stop();
+    }
+    map_page_nav_gnss_for_gps(page);
+    map_page_gpx_set_title(page, path);
+    map_page_gpx_course_clear(page);
 
     if (!map_page_ensure_route_nav_ex(page, false)) {
         vmap_free(pts);
@@ -4763,7 +5547,7 @@ static bool map_page_nav_plan_nearest_gpx(map_page_t * page, double lon,
             return true;
         }
     }
-    snprintf(msg, sizeof(msg), "GPX %.1f / %.1f km",
+    snprintf(msg, sizeof(msg), "路线 %.1f / %.1f km",
         along / 1000.0,
         (page->nav_gpx_true_m > page->nav_gpx_total_m
             ? page->nav_gpx_true_m : page->nav_gpx_total_m) / 1000.0);
@@ -4938,6 +5722,23 @@ void map_page_resume_after_cover(map_page_t * page)
         lv_timer_resume(page->render_timer);
     }
     helm_shell_resume_after_cover();
+
+    /* 按键回调是在 map_page_pause_for_cover() 里被**清空**的
+     * （`lv_port_buttons_clear_page_callbacks()`），正常只有 `map_will_appear`
+     * 会重绑。从"存储占用结束"这条路恢复时**没有 will_appear**，若不在这里补，
+     * 画面恢复了而按键仍然全空（`btn: scan alive … cbs=0/0/0` 可直接看出）。
+     * 仅在主界面确实是当前页时重绑，避免把菜单页的按键抢走。 */
+    if (lvgl_page_current_id() == BICYCLE_PM_ID_MAP) {
+        helm_shell_bind_keys();
+
+        /* 页根不透明度也要复位：`map_will_appear` 里有这句、本函数原来没有。
+         * 覆盖式退出走的是页根 fade（opa→0），而本函数是"没有 will_appear 的
+         * 恢复路径"；不补这一句，恢复后整页是**半透明白**（现场 2026-11-04：
+         * 换页正常、数据在动，但整屏淡到几乎看不见）。 */
+        if (s_live_map_page != NULL && s_live_map_page->page != NULL) {
+            lv_obj_set_style_opa(s_live_map_page->page, LV_OPA_COVER, 0);
+        }
+    }
 }
 
 /**
@@ -5025,7 +5826,7 @@ bool map_page_boot_prepare(map_page_t * page)
     /* 文件缺失不是可重试的启动阻塞条件；首帧会显示稳定背景并在实际进入
      * LiveMap 后按正常路径再次解析。 */
     s_boot_files_ready = true;
-    LV_LOG_USER("map boot: files prepared (render deferred)");
+    LV_LOG_INFO("map boot: files prepared (render deferred)");
     return true;
 }
 
@@ -5037,6 +5838,9 @@ void map_page_destroy(map_page_t * page)
     if (!page) {
         return;
     }
+
+    /* 首帧淡入是一次性动画（var=page）；先停掉，避免 exec 摸到下面已删除的对象。 */
+    lv_anim_delete(page, map_page_first_fade_exec);
 
     (void)bicycle_ride_gpx_discard();
     if (page->gpx_timer) {
@@ -5181,15 +5985,50 @@ bool map_page_boot_begin_load(void)
 
     s_boot_deferred = false;
     s_boot_files_ready = false;
-    LV_LOG_USER("map boot: resources created");
+    LV_LOG_INFO("map boot: resources created");
     return true;
+}
+
+typedef struct {
+    lv_pm_page_t self;
+    lv_pm_id incoming;
+} map_cover_scan_t;
+
+static void map_cover_scan_cb(lv_pm_page_t page, void * user_data)
+{
+    map_cover_scan_t * scan = (map_cover_scan_t *)user_data;
+
+    if (page == NULL || scan == NULL || page == scan->self) {
+        return;
+    }
+    if (page->flag.is_open && scan->incoming == 0xffu) {
+        scan->incoming = page->id;
+    }
+}
+
+/** @brief 扫出正在打开、即将盖住主界面的那一页；找不到返回 0xff。 */
+static lv_pm_id map_cover_scan(lv_pm_page_t self)
+{
+    map_cover_scan_t scan = { self, 0xffu };
+
+    lv_pm_foreach_registered_page(map_cover_scan_cb, &scan);
+    return scan.incoming;
 }
 
 static void map_will_disappear(void * pm_page)
 {
     map_page_t * map = live_map_page_instance();
+    lv_pm_page_t self = lv_pm_get_pm_page(pm_page);
 
-    (void)pm_page;
+    /* 记下"是谁盖住了主界面"。open_page 的顺序是：新页先置 `flag.is_open = 1`
+     * 再回调本函数，最后才 `g_pm_history_count++` ⇒ 此时 `lv_pm_get_crr_page()`
+     * 仍是主界面自己，新页只能从 `is_open` 扫出来（同一时刻只有一页在打开）。
+     * 回来时 `map_will_appear()` 据此区分：菜单返回不加动画，开机 splash /
+     * USB / 工厂页仍保留淡入。
+     * `self->flag.is_back` 为真表示是主界面自己在关闭（不是被盖住），不记录。 */
+    if (self != NULL && !self->flag.is_back) {
+        s_cover_page_id = map_cover_scan(self);
+    }
 
     if (map) {
         map_page_pause_for_cover(map);
@@ -5210,18 +6049,57 @@ static void map_will_appear(void * pm_page)
 {
     map_page_t * map = live_map_page_instance();
     lv_pm_page_t page = lv_pm_get_pm_page(pm_page);
+    const bool from_menu = (s_cover_page_id == (lv_pm_id)BICYCLE_PM_ID_MENU);
+
+    s_cover_page_id = 0xffu;
 
     if (page && page->page) {
         lv_obj_clear_flag(page->page, LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* Boot used apply_silent(); restore fade so menu/MTP covers animate. */
+    /* 页面级选项：`lv_pm_close_page_msg()` 在回调完 will_appear 后会给**本页**
+     * 播 ENTER（用这里装的 open_options），所以选项要在这里定。
+     *
+     * - 菜单返回：`bicycle_page_anima.c` 的口径是"菜单进出口都不加动画"
+     *   （MENU 那一行 no_anima 只管菜单自己的进出，回程露出的主界面仍会用
+     *   MAP 行的 220 ms fade）。这里改走 apply_silent() ⇒ 主界面一帧内整页可见。
+     * - 开机 splash / USB / 工厂页返回：保持原来的 220 ms 淡入。
+     * - 开机首轮（s_boot_deferred）沿用 apply_silent()，不抢 splash。 */
     if (!s_boot_deferred && page != NULL) {
-        bicycle_page_anima_apply(page, BICYCLE_PM_ID_MAP);
+        if (from_menu) {
+            /* 菜单覆盖时主界面自己的 EXIT 也走了 fade（`lv_pm_anima` 用的是页面
+             * 自己的 open_options），页根 opa 停在 0；no_anima 的 appear 只清
+             * HIDDEN / 摆正位置，不碰 opa ⇒ 这里必须显式复位，否则整页透明。 */
+            if (page->page != NULL) {
+                lv_obj_set_style_opa(page->page, LV_OPA_COVER, 0);
+            }
+            bicycle_page_anima_apply_silent(page);
+        } else {
+            bicycle_page_anima_apply(page, BICYCLE_PM_ID_MAP);
+        }
     }
 
     if (map) {
         helm_shell_bind_keys();
+    }
+
+    /* 主界面入场动效（WP-V3）：时钟块 → 状态列 → 操作条错峰淡入 + 轻推入。
+     *
+     * 选点理由：本页只有在**栈顶**（splash 已经走完 400 ms 淡出、被 no_anima
+     * 关闭）时才会走到 will_appear —— lv_pm_close_page_msg() 里先隐藏/删除
+     * splash 页，再回调前一页的 will_appear，所以这里起播不会和 splash 抢帧。
+     * 开机首轮 push（splash 底下建空壳）也走本回调，但那时 helm_shell 还没
+     * attach（s_sh.attached=false），函数内部直接返回，不会误播。
+     * 与页面级 fade 的关系：fade 动的是页根（这里的 page->page）的 opa，
+     * 入场动效动的是三个子控件的 opa/translate_y，两条通道互不覆盖；
+     * 子级不透明度与父级相乘、都收敛到 255，末态由 helm_sb_in_done 显式复位。
+     *
+     * 菜单返回不重播：用户要的是"返回即完整"（WP-FADE/R1）。三块卡片在菜单
+     * 打开前就已停在末态，菜单覆盖期间也没被改过；重播会让地图已经出来了、
+     * 卡片却还从 opa=0 淡入，观感仍是"返回有动画"。换主题的重建路径
+     * （`helm_shell_rebuild_once()` 末尾）会自己再调本函数，不受影响。 */
+    if (!from_menu) {
+        helm_shell_enter_anim();
     }
 }
 

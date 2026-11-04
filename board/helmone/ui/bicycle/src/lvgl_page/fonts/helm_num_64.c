@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 64 px
  * Bpp: 2
- * Opts: --size 64 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name helm_num_64 -o /home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/fonts/helm_num_64.c --font /home/jinsc/SDK/SGl/PingFangSC/PingFangSC-Semibold.ttf --autohint-strong -r 0x20-0x7E --symbols 0123456789.:-/+%
+ * Opts: --size 64 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name helm_num_64 -o /home/jinsc/SDK/vela/openvela/vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/src/lvgl_page/fonts/helm_num_64.c --font /home/jinsc/SDK/SGl/PingFangSC/PingFangSC-Semibold.ttf --autohint-strong -r 0x20-0x7E --symbols 0123456789.:-/+%
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Wrap nuttx.bin → nuttx.flash.bin (1KiB OVNX header + payload + 4B CRC). nuttx.bin unchanged.
-# CLion Post-build: wrap_nuttx_image.sh cmake_out/my_vendor_nsh  (see nuttx_ovnx_image.md)
+# CLion Post-build: wrap_nuttx_image.sh cmake_out/helmone_nsh  (see nuttx_ovnx_image.md)
 #
 # Usage:
-#   wrap_nuttx_image.sh [cmake_out/my_vendor_nsh]
+#   wrap_nuttx_image.sh [cmake_out/helmone_nsh]
 #   wrap_nuttx_image.sh --input nuttx.bin --output nuttx.flash.bin
-#   wrap_nuttx_image.sh --verify cmake_out/my_vendor_nsh/nuttx.flash.bin
+#   wrap_nuttx_image.sh --verify cmake_out/helmone_nsh/nuttx.flash.bin
 #
 # Output default: nuttx.flash.bin alongside nuttx.bin (for sftool / NAND boot).
 

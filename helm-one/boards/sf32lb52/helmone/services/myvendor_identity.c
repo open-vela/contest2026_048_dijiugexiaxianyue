@@ -103,7 +103,7 @@ const char *myvendor_identity_serial(void)
 }
 
 #ifndef CONFIG_MYVENDOR_PRODUCT_VERSION
-#  define CONFIG_MYVENDOR_PRODUCT_VERSION "1.4.0"
+#  define CONFIG_MYVENDOR_PRODUCT_VERSION "1.4.2"
 #endif
 
 #ifndef CONFIG_MYVENDOR_HARDWARE_VERSION

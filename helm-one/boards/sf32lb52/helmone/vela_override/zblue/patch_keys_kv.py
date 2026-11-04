@@ -36,6 +36,9 @@
   · keys.c `bt_keys_reset()`（adapter enable/disable 会清池）     = 允许下次重新恢复
   · **恢复入口由外部调用**：`myvendor_keys_kv_load_all()`（app 侧在 adapter enable
     之后、开广播之前调一次 —— 见 ble_companion.c 的 companion_start_advertising()）。
+    恢复每条密钥时**顺带 `bt_id_add()` 写进控制器解析列表（RAL）**：
+    上游那一步挂在 settings 提交链（`keys_commit()`）上，而本板 `CONFIG_SETTINGS`
+    关着 ⇒ 不补这一句，「从 KV 恢复的密钥永远进不了 RAL」。
     **不要挂在 bt_keys_find*() 上**：那条路会被 `bt_lookup_id_addr()` 从**连接/扫描
     事件处理**里调用，而本板的事件处理跑在 BT 收包的中断上下文里（现场崩溃签名
     `arm_memfault.c:136 irq=1`）—— 在中断里做 open/read/close（还会拿 FS 的互斥、
@@ -256,6 +259,34 @@ void myvendor_keys_kv_load_all(void)
 			continue;
 		}
 		memcpy(keys->storage_start, rec[i].storage, BT_KEYS_STORAGE_LEN);
+
+		/* **把这条 IRK 写进控制器的解析列表（RAL）**——主机侧的
+		 * `bt_lookup_id_addr()` 只能把"已收到的包"翻译回身份地址，控制器
+		 * 侧没有任何解析能力时，手机轮换 RPA 连上来报的还是随机地址。
+		 *
+		 * 上游把这一步挂在 settings 提交链上（`keys_commit()` →
+		 * `bt_id_add()`），而本板 `CONFIG_SETTINGS` 是关的 ⇒ 那条路从不执行，
+		 * 于是"从 KV 恢复的密钥永远进不了 RAL"。配对当场那条（smp.c 里
+		 * `bt_id_add()`）是另一条路，所以现场表现成"刚配完能认、重启后认不出"。
+		 *
+		 * 这里补上，位置与上游语义一致（恢复完即入表）。控制器不支持时
+		 * `bt_id_add()` 只打一行 error 就返回，不影响本函数的其余部分。 */
+		bt_id_add(hdev, keys);
+
+		/* **把结果打出来**——这是"控制器 RAL 到底有没有生效"的**唯一可见证据**：
+		 * id.c 里 `Failed to add IRK to controller` 那几条是 LOG_ERR，而本板
+		 * BT 日志等级是 0（见本文件头注释：keys.c 的 LOG_* 全被编译掉），
+		 * 出错了也一声不吭。判读：
+		 *   · `rl_size=0` ⇒ 板级 HCI 楔子仍报"控制器不会解析"（该报 3，见
+		 *     `chips/sf32lb52/sf32lb52_bth4.c` 的 SF32LB52_HCI_RL_SIZE）；
+		 *   · `rl_size=3 entries=1/2/3` ⇒ 逐条进了 RAL，控制器会解析 RPA；
+		 *   · `rl_size=3` 但 `entries` 不涨 ⇒ LCPU 拒了 Add Device To
+		 *     Resolving List，退回主机侧解析（`patch_keys_kv.py` 的 IRK
+		 *     落盘仍是那条路的保障）。
+		 */
+		printk("bt_keys kv: %s -> RAL rl_size=%u entries=%u\n",
+		       bt_addr_le_str(&addr), hdev->le.rl_size, hdev->le.rl_entries);
+
 		applied++;
 	}
 
@@ -340,7 +371,13 @@ def patch_keys_c(src: str) -> tuple[str, int]:
 
     out = insert_after_anchor(src, RESET_SIG, RESET_ANCHOR,
                               "\tmyvendor_keys_loaded = false;   "
-                              "/* adapter enable/disable 会清池，留着下次再恢复 */\n")
+                              "/* adapter enable/disable 会清池，留着下次再恢复 */\n"
+                              "\tmyvendor_keys_tries  = 0;      "
+                              "/* 预算按「池世代」重置 —— 不清零的话，本开机内累计\n"
+                              "\t                                * 32 次尝试用完就再也灌不回来，\n"
+                              "\t                                * 手机 IRK 丢失 ⇒ RPA 解析不出发\n"
+                              "\t                                * 身份地址 ⇒ 每次连上看到的 MAC 都不一样、\n"
+                              "\t                                * 记录/准入认不出（2026-09-23 现场）。 */\n")
     resets = 1 if out != src else 0
     src = out
 

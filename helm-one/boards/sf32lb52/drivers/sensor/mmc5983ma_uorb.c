@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/sensor/mmc5983ma_uorb.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/sensor/mmc5983ma_uorb.c
  *
  * Memsic MMC5983MA 3-axis magnetometer — NuttX sensor (uORB) lower-half
  * driver. Register map and scaling follow the MMC5983MA datasheet and the

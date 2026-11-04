@@ -1,8 +1,7 @@
-/****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/my_vendor/services/myvendor_diaglog.c
- *
- * 日志落盘：注册一个只写 RAM 环的 syslog channel，定期把新增内容追加到
- * **自己的 /diag 目录**下的日志文件（不与崩溃转储混在一起，上位机按目录区分）。
+/**
+ * @file myvendor_diaglog.c
+ * @brief 日志落盘：注册一个只写 RAM 环的 syslog channel，定期把新增内容追加到
+ *        **自己的 /diag 目录**下的日志文件（不与崩溃转储混在一起，上位机按目录区分）。
  *
  * **只落 error 级别的行**（用户要求）：正常运行时 info/debug 刷屏（实测 2~4 KB/s）
  * 不再占用环和卡的写入带宽，环里留下的全是异常。级别靠 `CONFIG_SYSLOG_PRIORITY`
@@ -21,7 +20,7 @@
  * 更容易审计（没有可变格式串，宽度固定）。
  *
  * SPDX-License-Identifier: Apache-2.0
- ****************************************************************************/
+ */
 
 #include <nuttx/config.h>
 
@@ -31,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <nuttx/clock.h>
 #include <nuttx/irq.h>
 #include <nuttx/syslog/syslog.h>
 #include <stdbool.h>
@@ -124,9 +124,25 @@ static char     g_last_pfx[DIAGLOG_PFX_MAX + 1u];
 static uint8_t  g_last_pfx_len;
 
 static char     g_path[DIAGLOG_PATH_MAX];
-static int      g_day = -1;          /* 文件名对应的"年内第几天"，用于按天滚动 */
+static unsigned g_seq;               /* 本次开机的文件序号（flush 写 boot 标记用） */
 static bool     g_started;
 static bool     g_fail_logged;       /* 落盘失败只报一次，避免自己刷屏 */
+static bool     g_created;           /* 本文件已建出来过：之后 open 不再带 O_CREAT */
+
+/* `/mnt/kv` 就在 SD 卡上（`sf32lb_sd_mount_kv()`），判死窗口里写只会立刻
+ * 拿到 -EIO。板级代码一直用 extern 声明这个入口（见 bringup.c 的同族声明），
+ * 这里沿用同一手法，不把 chips 头拉进 board 组件的 include 路径。 */
+extern bool sf32lb_sd_dead(void);
+
+/** 本次开机还没写过 boot 标记？**由 flush 直接写进文件**，不走 syslog。
+ *
+ *  为什么不用 `syslog()` 记这条（2026-09-27 实测）：它落在 `start()` 里、
+ *  紧随 `syslog_channel_register()` 之后，结果**控制台与归档里都没有**，
+ *  而同一时段其它 WARN 正常 —— 排查过屏蔽位（0x7f 全开）、通道注册（只是
+ *  往 `g_syslog_channel[]` 里塞一项）、通道数量，都没能解释这一次投递缺口。
+ *  不再依赖它：标记行在**文件已经打开、马上就要写**的那一刻直接 `write()`
+ *  进文件，同时把"这条路能成"变成不需要假设的事实（也从级别过滤里免掉）。 */
+static bool     g_bootmark_pending = true;
 
 /****************************************************************************
  * 级别过滤：逐行判定
@@ -391,8 +407,51 @@ static void diaglog_mkname(char *name, size_t n, unsigned seq, time_t now)
   p = diaglog_put_u(p, (unsigned)tm.tm_min, 2u);
   p = diaglog_put_u(p, (unsigned)tm.tm_sec, 2u);
   memcpy(p, ".txt", 5u);
+}
 
-  g_day = tm.tm_yday;
+/* 组 boot 标记行：**每开机一行，由 flush 直接写文件**（不过 syslog，见
+ * `g_bootmark_pending` 的说明）。内容 = 序号 + 墙钟 + 可读时间 + 文件名，
+ * 用来把"追加式文件里哪一段属于哪次开机"钉死。 */
+
+static int diaglog_bootmark(char *buf, size_t n)
+{
+  struct tm tm;
+  time_t    now = time(NULL);
+  int       len;
+
+  localtime_r(&now, &tm);
+  if (tm.tm_year < 0)
+    {
+      memset(&tm, 0, sizeof(tm));
+    }
+
+  len = snprintf(buf, n, "[diaglog] boot seq=%u wall=%lu", g_seq,
+                 (unsigned long)now);
+
+  if (len > 0 && (size_t)len < n)
+    {
+      int w = snprintf(buf + len, n - (size_t)len,
+                       " %04d-%02d-%02d %02d:%02d:%02d",
+                       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                       tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+      if (w > 0 && (size_t)(len + w) < n)
+        {
+          len += w;
+        }
+    }
+
+  if (len > 0 && (size_t)len < n)
+    {
+      int w = snprintf(buf + len, n - (size_t)len, " file=%s\n", g_path);
+
+      if (w > 0 && (size_t)(len + w) < n)
+        {
+          len += w;
+        }
+    }
+
+  return len;
 }
 
 /* 目录 + '/' + 名字。 */
@@ -428,7 +487,9 @@ static bool diaglog_name_stamp(const char *name, long *stamp)
   unsigned              i;
   long                  v = 0;
 
-  if (name == NULL || name[0] != 'd')
+  /* 前缀 'd' 是本目录现行命名；'n' 是早期沿用 coredump 那套的遗留名 —— 一并认，
+   * 否则改名之前落下的文件永远不会被清理（2026-09-25 清理改造时补）。 */
+  if (name == NULL || (name[0] != 'd' && name[0] != 'n'))
     {
       return false;
     }
@@ -439,10 +500,23 @@ static bool diaglog_name_stamp(const char *name, long *stamp)
       return false;
     }
 
-  if (len < 24u)
+  /* 只认两种**确切**形状（2026-09-25 收紧）：
+   *   · 完整名 dNNN_YYYYMMDD_HHMMSS.txt = 24 字符（'n' 前缀是早期遗留名，一并认）；
+   *   · 降级名 dNNN.txt = 8 字符（没有日历戳，当最老）。
+   * 以前 `len < 24 ⇒ 认`，于是 `nonsense.txt` 这种"像日志但不是"的文件既进不了
+   * 计数、也不会被当垃圾清 —— 只能永久占着目录。现在它会被判为垃圾清掉。 */
+  if (len == 8u && name[1] >= '0' && name[1] <= '9' &&
+      name[2] >= '0' && name[2] <= '9' &&
+      name[3] >= '0' && name[3] <= '9' &&
+      memcmp(name + 4u, ".txt", 4u) == 0)
     {
-      *stamp = 0;                /* dNNN.txt —— 没有日历戳，当最老 */
+      *stamp = 0;
       return true;
+    }
+
+  if (len != 24u)
+    {
+      return false;
     }
 
   for (i = 0; i < 6u; i++)
@@ -552,6 +626,8 @@ static bool diaglog_drop_oldest(void)
   dir = opendir(DIAGLOG_DIR);
   if (dir == NULL)
     {
+      syslog(LOG_WARNING, "diaglog: prune opendir %s failed errno=%d\n",
+             DIAGLOG_DIR, errno);
       return false;
     }
 
@@ -560,9 +636,9 @@ static bool diaglog_drop_oldest(void)
     {
       long stamp;
 
-      if (de->d_name[0] != 'd' || !diaglog_name_stamp(de->d_name, &stamp))
+      if (!diaglog_name_stamp(de->d_name, &stamp))
         {
-          continue;
+          continue;    /* 前缀 'd'/'n' 与 ".txt" 由解析函数把关 */
         }
 
       /* 哨兵用 LONG_MAX 而不是 0：降级名 dNNN.txt 的戳就是 0，
@@ -590,17 +666,36 @@ static bool diaglog_drop_oldest(void)
     diaglog_mkpath(path, sizeof(path), oldest);
     if (path[0] == '\0')
       {
+        syslog(LOG_WARNING, "diaglog: prune path too long for '%s'\n", oldest);
         return false;
       }
 
-    return (unlink(path) == 0);
+    if (unlink(path) != 0)
+      {
+        /* 删除失败**必须出声** —— 旧实现这里静默返回，目录涨到把 /mnt/kv 撑满
+         * 都没人知道（2026-09-25 用户报的"一直累加"就是这么来的）。 */
+        syslog(LOG_WARNING, "diaglog: prune unlink %s failed errno=%d\n",
+               path, errno);
+        return false;
+      }
+
+    return true;
   }
 }
 
-static void diaglog_prune(void)
+/**
+ * @brief 目录里**除 `seq` 与本目录的日志文件外，一律当垃圾清掉**
+ *        （用户 2026-09-25 定调："除了 seq 和日志，其他的都当垃圾清理"）。
+ *
+ * @details 判"是日志"用的是与裁剪同一把尺子 `diaglog_name_stamp()`（认 `d`/`n` 前缀
+ *          加确切形状的名字），所以 `nonsense.txt` 这种"像日志但不是"的会被清掉，
+ *          而不是永久占着目录。
+ *          注意：`.` / `..` 必须显式跳过 —— 绝不 unlink 它们。
+ *          删不掉时打 WARNING（旧实现静默 → 目录涨到撑满 `/mnt/kv` 都无人知晓）。
+ */
+static void diaglog_scrub_unknown(void)
 {
-  unsigned      count = 0;
-  DIR          *dir;
+  DIR           *dir;
   struct dirent *de;
 
   dir = opendir(DIAGLOG_DIR);
@@ -611,11 +706,74 @@ static void diaglog_prune(void)
 
   while ((de = readdir(dir)) != NULL)
     {
+      const char *n = de->d_name;
+      char        path[DIAGLOG_PATH_MAX];
+      long        stamp;
+
+      if (n[0] == '\0' || strcmp(n, ".") == 0 || strcmp(n, "..") == 0 ||
+          strcmp(n, "seq") == 0)          /* 序号文件保留 */
+        {
+          continue;
+        }
+
+      if (diaglog_name_stamp(n, &stamp))  /* 认得出的日志文件保留 */
+        {
+          continue;
+        }
+
+      diaglog_mkpath(path, sizeof(path), n);
+      if (path[0] == '\0')
+        {
+          continue;
+        }
+
+      if (unlink(path) != 0)
+        {
+          syslog(LOG_WARNING, "diaglog: scrub unlink %s errno=%d\n",
+                 path, errno);
+        }
+      else
+        {
+          syslog(LOG_INFO, "diaglog: scrub %s (not seq/log)\n", n);
+        }
+    }
+
+  closedir(dir);
+}
+
+/**
+ * @brief 清垃圾 + 按"最老戳/最小名"删到只剩 `DIAGLOG_KEEP` 个日志文件。
+ *
+ * @details 顺序是"先清垃圾、后数日志"：垃圾清不掉不影响裁剪，反之亦然。
+ *          计数与裁剪都交给 `diaglog_name_stamp()` 判身份，`d` 前缀是现行命名、
+ *          `n` 前缀是早期遗留名 —— **两个前缀都要计入**，否则改名之前落下的文件
+ *          占着目录却永远不被删。
+ *
+ * @return true = 跑完了（目录已 ≤ KEEP）；false = 失败/卡住，调用方按节流再试。
+ */
+static bool diaglog_prune(void)
+{
+  unsigned      count = 0;
+  DIR          *dir;
+  struct dirent *de;
+
+  diaglog_scrub_unknown();
+
+  dir = opendir(DIAGLOG_DIR);
+  if (dir == NULL)
+    {
+      syslog(LOG_WARNING, "diaglog: prune opendir %s errno=%d\n",
+             DIAGLOG_DIR, errno);
+      return false;
+    }
+
+  while ((de = readdir(dir)) != NULL)
+    {
       long stamp;
 
-      if (de->d_name[0] == 'd' && diaglog_name_stamp(de->d_name, &stamp))
+      if (diaglog_name_stamp(de->d_name, &stamp))
         {
-          count++;
+          count++;      /* 前缀 'd'/'n' 由解析函数把关 */
         }
     }
 
@@ -625,11 +783,60 @@ static void diaglog_prune(void)
     {
       if (!diaglog_drop_oldest())
         {
-          break;
+          /* 与 `[coredump] prune stuck` 同形，便于一起 grep。 */
+          syslog(LOG_WARNING, "diaglog: prune stuck count=%u keep=%u\n",
+                 count, (unsigned)DIAGLOG_KEEP);
+          return false;
         }
 
       count--;
     }
+
+  return true;
+}
+
+/** 本次运行**成功**清过一次就不再清（用户 2026-09-25 定调："一次运行只需要清理成功
+ *  一次就不清理了"）；失败才按下面的节流重试 —— 失败每次都打 WARNING，节流是为了
+ *  不把日志刷爆。开机那次若已成功，diag 拍里的入口就是空转。 */
+static bool s_prune_done;
+
+/** 失败后的重试间隔（秒）。成功路径不进这个节流。 */
+#define DIAGLOG_PRUNE_RETRY_S 600u
+
+/**
+ * @brief 运行期周期性清理入口（线程上下文；内部限频，默认 10 分钟）。
+ *
+ * @details 清理原先只在**开机**与**按天滚动**时跑 —— 只要设备不重启、不跨天，目录
+ *          就只涨不落（2026-09-25 用户报"diag 文件一直累加"）。本入口由 diag 线程
+ *          每拍调用，自身限频；成功**一次**即整场空转，失败才按 `DIAGLOG_PRUNE_RETRY_S`
+ *          重试（失败每次都出声，节流只为不刷爆日志）。
+ *
+ * @return 0（清理失败不影响调用方）。
+ */
+int myvendor_diaglog_prune(void)
+{
+  static clock_t s_retry;
+
+  if (s_prune_done)
+    {
+      return 0;
+    }
+
+  if (s_retry != 0 &&
+      (clock_t)(clock_systime_ticks() - s_retry) <
+        (clock_t)DIAGLOG_PRUNE_RETRY_S * (clock_t)TICK_PER_SEC)
+    {
+      return 0;
+    }
+
+  if (diaglog_prune())
+    {
+      s_prune_done = true;    /* 成功一次就收工 */
+      return 0;
+    }
+
+  s_retry = clock_systime_ticks();
+  return 0;
 }
 
 /****************************************************************************
@@ -702,15 +909,35 @@ int myvendor_diaglog_start(void)
       return -errno;
     }
 
-  seq = diaglog_next_seq();
-  diaglog_mkname(name, sizeof(name), seq, now);
-  diaglog_mkpath(g_path, sizeof(g_path), name);
-  if (g_path[0] == '\0')
+  /* 名字**只算一次**：以前每次进入本函数都消耗一个序号，而首次注册若失败（重试路径
+   * 每 ~10 s 会再进来一次），序号就白耗一个 ⇒ 文件名跳号（2026-09-25 现场实测：
+   * d665/d667/d669… 每次开机跳 2）。改成"算过一次就复用"，序号与文件名一一对应。 */
+  static bool     s_path_ready;
+
+  if (!s_path_ready)
     {
-      return -ENAMETOOLONG;
+      seq = diaglog_next_seq();
+      diaglog_mkname(name, sizeof(name), seq, now);
+      diaglog_mkpath(g_path, sizeof(g_path), name);
+      if (g_path[0] == '\0')
+        {
+          return -ENAMETOOLONG;
+        }
+
+      g_seq        = seq;
+      s_path_ready = true;
+      g_created    = false;   /* 新文件：下一拍还要带 O_CREAT 建一次 */
+    }
+  else
+    {
+      seq = g_seq;
     }
 
-  diaglog_prune();
+  /* 开机这次若成功，运行期入口（diag 拍）就空转 —— 一次运行清一次就够。 */
+  if (diaglog_prune())
+    {
+      s_prune_done = true;
+    }
 
   ret = syslog_channel_register(&g_diaglog_channel);
   if (ret < 0)
@@ -720,9 +947,12 @@ int myvendor_diaglog_start(void)
 
   g_started = true;
 
-  /* 这一行本身也会进环，正好验证通道已经生效。 */
-  syslog(LOG_INFO, "diaglog: ring %u B seq=%u keep %u\n",
-         (unsigned)DIAGLOG_RING, seq, (unsigned)DIAGLOG_KEEP);
+  /* 控制台只留一句短 INFO（INFO 不进归档，见级别过滤）；**归档里的分隔标记
+   * 改由 flush 直接写文件**（`g_bootmark_pending` 的说明写了为什么不再走
+   * syslog：2026-09-27 实测那条 WARN 在控制台与归档里都没落地）。 */
+  syslog(LOG_INFO, "diaglog: start seq=%u keep %u\n",
+         seq, (unsigned)DIAGLOG_KEEP);
+  g_bootmark_pending = true;
   return 0;
 }
 
@@ -771,33 +1001,49 @@ int myvendor_diaglog_flush(void)
         }
     }
 
-  /* 按天滚动：跨天后换一个文件（同一次开机也就有了"一天一个"）。 */
-  {
-    time_t    now = time(NULL);
-    struct tm tm;
+  /* **删掉了"按天滚动"（2026-09-27）**：原实现每次 flush 都判 `tm.tm_yday`
+   * 是否变了，变了就重算文件名 —— 而开机早期的时钟还是上次同步的旧值、
+   * 之后又会被改（RTC/GNSS），于是**同一次开机中途会换文件**。现场实测：
+   * 09:59 那次开机，39~74 s 的日志落在 d261_…，229 s 的却落在 d259_… 的尾部
+   * （名字"更旧"的文件里）。取证据的人只看文件名就会漏。现在**一次开机一个
+   * 文件**：名字在 `start()` 里定死，boot 标记（下面直接写文件那行）负责
+   * 说明"这一段属于哪次开机"。 */
 
-    localtime_r(&now, &tm);
-    if (tm.tm_yday != g_day)
-      {
-        char name[DIAGLOG_NAME_MAX];
-
-        diaglog_mkname(name, sizeof(name), diaglog_next_seq(), now);
-        diaglog_mkpath(g_path, sizeof(g_path), name);
-        diaglog_prune();
-      }
-  }
+  /* **SD 判死期间不碰 /mnt/kv。** 日志是"锦上添花"，不值得为它承担一次
+   * abort：判死窗口里 open() 会立刻 -EIO，而 littlefs 在 prog 失败后会把写
+   * 缓存留在脏状态，下一笔 commit 落到另一个目录块就撞不稳定量
+   * （`lfs.c:262 LFS_ASSERT(pcache->block == LFS_BLOCK_NULL)`）。现场
+   * 2026-11-04 12:33 就是这样把 diag 线程 abort 掉的 —— 板子没复位，但这次
+   * 开机之后的落盘日志到此为止。判死期把内容留在环里，复活后再落。 */
+  if (sf32lb_sd_dead())
+    {
+      return -EAGAIN;
+    }
 
   flags = up_irq_save();
   head = g_head;
   tail = g_tail;
   up_irq_restore(flags);
 
-  if (head == tail)
+  if (head == tail && !g_bootmark_pending)
     {
       return 0;
     }
 
-  fd = open(g_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+  /* **O_CREAT 只带一次。** `CONFIG_FS_LITTLEFS_ATTR_UPDATE=1` 时，只要 oflags
+   * 里带 O_CREAT，VFS 每次 open 都会做一次 `lfs_setattr`（在 littlefs 里就是
+   * 一笔**目录元数据提交**）。而这里每 500 ms 就 open 同一个文件 —— 等于每
+   * 500 ms 改一次目录：既白耗擦写寿命，又把"写正好撞上哑 SD"从偶发变成必然，
+   * 而那一撞能连锁到 lfs 的不变量断言（机制见本函数开头的说明）。
+   * 文件建出来之后只做 O_APPEND；万一被别人删掉（ENOENT）再退回带 O_CREAT
+   * 的那条，保证自愈。 */
+  fd = open(g_path, g_created ? (O_WRONLY | O_APPEND)
+                              : (O_WRONLY | O_CREAT | O_APPEND), 0644);
+  if (fd < 0 && g_created && errno == ENOENT)
+    {
+      fd = open(g_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    }
+
   if (fd < 0)
     {
       int err = errno;
@@ -812,6 +1058,23 @@ int myvendor_diaglog_flush(void)
         }
 
       return -err;
+    }
+
+  g_created = true;
+
+  /* **本次开机的第一笔落盘内容：boot 标记**（直接 write，不经 syslog ——
+   * 级别过滤、通道投递、屏蔽位都不再参与，落不落得下只取决于这个文件能不能写）。 */
+  if (g_bootmark_pending)
+    {
+      char line[192];
+      int  n = diaglog_bootmark(line, sizeof(line));
+
+      if (n > 0)
+        {
+          (void)write(fd, line, (size_t)n);
+        }
+
+      g_bootmark_pending = false;
     }
 
   /* 一直写到环空为止，但受 DIAGLOG_WRITE_MAX 总预算约束。

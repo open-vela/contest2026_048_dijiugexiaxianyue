@@ -11,6 +11,9 @@
  * - GATTS 的 connect/MTU/disconnect/notify-complete 以及特征写/CCC
  *   必须忽略传感器地址。zblue att_mtu_updated 是全局的；HR ATT 23
  *   曾把 Companion FS MTU 设成 20。FS set_mtu 还要匹配手机 peer。
+ * - 手机回连常先记 RPA、加密后 ATT/CCC 换身份地址：`companion_is_phone()`
+ *   刷新 peer 并同步 FS，否则 `fs ccc/cmd DROPPED`（App 0 帧超时）。
+ *   见 docs/ble/pairing_and_radio.md §1.3。
  * - 只在角色为 BT_CONN_ROLE_PERIPHERAL 时收紧 7.5 ms / PHY / DLE。
  *   在传感器（central）链路上强推会和 Android 打架（HCI 0x16）。
  * - zblue `disconnected` 转给 ble_sensor：GATTC 回调在满载时可能丢，
@@ -75,16 +78,21 @@
 #define LOGE(fmt, ...) syslog(LOG_ERR, "ble_companion: " fmt "\n", ##__VA_ARGS__)
 
 /* 配对/准入那条线在 myvendor_bt_pair.c 里（同 target，头文件不共享，用 extern 声明）。
- * 语义与文件里的大段注释见 myvendor_bt_pair.c：没配对就不接受连接 + 绑定后定向广播。 */
+ * 语义见 myvendor_bt_pair.c：没配对就不接受连接；窗口外已绑定手机走定向 ADV
+ * （CONFIG_MYVENDOR_BLE_DIRECTED_ADV），失败/超时回退无定向。 */
 extern bool myvendor_pair_admit(const bt_address_t *addr);
 extern void myvendor_pair_note_bond(const bt_address_t *addr, bool bonded);
-extern bool myvendor_pair_directed_peer(bt_address_t *out, uint8_t *out_type);
 extern bool myvendor_pair_phone_link_up(void);
 extern bool myvendor_pair_has_phone_record(void);
+extern bool myvendor_pair_has_phone_identity(const bt_address_t *addr,
+                                             uint8_t type);
 extern bool myvendor_pair_window_active(void);
+extern bool myvendor_pair_directed_peer(bt_address_t *out, uint8_t *out_type);
 extern bool myvendor_pair_window_take_restart(void);
 extern void myvendor_pair_admit_poll(void);
 extern void myvendor_pair_unbind_poll(void);
+extern bool myvendor_pair_pending(void);
+extern void myvendor_pair_settle_poll(void);
 extern void myvendor_pair_peer_poll(void);
 extern void myvendor_pair_window_open(unsigned secs);
 extern void myvendor_pair_unbind_request(void);
@@ -112,26 +120,35 @@ extern void myvendor_pair_note_peer_if_secure(const bt_address_t *addr);
 
 #define ADV_INTERVAL_UNITS  ((ADV_INTERVAL_MS) * 8 / 5)
 
-/** 空闲期（有手机记录、不在配对窗口）的广播间隔。
- *
- * 为什么单独一档：真正吃空口/抢射频的是"每秒发几次"，不是"发得远不远"。200 ms
- * （5 次/s）→ 1280 ms（0.78 次/s）把广播事件数压掉 ~6.4 倍，代价只是手机直连时
- * 多等 ≤1.3 s（Android 直连窗口 15 s，够）。窗口期仍用 `ADV_INTERVAL_MS` 快广播。 */
-#define ADV_INTERVAL_IDLE_MS 1280
-#define ADV_INTERVAL_IDLE_UNITS ((ADV_INTERVAL_IDLE_MS) * 8 / 5)
+/** 曾用 1280 ms「空闲档」给已绑定回连省空口。现场（2026-09-21）：
+ *  手机未连时本来就会 ADV，再叠 sensor ADV↔scan 的 2 s 窗，1280 ms 间隔
+ *  一窗只剩 1~2 个 ADV 事件 → App 直连经常卡几十秒到数分钟；关外设后
+ *  连续 1280 ms 也不够 Android autoConnect。已绑定回连一律用快广播
+ * （`ADV_INTERVAL_MS`）；省空口靠「手机连上后停 ADV」和 sensor 分时，
+ *  不靠拉稀间隔。 */
 
 #define HCI_DEV_PATH        "/dev/ttyHCI0"
 #define HCI_WAIT_SECS       10
 #define ADAPTER_WAIT_SECS   60
 #define ADAPTER_CYCLE_WAIT_SECS 8
 
-/** @brief "广播让位"（sensor 扫描/建链时暂停广播）的最长时长，超时强制收回。
+/** @brief "广播让位"（sensor 扫描/建链时暂停广播）**空转**多久就强制收回。
  *
  * 让位本身是必需的：这颗 LCPU 一个时刻只有一个射频角色，扫传感器就得停广播。
  * 但**让位必须有上限** —— 现场出现过 hold 一直没释放、广播永久停着，手机彻底
- * 看不到设备（"其他设备收不到 BLE 广播"）。取 20 s：比传感器连接的 15 s 超时
- * （`SENSOR_CONNECT_MS`）宽一点，正常让位不会被误收，泄漏则最多 20 s 自愈。 */
-#define COMPANION_ADV_HOLD_MAX_MS 20000u
+ * 看不到设备（"其他设备收不到 BLE 广播"）。
+ *
+ * **判据是"空转"，不是"时长"。** 早先这里取 20 s、按纯时长收，会误伤正常让位：
+ * 同一版固件的健康会话里让位最长到过 768 s，而且每次都正常闭合
+ * （`analysis/BLE_ADV_HOLD_LOCKOUT.md` §4）。所以收回条件是
+ * **闩锁在 + 传感器一次都没真的用射频（`transient` 恒 0）连续这么久**：
+ *   · 正常让位每拍都会被 `COMPANION_BLE_EV_TRANSIENT` 刷新 ⇒ 永不触发；
+ *   · 2026-09-23 13:13~14:25 那次外设关机 72 min，`hold=0`（transient 恒 0）
+ *     而闩锁恒 1 ⇒ 180 s 就到点收回，手机重新可见。
+ *
+ * 自证伪：若日志出现 `adv hold watchdog` 而同时段传感器**确实在扫描/建链**，
+ * 说明 180 s 太短 ⇒ 调大本值，别去掉这道兜底。 */
+#define COMPANION_ADV_HOLD_MAX_MS 180000u
 #define ADAPTER_CYCLE_OFF_MS    8000u
 /** skip-HCI respawn 后再 enable，GATTS 可能还没 startup。 */
 #define GATTS_READY_RETRY       10u
@@ -204,12 +221,64 @@ static volatile bool    g_hold_le_adv;
  *  22.6 s 一轮）。闩锁把"要"与"正在用"分开，环就断了。 */
 static volatile bool    g_hold_req_latch;
 /** @brief 判定侧读的本地镜像：现在该不该给 sensor 让出广播。
- *         让位是**派生值** —— sensor 每拍上报"正在扫描/建链"
- *         （COMPANION_BLE_EV_TRANSIENT），所以不再需要超时兜底。以前带兜底是
- *         因为存在配对失衡（hold 泄漏），那会让广播永久停着、手机再也看不到
- *         设备；派生之后这类泄漏不可能发生。 */
+ *
+ *  `transient` 那一路是**派生值** —— sensor 每拍上报"正在扫描/建链"
+ *  （COMPANION_BLE_EV_TRANSIENT），不会泄漏；但本值是
+ *  `transient || g_hold_req_latch`，**闩锁那一路是电平**：只要它的输入里混进
+ *  一个常驻判据，广播就会被永久扣住、手机再也看不到设备。
+ *  ⇒ 兜底不能省，见 `companion_adv_hold_watchdog()`。
+ *
+ *  （本注释 2026-09-23 更正：原文写的是"派生之后这类泄漏不可能发生"，
+ *   `analysis/BLE_ADV_HOLD_LOCKOUT.md` 证伪 —— 闩锁混进常驻量后外设关机
+ *  72 min 里广播全程停着。） */
 static volatile bool    g_policy_adv_off;
 static volatile bool    g_adv_active;
+
+/** 当前这次广播是不是定向（已绑定手机、窗口外）。 */
+static bool             g_adv_directed;
+/** 定向起播时刻：超过 DIRECTED_ADV_WINDOW_MS 没连上就回退无定向。 */
+static uint32_t         g_adv_directed_since_ms;
+/** 定向失败后的冷却截止时刻；冷却期内走无定向。0 = 立即可试。 */
+static uint32_t         g_adv_directed_retry_after_ms;
+
+/** 手机最近一次 CONNECT_IND 的原始 InitA（RPA）。
+ *
+ *  为什么必须自己存：`bt_conn_get_dst()` 对已绑定手机会返回身份地址
+ *  （bt_lookup_id_addr 解析后的结果）；只有 `bt_conn_get_info().le.remote`
+ *  保留连接建立时的原始 RPA。定向广播的 TargetA 必须是这个 RPA，
+ *  身份地址在本板控制器上实测不会自动解析（A 方案 90 s 无人连，
+ *  回退无定向后 0.36 s 就连上）。 */
+static pthread_mutex_t  g_rpa_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t          g_last_peer_rpa[6];
+static uint32_t         g_last_peer_rpa_ms;
+static bool             g_last_peer_rpa_valid;
+static bt_address_t     g_last_peer_identity;
+static uint8_t          g_last_peer_identity_type;
+static uint8_t          g_pending_peer_rpa[6];
+static uint32_t         g_pending_peer_rpa_ms;
+static bool             g_pending_peer_rpa_valid;
+/* Non-owning pointer, compared only while the connection exists. */
+static struct bt_conn  *g_pending_peer_conn;
+static bt_address_t     g_pending_peer_identity;
+static uint8_t          g_pending_peer_identity_type;
+static bool             g_pending_peer_secure;
+
+#define RPA_MAX_AGE_MS           600000u  /* 手机 RPA 默认 15 min 轮换，留余量 */
+/* 手机 App 后台重连实测约 30 s（17:53:41 am start → 17:54:11 连上），
+ * 定向窗口必须覆盖这个延迟；60 s 后仍没连上才回退无定向。 */
+#define DIRECTED_ADV_WINDOW_MS    60000u
+#define DIRECTED_ADV_RETRY_MS    600000u  /* 失败后 10 min 再试定向 */
+
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+/* 故障注入（仅 nsh-btadv 测试构建）：
+ *   1 = 定向起播同步返回 NULL；3 = 把缓存 RPA 置为过期。
+ *   2（异步失败）在 SAL 的 myvendor_sal_advfault_set()。 */
+static volatile int g_adv_fault_mode;
+void myvendor_adv_fault_set(int mode)
+{
+  g_adv_fault_mode = mode;
+}
+#endif
 
 static volatile bool g_running = true;
 
@@ -739,18 +808,51 @@ static uint16_t gnss_on_write(gatts_handle_t srv_handle, bt_address_t *addr,
 }
 
 /**
- * @brief FS Data 的 CCC（0xFF16）。
+ * @brief FS Data（0xFF16）的 Client Characteristic Configuration 写回调。
+ *
+ * @param[in] srv_handle   GATTS 服务句柄（未使用）。
+ * @param[in] addr          写 CCC 的对端；须通过 @ref companion_is_phone。
+ * @param[in] attr_handle   CCC 属性句柄（日志用，便于与驱动 `gatt: ccc write` 对齐）。
+ * @param[in] value         CCC 值；bit0 = Notify。
+ * @param[in] length        @p value 长度。
+ * @param[in] offset        写偏移（未使用）。
+ *
+ * @return 已接受的字节数（与框架约定一致）。
+ *
+ * @note 若 @ref companion_is_phone 返回 false，打
+ *       `fs ccc DROPPED (not phone) … addr=… peer=…`，App 仍可能以为 CCC 写成功。
  */
 static uint16_t fs_ccc_changed(gatts_handle_t srv_handle, bt_address_t *addr,
                                uint16_t attr_handle, const uint8_t *value,
                                uint16_t length, uint16_t offset)
 {
   (void)srv_handle;
-  (void)attr_handle;
   (void)offset;
 
   if (!companion_is_phone(addr))
     {
+      char peer_str[BT_ADDR_STR_LENGTH];
+      char addr_str[BT_ADDR_STR_LENGTH];
+
+      bt_addr_ba2str(addr, addr_str);
+      pthread_mutex_lock(&g_ctx.lock);
+      if (g_ctx.connected)
+        {
+          bt_addr_ba2str(&g_ctx.peer, peer_str);
+        }
+      else
+        {
+          snprintf(peer_str, sizeof(peer_str), "(none)");
+        }
+
+      pthread_mutex_unlock(&g_ctx.lock);
+      syslog(LOG_WARNING,
+             "ble_companion: fs ccc DROPPED (not phone) h=0x%04x raw=%02x "
+             "addr=%s peer=%s sensor=%d\n",
+             (unsigned)attr_handle,
+             (unsigned)(length > 0 ? value[0] : 0),
+             addr_str, peer_str,
+             ble_sensor_owns_addr(addr) ? 1 : 0);
       return length;
     }
 
@@ -782,7 +884,18 @@ static uint16_t fs_ccc_changed(gatts_handle_t srv_handle, bt_address_t *addr,
 }
 
 /**
- * @brief 拷贝 0xFF15 FS Command；I/O 在 companion 线程做。
+ * @brief 接收 FS Command（0xFF15）写；实际 I/O 在 companion 线程泵出。
+ *
+ * @param[in] srv_handle   GATTS 服务句柄（未使用）。
+ * @param[in] addr          写命令的对端；须通过 @ref companion_is_phone。
+ * @param[in] attr_handle   属性句柄（未使用）。
+ * @param[in] value         命令载荷。
+ * @param[in] length        载荷长度。
+ * @param[in] offset        写偏移（未使用）。
+ *
+ * @return 已接受的字节数；非手机对端时仍返回 @p length（帧已丢弃）。
+ *
+ * @see companion_fs_on_cmd()
  */
 static uint16_t fs_cmd_on_write(gatts_handle_t srv_handle, bt_address_t *addr,
                                 uint16_t attr_handle, const uint8_t *value,
@@ -794,6 +907,28 @@ static uint16_t fs_cmd_on_write(gatts_handle_t srv_handle, bt_address_t *addr,
 
   if (!companion_is_phone(addr))
     {
+      char peer_str[BT_ADDR_STR_LENGTH];
+      char addr_str[BT_ADDR_STR_LENGTH];
+
+      bt_addr_ba2str(addr, addr_str);
+      pthread_mutex_lock(&g_ctx.lock);
+      if (g_ctx.connected)
+        {
+          bt_addr_ba2str(&g_ctx.peer, peer_str);
+        }
+      else
+        {
+          snprintf(peer_str, sizeof(peer_str), "(none)");
+        }
+
+      pthread_mutex_unlock(&g_ctx.lock);
+      syslog(LOG_WARNING,
+             "ble_companion: fs cmd DROPPED (not phone) len=%u cmd=0x%02x "
+             "addr=%s peer=%s sensor=%d\n",
+             (unsigned)length,
+             (unsigned)(length > 0 ? value[0] : 0),
+             addr_str, peer_str,
+             ble_sensor_owns_addr(addr) ? 1 : 0);
       return length;
     }
 
@@ -889,8 +1024,9 @@ static gatt_attr_db_t g_companion_attr_db[] =
       GATT_PROP_READ, GATT_PERM_READ | GATT_PERM_ENCRYPT_REQUIRED,
       g_proto_ver_buf, sizeof(g_proto_ver_buf), COMP_PROTO_VER_ID),
 
-  /* 0xFF12 设备状态 — Read + Notify。
-   * CCCD 不加 ENCRYPT/AUTHEN：加上会触发 SMP 配对。
+  /* 0xFF12 设备状态 — Read + Notify（兼容旧 App）。
+   * 新 App（2026-09）改轮询读，不再写 status CCC ⇒ 板端也发不出 status 心跳。
+   * CCCD 仍保留：旧客户端订上才会走 notify 路径。
    */
 
   GATT_H_CHARACTERISTIC_AUTO_RSP(
@@ -997,6 +1133,14 @@ static void on_pair_display(void *cookie, bt_address_t *addr,
       return;
     }
 
+  /* 2026-09-23（审计 F9g）：同 gatts_connect_callback —— `addr` 先判空，
+   * `bt_addr_ba2str()` 不解引用 NULL。 */
+  if (addr == NULL)
+    {
+      LOGE("pair: display with null addr (type=%d), ignored", (int)type);
+      return;
+    }
+
   bt_addr_ba2str(addr, addr_str);
 
   if (type != PAIR_TYPE_CONSENT && type != PAIR_TYPE_PASSKEY_CONFIRMATION)
@@ -1006,6 +1150,29 @@ static void on_pair_display(void *cookie, bt_address_t *addr,
       return;
     }
 
+  /* 与 myvendor_bt_pair 的 pairing_confirm 一致：窗口外拒绝新配对。 */
+  if (!myvendor_pair_window_active())
+    {
+      st = bt_device_set_pairing_confirmation(g_ins, addr, BT_TRANSPORT_BLE,
+                                              false);
+      LOGI("pair: consent %s -> reject (no window) ret=%d", addr_str, (int)st);
+      return;
+    }
+
+  /* 名单已满且是新地址：拒绝（与 zblue pairing_confirm 同口径）。 */
+  {
+    extern bool myvendor_pair_reject_new_addr(const char *addr_str);
+
+    if (myvendor_pair_reject_new_addr(addr_str))
+      {
+        st = bt_device_set_pairing_confirmation(g_ins, addr, BT_TRANSPORT_BLE,
+                                                false);
+        LOGI("pair: consent %s -> reject (slots full) ret=%d", addr_str,
+             (int)st);
+        return;
+      }
+  }
+
   st = bt_device_set_pairing_confirmation(g_ins, addr, BT_TRANSPORT_BLE, true);
   LOGI("pair: consent %s -> accept ret=%d", addr_str, (int)st);
 }
@@ -1013,7 +1180,7 @@ static void on_pair_display(void *cookie, bt_address_t *addr,
 /**
  * @brief 绑定状态变化：维护"已绑定手机"记录（`/mnt/kv/bt_phone.tsv`）。
  *
- * 这个文件同时给两件事用：连接准入（地址对得上才放行）和定向广播（只朝它播）。
+ * 这个文件给连接准入用（地址对得上才放行；窗口外无记录不广播）。
  * 注意 `BOND_STATE_NONE` 也会在**别的设备配对失败**时发出来，所以清记录必须
  * 核对地址（`myvendor_pair_note_bond(addr, false)` 内部会比对），否则一台陌生
  * 设备配对失败就会把手机那条记录抹掉、把手机挡在门外。
@@ -1053,16 +1220,44 @@ static const adapter_callbacks_t g_adapter_cbs =
 };
 
 /**
- * @brief @p addr 是否是手机 Companion 对端（不是 HR/CSC/CPS 槽位）。
- * @param addr GATTS 回调里的对端。
- * @return 传感器地址返回 false，让 FS/MTU/状态留在手机链路上。
+ * @brief 判断 GATTS 回调对端是否为手机 Companion 链路。
  *
- * zblue att_mtu_updated 是全局的：HR 连接会把 ATT 23 报到 GATTS。
- * 把该 MTU 套到 Companion 曾让 FS 载荷变成 17 字节，文件传输会坏。
+ * 用于过滤 HR/CSC/CPS 等传感器地址上的 connect / disconnect / MTU /
+ * notify-complete / 特征写 / CCC，避免污染 `g_ctx.peer` 与 Companion FS。
+ *
+ * zblue 的 `att_mtu_updated` 是全局的：心率连接会把 ATT 23 报到 GATTS。
+ * 若误把该 MTU 套到 Companion，FS 载荷会变成约 17 字节，文件传输失败。
+ *
+ * @param[in] addr  GATTS 回调给出的对端 LE 地址；可为 @c NULL。
+ *
+ * @retval true   视为手机链路，调用方可继续处理 FS/MTU/状态。
+ * @retval false  传感器地址、@c NULL，或不应改动手机 peer 的其它情况。
+ *
+ * @note 连接回调尚未置位（`g_ctx.connected == false`）时，非传感器对端仍
+ *       视为手机，以便首包 MTU/CCC 能进；FS 侧另需已 `companion_fs_on_connect`
+ *       且地址与 FS peer 一致。
+ *
+ * @note **RPA / 身份地址（2026-09-21）**
+ *       连接回调常记下可解析私有地址（RPA），加密后 ATT 写与 CCC 回调可能
+ *       换成身份地址（或反过来）。严格 `memcmp(g_ctx.peer)` 会把
+ *       `fs ccc` / `fs cmd` 全部标成 `DROPPED (not phone)`，App 侧表现为
+ *       「CCCD=01 却 0 帧超时」。本产品单手机槽：已有手机链路且对端非传感器
+ *       时，认作同一台手机，刷新 `g_ctx.peer` 并同步
+ *       `companion_fs_on_connect()`（否则 `bt_gatts_notify` 仍打旧地址）。
+ *       成功刷新时打日志：`phone peer refresh <old> -> <new> (RPA/identity)`。
+ *
+ * @warning 不得在持有 `g_ctx.lock` 时调用 `companion_fs_on_connect()`
+ *          （该路径自带锁，会死锁）。
+ *
+ * @see companion_fs_on_connect(), ble_sensor_owns_addr()
+ * @see docs/ble/pairing_and_radio.md §1.3
  */
 static bool companion_is_phone(const bt_address_t *addr)
 {
   bool yes = false;
+  bool refresh = false;
+  bt_address_t old_peer;
+  bt_address_t new_peer;
 
   if (addr == NULL || ble_sensor_owns_addr(addr))
     {
@@ -1070,19 +1265,40 @@ static bool companion_is_phone(const bt_address_t *addr)
     }
 
   pthread_mutex_lock(&g_ctx.lock);
-  if (g_ctx.connected)
+  if (!g_ctx.connected)
     {
-      yes = (memcmp(g_ctx.peer.addr, addr->addr, BT_ADDR_LENGTH) == 0);
+      /* 连接回调尚未置位：非传感器对端仍视为手机（首包 MTU/CCC）。 */
+      yes = true;
+    }
+  else if (memcmp(g_ctx.peer.addr, addr->addr, BT_ADDR_LENGTH) == 0)
+    {
+      yes = true;
     }
   else
     {
-      /** 连接回调尚未置位时，非传感器对端仍视为手机（首包 MTU/CCC）。
-       *  FS MTU 另需 g_fs.connected 且地址等于 peer。
-       */
+      /* 单手机槽：RPA ↔ 身份地址切换，刷新 peer。 */
+      old_peer = g_ctx.peer;
+      g_ctx.peer = *addr;
+      new_peer = *addr;
       yes = true;
+      refresh = true;
     }
 
   pthread_mutex_unlock(&g_ctx.lock);
+
+  if (refresh)
+    {
+      char a1[BT_ADDR_STR_LENGTH];
+      char a2[BT_ADDR_STR_LENGTH];
+
+      bt_addr_ba2str(&old_peer, a1);
+      bt_addr_ba2str(&new_peer, a2);
+      syslog(LOG_INFO,
+             "ble_companion: phone peer refresh %s -> %s (RPA/identity)\n",
+             a1, a2);
+      companion_fs_on_connect(&new_peer);
+    }
+
   return yes;
 }
 
@@ -1095,16 +1311,51 @@ static void gatts_connect_callback(gatts_handle_t srv_handle,
   char addr_str[BT_ADDR_STR_LENGTH];
 
   (void)srv_handle;
+
+  /* 2026-09-23（审计 F9g）：**`addr` 必须显式判空**。
+   *
+   * 不能指望下面那句 `ble_sensor_owns_addr()` 兜住 —— 它对 NULL 返回
+   * **false**（"不是传感器的地址"），于是 NULL 会一路走到 `addr->addr`／
+   * `bt_addr_ba2str(addr, …)` 才炸。本文件同族的 `on_bond_state_changed()`
+   * 就是 `|| addr == NULL` 一起判的，这里漏了。
+   *
+   * 本回调跑在 framework 的 service-loop 线程上，崩在这里等于整条 BT 服务
+   * 线程没了（比"漏一次连接"严重得多），所以宁可不处理这一拍。 */
+  if (addr == NULL)
+    {
+      LOGE("gatts connect callback: null addr, ignored");
+      return;
+    }
+
   if (ble_sensor_owns_addr(addr))
     {
       return;
     }
 
-  /* **准入（2026-09-20）：没配对就不接受连接。** 只有"配对窗口内"或"本机记录的
-   * 已绑定手机"才放行，其余在这里请求断开（异步，AUTH_FAIL）——被拒时**不要**
-   * 往下走标记 connected，否则状态机会一直以为手机在连。详见 myvendor_bt_pair.c。 */
+  /* **准入（2026-09-20；2026-09-22 抗旧手机占坑）**：没配对就不接受。
+   * 只有"配对窗口内"或"本机记录的已绑定手机 / 短 grace 等 RPA 升密"才放行；
+   * 其余在这里请求断开（异步，AUTH_FAIL）——被拒时**不要**往下走标记
+   * connected，也**不要**停 ADV（停播在 admit 成功之后），否则旧手机 A
+   * 占坑时 B 扫不到设备。详见 myvendor_bt_pair.c（短 grace + 拒连冷却）。 */
   if (!myvendor_pair_admit(addr))
     {
+      /* 定向广播的目标被控制器接受、但连接来自非绑定设备（或者 Admission
+       * 判据拒绝）：控制器已经把定向广播停了，而 zblue 不会为此回调
+       * on_advertising_stopped ⇒ 这里主动清句柄并重新拉起，避免 g_adv
+       * 悬空后永远不再广播。 */
+      if (g_adv_directed)
+        {
+          companion_stop_advertising();
+
+          pthread_mutex_lock(&g_ctx.lock);
+          if (!g_hold_le_adv && !g_policy_adv_off)
+            {
+              g_ctx.adv_restart = true;
+            }
+
+          pthread_mutex_unlock(&g_ctx.lock);
+        }
+
       return;
     }
 
@@ -1118,6 +1369,7 @@ static void gatts_connect_callback(gatts_handle_t srv_handle,
 
   g_ctx.connected = true;
   g_ctx.peer      = *addr;
+
   pthread_mutex_unlock(&g_ctx.lock);
 
   companion_bridge_phone_set(true);
@@ -1150,6 +1402,26 @@ static void le_connected(struct bt_conn *conn, uint8_t err)
     {
       int ret;
 
+      /* **先抓原始 InitA/RPA。**
+       *
+       * `info.le.remote` 是连接建立时的对端地址，`bt_lookup_id_addr()`
+       * 不会改写它；`bt_conn_get_dst()` / GATTS 回调拿到的则是解析后的
+       * 身份地址。定向广播的 TargetA 必须用这里的 RPA。
+       * 只暂存真正的 RPA；身份核对和缓存提升由 companion 线程完成。 */
+      pthread_mutex_lock(&g_rpa_lock);
+      g_pending_peer_rpa_valid = false;
+      g_pending_peer_conn = NULL;
+      g_pending_peer_secure = false;
+      if (info.le.remote != NULL && bt_addr_le_is_rpa(info.le.remote))
+        {
+          memcpy(g_pending_peer_rpa, info.le.remote->a.val,
+                 sizeof(g_pending_peer_rpa));
+          g_pending_peer_rpa_ms = mono_ms();
+          g_pending_peer_rpa_valid = true;
+          g_pending_peer_conn = conn;
+        }
+      pthread_mutex_unlock(&g_rpa_lock);
+
       /* **控制器没就绪就别发这一族命令。**
        *
        * 连接刚建立时下发的 PM/参数命令（param update / PHY / data len）正是
@@ -1175,8 +1447,25 @@ static void le_connected(struct bt_conn *conn, uint8_t err)
           return;
         }
 
-      ret = bt_conn_le_param_update(conn, BT_LE_CONN_PARAM(6, 6, 0, 400));
-      LOGD("le interval 7.5 ms ret=%d", ret);
+      /** 参数取**厂商 SDK 的"高性能档"原值**，不要再自己发明。
+       *
+       *  `ble_connection_manager.h` 里三档是
+       *    高性能 12/12（15 ms）/ latency 0 / timeout 600（6 s）
+       *    均衡   24~40（30~50 ms）/ 0 / 600
+       *    低功耗 80~100（100~125 ms）/ 2 / 600
+       *  并注明了"iOS 支持的最大监督超时是 6 s"。厂商的
+       *  `file_transfer` 例程也是在传输期间强制切到高性能档。
+       *
+       *  以前这里要的是 `6/6/0/400`：**间隔 7.5 ms 是 BLE 规定的下限**，
+       *  手机基本不会给（本文件自己的注释就记着"间隔最后也会回到 30 ms"），
+       *  而 **4 s 监督超时比厂商的 6 s 短三分之一** —— 在一块"一张射频同时
+       *  跑手机广播 + 传感器扫描"的板子上，缺的正是这两秒余量。
+       *
+       *  自证伪：若日志里 `le interval=` 长期停在 15 ms 且丢链变多，说明本档
+       *  对这台手机偏激进 ⇒ 改投均衡档（24~40 / 0 / 600）。
+       */
+      ret = bt_conn_le_param_update(conn, BT_LE_CONN_PARAM(12, 12, 0, 600));
+      LOGD("le interval 15 ms ret=%d", ret);
       (void)ret;
 
 #if defined(CONFIG_BT_USER_PHY_UPDATE)
@@ -1201,6 +1490,15 @@ static void le_disconnected(struct bt_conn *conn, uint8_t reason)
 {
   struct bt_conn_info info;
   bt_address_t addr;
+
+  pthread_mutex_lock(&g_rpa_lock);
+  if (g_pending_peer_conn == conn)
+    {
+      g_pending_peer_conn = NULL;
+      g_pending_peer_rpa_valid = false;
+      g_pending_peer_secure = false;
+    }
+  pthread_mutex_unlock(&g_rpa_lock);
 
   if (bt_conn_get_info(conn, &info) != 0 || info.type != BT_CONN_TYPE_LE)
     {
@@ -1302,6 +1600,119 @@ static void le_note_peer_if_secure(struct bt_conn *conn)
     }
 
   myvendor_pair_note_secure_peer(&a, (uint8_t)dst->type);
+
+  /* GATTS admission can grant an unknown peer a short grace period. Only a
+   * secure connection may nominate its raw InitA for directed advertising. */
+  pthread_mutex_lock(&g_rpa_lock);
+  if (g_pending_peer_rpa_valid && g_pending_peer_conn == conn)
+    {
+      g_pending_peer_identity = a;
+      g_pending_peer_identity_type = (uint8_t)dst->type;
+      g_pending_peer_secure = true;
+    }
+  pthread_mutex_unlock(&g_rpa_lock);
+}
+
+/* Runs on the companion thread, where reading the phone record is safe. */
+static void companion_directed_peer_poll(void)
+{
+  bt_address_t identity;
+  uint8_t type;
+  uint8_t rpa[6];
+  uint32_t seen_ms;
+  bool pending;
+
+  pthread_mutex_lock(&g_rpa_lock);
+  pending = g_pending_peer_rpa_valid && g_pending_peer_secure;
+  if (pending)
+    {
+      identity = g_pending_peer_identity;
+      type = g_pending_peer_identity_type;
+      memcpy(rpa, g_pending_peer_rpa, sizeof(rpa));
+      seen_ms = g_pending_peer_rpa_ms;
+    }
+  pthread_mutex_unlock(&g_rpa_lock);
+
+  if (!pending || !myvendor_pair_has_phone_identity(&identity, type))
+    {
+      return;
+    }
+
+  pthread_mutex_lock(&g_rpa_lock);
+  if (g_pending_peer_rpa_valid && g_pending_peer_secure &&
+      g_pending_peer_rpa_ms == seen_ms &&
+      memcmp(g_pending_peer_rpa, rpa, sizeof(rpa)) == 0 &&
+      memcmp(g_pending_peer_identity.addr, identity.addr,
+             BT_ADDR_LENGTH) == 0 &&
+      g_pending_peer_identity_type == type)
+    {
+      memcpy(g_last_peer_rpa, rpa, sizeof(rpa));
+      g_last_peer_rpa_ms = seen_ms;
+      g_last_peer_identity = identity;
+      g_last_peer_identity_type = type;
+      g_last_peer_rpa_valid = true;
+      g_pending_peer_rpa_valid = false;
+      g_pending_peer_conn = NULL;
+      g_pending_peer_secure = false;
+      /* **不要清 g_adv_directed_retry_after_ms。** 定向失败/超时设的
+       * 10 min 冷却是“这段时间内别再发定向”的硬约束；无定向回连成功
+       * 只刷新 RPA，不能把冷却一起清掉（R6 实测：清了会在 17 s 后
+       * 再次发定向）。冷却到期后自然重试。 */
+      pthread_mutex_unlock(&g_rpa_lock);
+      LOGI("phone RPA cached after secure identity check");
+      return;
+    }
+  pthread_mutex_unlock(&g_rpa_lock);
+}
+
+/* An unbind can happen while the old target's directed ADV is already up. */
+static void companion_directed_target_reconcile(void)
+{
+  static uint32_t last_check_ms;
+  bt_address_t identity;
+  uint8_t type;
+  uint32_t now = mono_ms();
+  bool active;
+
+  if (!g_adv_directed || !g_adv_active ||
+      (last_check_ms != 0 &&
+       myvendor_mono_elapsed_ms(now, last_check_ms) < 1000u))
+    {
+      return;
+    }
+
+  last_check_ms = now;
+  pthread_mutex_lock(&g_rpa_lock);
+  active = g_last_peer_rpa_valid;
+  if (active)
+    {
+      identity = g_last_peer_identity;
+      type = g_last_peer_identity_type;
+    }
+  pthread_mutex_unlock(&g_rpa_lock);
+
+  if (!active || myvendor_pair_has_phone_identity(&identity, type))
+    {
+      return;
+    }
+
+  pthread_mutex_lock(&g_rpa_lock);
+  if (g_last_peer_rpa_valid &&
+      memcmp(g_last_peer_identity.addr, identity.addr, BT_ADDR_LENGTH) == 0 &&
+      g_last_peer_identity_type == type)
+    {
+      g_last_peer_rpa_valid = false;
+    }
+  pthread_mutex_unlock(&g_rpa_lock);
+
+  LOGI("directed target removed from phone records; stopping directed adv");
+  companion_stop_advertising();
+  pthread_mutex_lock(&g_ctx.lock);
+  if (!g_ctx.connected && !g_hold_le_adv && !g_policy_adv_off)
+    {
+      g_ctx.adv_restart = true;
+    }
+  pthread_mutex_unlock(&g_ctx.lock);
 }
 
 /**
@@ -1672,7 +2083,8 @@ static void on_advertising_start(bt_advertiser_t *adv, uint8_t adv_id,
        * 广播没了"这件事在日志里看不出来（现场 2026-09-18 16:08）。 */
       if (!g_adv_active)
         {
-          syslog(LOG_INFO, "ble_companion: adv active\n");
+          syslog(LOG_INFO, "ble_companion: adv active%s\n",
+                 g_adv_directed ? " (directed)" : "");
         }
 
       g_adv_active = true;
@@ -1691,6 +2103,28 @@ static void on_advertising_start(bt_advertiser_t *adv, uint8_t adv_id,
   syslog(LOG_WARNING,
          "ble_companion: adv start failed status=%u id=%u\n",
          (unsigned)status, (unsigned)adv_id);
+
+  if (g_adv_directed)
+    {
+      /* 定向参数被拒/控制器不接受：冷却 10 min，下一拍回无定向。
+       * **不要把这次失败报成 supervisor 故障** —— 否则一次参数不兼容
+       * 会升级成整栈 cycle；回退无定向后链路仍然可用。 */
+      g_adv_directed = false;
+      g_adv_directed_retry_after_ms = mono_ms() + DIRECTED_ADV_RETRY_MS;
+      syslog(LOG_WARNING,
+             "ble_companion: directed adv failed status=%u; "
+             "fallback to undirected for %u ms\n",
+             (unsigned)status, (unsigned)DIRECTED_ADV_RETRY_MS);
+
+      pthread_mutex_lock(&g_ctx.lock);
+      if (!g_ctx.connected && !g_hold_le_adv && !g_policy_adv_off)
+        {
+          g_ctx.adv_restart = true;
+        }
+
+      pthread_mutex_unlock(&g_ctx.lock);
+      return;
+    }
 
   /* **有链路在时，"广播起不来"不算故障。**
    *
@@ -1745,6 +2179,26 @@ static void on_advertising_stopped(bt_advertiser_t *adv, uint8_t adv_id)
   if (g_adv == adv)
     {
       g_adv = NULL;
+
+      /* 不是 app 主动停（主动停会先把 g_adv 清掉）而是 SAL/控制器停的：
+       * 定向广播提前结束 ⇒ 冷却并回退无定向。 */
+      if (g_adv_directed)
+        {
+          g_adv_directed = false;
+          g_adv_directed_retry_after_ms = mono_ms() + DIRECTED_ADV_RETRY_MS;
+          syslog(LOG_WARNING,
+                 "ble_companion: directed adv stopped early; "
+                 "fallback to undirected for %u ms\n",
+                 (unsigned)DIRECTED_ADV_RETRY_MS);
+
+          pthread_mutex_lock(&g_ctx.lock);
+          if (!g_ctx.connected && !g_hold_le_adv && !g_policy_adv_off)
+            {
+              g_ctx.adv_restart = true;
+            }
+
+          pthread_mutex_unlock(&g_ctx.lock);
+        }
     }
 }
 
@@ -1760,6 +2214,7 @@ static const advertiser_callback_t g_adv_cbs =
  */
 static void companion_stop_advertising(void)
 {
+  g_adv_directed = false;
   if (g_adv == NULL || g_ins == NULL)
     {
       g_adv = NULL;
@@ -1772,11 +2227,11 @@ static void companion_stop_advertising(void)
 }
 
 /**
- * @brief 配对窗口刚打开：让广播按新档位**立刻重来**（定向 → 普通可发现）。
+ * @brief 配对窗口刚打开：让广播按新档位**立刻重来**（可发现快广播）。
  *
  * 由 `ctl pair open [秒]`（myvendor_bt_pair.c 里 extern 调）和窗口过期后的下一拍用。
  * 只开窗口不重播是不够的：`companion_start_advertising()` 在 `g_adv != NULL`
- * （正播着定向广播）时会直接早退，档位永远不切（2026-09-20 现场：`ctl pair open 30`
+ * 时会直接早退，档位永远不切（2026-09-20 现场：`ctl pair open 30`
  * 之后看不到任何广播变化）。
  */
 void companion_adv_restart_for_pair_window(void)
@@ -1787,6 +2242,26 @@ void companion_adv_restart_for_pair_window(void)
 
   companion_stop_advertising();
   LOGI("pair window -> adv restart");
+}
+
+/**
+ * @brief 配对窗口开着才允许 LE 新绑定；窗口外只保留已绑定回连（LTK）。
+ *
+ * 旧注释"不要调 set_bondable_le(false)"已过时：Companion GATT 现已 ENCRYPT，
+ * 窗口外若仍 bondable，任意扫到的中心都能发起 Just Works（2026-09-21）。
+ */
+static void companion_sync_bondable(void)
+{
+  bool on = myvendor_pair_window_active();
+  bt_status_t st;
+
+  if (g_ins == NULL)
+    {
+      return;
+    }
+
+  st = bt_device_set_bondable_le(g_ins, on);
+  LOGI("bondable_le=%d ret=%d", on ? 1 : 0, (int)st);
 }
 
 /**
@@ -1845,8 +2320,19 @@ static void companion_le_io_cap_once(void)
 static void companion_restore_keys(void)
 {
   extern void myvendor_keys_kv_load_all(void);
+  extern void myvendor_pair_prune_against_keys(void);
 
   myvendor_keys_kv_load_all();
+
+  /** **密钥池刚恢复完、还没开广播 ⇒ 这是唯一能安全遍历密钥池的窗口。**
+   *
+   *  用它修剪 `bt_phone.tsv` 里混进去的陈旧 RPA（配对那次连接建立时密钥池里
+   *  还没有 IRK，只能记下轮换 RPA；它永远匹配不上、只白占名额）。
+   *  详情与约束见 `myvendor_bt_pair.c` 的 `myvendor_pair_prune_against_keys()`。
+   *
+   *  必须**紧跟** `myvendor_keys_kv_load_all()`：池还是空的时候这个函数自己
+   *  会跳过（不清表），所以这里不用额外判。 */
+  myvendor_pair_prune_against_keys();
 }
 
 /**
@@ -1858,6 +2344,13 @@ static void companion_restore_keys(void)
 static int companion_start_advertising(void)
 {
   ble_adv_params_t params;
+
+  /* Radio-policy changes can arrive while the phone is still connected.
+   * This product resumes phone advertising only after that link disconnects. */
+  if (companion_phone_connected())
+    {
+      return 0;
+    }
 
   companion_le_io_cap_once();
   companion_restore_keys();
@@ -1919,40 +2412,118 @@ static int companion_start_advertising(void)
   params.channel_map     = BT_LE_ADV_CHANNEL_DEFAULT;
   params.filter_policy   = BT_LE_ADV_FILTER_WHITE_LIST_FOR_NONE;
 
-  /* **广播三档（2026-09-20 改）**：
-   *   ① 有"已绑定手机"记录 + 不在配对窗口 → 可发现 + 可连接（`ADV_IND`）。
-   *      为什么不再用定向广播（`ADV_DIRECT_IND`）：手机配对成功后会改用**轮换的
-   *      RPA** 发起连接（现场 2026-09-20：HCI `atype=1`，地址每次不同 ——
-   *      78D8404BF520 → 43E600A8A719 → 6cb27f542da5 …），而定向广播只能打给一个
-   *      固定 TargetA ⇒ 手机侧直接忽略，CONNECT_IND 等 15 s 超时 ⇒ 用户看到的
-   *      **"只有配对那次能连，之后连接被拒绝"**（小米 13 / Android 16，adbf logcat：
-   *      `GATT_CONN_TERMINATE_LOCAL_HOST` + `Connection timeout`）。定向那条路
-   *      现在没有可用场景，代码留着（`myvendor_pair_directed_peer()`）但不再走。
-   *      别人扫到也连不上：`myvendor_pair_admit()` 只放行记录里那台，其余走宽限后
-   *      断开，且所有特征/CCCD 都是 ENCRYPT 权限。
-   *   ② 配对窗口内（app「允许配对新手机」30 s / `ctl pair open [秒]`）
-   *      → 可发现 + 可连接：新手机要在这段时间里扫到并配对。
-   *   ③ 没记录 + 窗口外 → **完全不广播**（用户要求："不允许扫描到本设备，甚至不广播 ——
-   *      我做这套逻辑就是为了减轻 MCU 同时扫描和广播的压力"），射频整块让给传感器扫描。
+  /* **广播三档**：
+   *   ① 配对窗口内 → 可发现 + 可连接 + 带本地名（快广播）+ bondable。
+   *   ② 已绑定手机 + 窗口外 → **定向广播**（CONFIG_MYVENDOR_BLE_DIRECTED_ADV）：
+   *      ADV_DIRECT_IND + own=PUBLIC（码表身份地址）+ TargetA=上一次手机连接
+   *      时的原始 InitA/RPA（`bt_conn_get_info().le.remote`），peer_type=RANDOM。
+   *      **不能用身份地址当 TargetA**：本板控制器实测不会把身份地址解析成
+   *      RPA（A 方案 90 s 无人连，回退无定向后 0.36 s 连上）。
+   *      **own 也不能用 RANDOM**：手机后台 auto-connect 只认码表 public 地址；
+   *      V2/V3（own=RANDOM，含 DIR_ADDR_RPA）30 s 内一次连接尝试都没有。
+   *      RPA 超过 10 min / 定向失败 / 60 s 没连上 → 冷却 10 min，期间回退
+   *      无定向 ADV_IND；无定向连上后会刷新 RPA 并清冷却，下一次断开再试。
+   *   ③ 没记录 + 窗口外 → **完全不广播**。
    */
   {
+    uint8_t rsp_len = g_scan_rsp_len;
+    bool directed = false;
+
     if (myvendor_pair_window_active())
       {
         LOGI("adv discoverable (pair window; %u ms)", (unsigned)ADV_INTERVAL_MS);
       }
     else if (myvendor_pair_has_phone_record())
       {
-        /* **空闲期把间隔拉长**：这才是真正"降低广播时间"的杠杆 —— 定向广播
-         * （②）和普通广播的**空口时长完全一样**，只是别人扫不到（不可发现），
-         * 所以我们不再用它；能省的只有"每秒发几次"。手机直连时会一直监听，
-         * 1.28 s 才发一次也只是让连接多等 ≤1.3 s（Android 侧 15 s 超时够）。
-         * 配对窗口仍是快广播（要快扫快配）。 */
-        params.interval = ADV_INTERVAL_IDLE_UNITS;
-        LOGI("adv discoverable (paired; idle %u ms)", (unsigned)ADV_INTERVAL_IDLE_MS);
+        rsp_len = 0;
+
+#ifdef CONFIG_MYVENDOR_BLE_DIRECTED_ADV
+        {
+          uint32_t now = mono_ms();
+          uint32_t rpa_age_ms = 0;
+          uint8_t rpa[6];
+          bt_address_t identity;
+          uint8_t identity_type = 0;
+          bool have_rpa = false;
+
+          pthread_mutex_lock(&g_rpa_lock);
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+          if (g_adv_fault_mode == 3)
+            {
+              g_last_peer_rpa_ms = now - RPA_MAX_AGE_MS - 1u;
+              g_adv_fault_mode = 0;
+              LOGI("injected expired RPA cache");
+            }
+#endif
+          if (g_last_peer_rpa_valid &&
+              myvendor_mono_elapsed_ms(now, g_last_peer_rpa_ms) < RPA_MAX_AGE_MS)
+            {
+              memcpy(rpa, g_last_peer_rpa, sizeof(rpa));
+              identity = g_last_peer_identity;
+              identity_type = g_last_peer_identity_type;
+              rpa_age_ms = myvendor_mono_elapsed_ms(now, g_last_peer_rpa_ms);
+              have_rpa = true;
+            }
+          pthread_mutex_unlock(&g_rpa_lock);
+
+          /* A phone can be unbound while another record remains. Never use
+           * the removed phone's RPA as the next directed TargetA. */
+          if (have_rpa &&
+              !myvendor_pair_has_phone_identity(&identity, identity_type))
+            {
+              pthread_mutex_lock(&g_rpa_lock);
+              if (g_last_peer_rpa_valid &&
+                  memcmp(g_last_peer_identity.addr, identity.addr,
+                         BT_ADDR_LENGTH) == 0 &&
+                  g_last_peer_identity_type == identity_type &&
+                  memcmp(g_last_peer_rpa, rpa, sizeof(rpa)) == 0)
+                {
+                  g_last_peer_rpa_valid = false;
+                }
+              pthread_mutex_unlock(&g_rpa_lock);
+              have_rpa = false;
+              LOGI("directed target removed from phone records");
+            }
+
+          if (have_rpa &&
+              (int32_t)(now - g_adv_directed_retry_after_ms) >= 0)
+            {
+              char rpa_str[BT_ADDR_STR_LENGTH];
+              bt_address_t peer;
+
+              memset(&peer, 0, sizeof(peer));
+              memcpy(peer.addr, rpa, sizeof(rpa));
+              params.adv_type         = BT_LE_LEGACY_ADV_DIRECT_IND;
+              params.peer_addr        = peer;
+              params.peer_addr_type   = BT_LE_ADDR_TYPE_RANDOM;
+              /* **own 必须是 PUBLIC（码表身份地址），不能是本地 RPA。**
+               * 实机 V1/V2/V3 对比：手机后台 auto-connect 只认它缓存的
+               * 码表 public 地址；own=RANDOM（不管有没有 DIR_ADDR_RPA）
+               * 手机 30 s 内一次连接尝试都没有。TargetA 仍然是手机
+               * 当前 RPA（peer_type=1），不需要 DIR_ADDR_RPA。 */
+              params.own_addr_type    = BT_LE_ADDR_TYPE_PUBLIC;
+              directed                = true;
+              g_adv_directed_since_ms = now;
+
+              bt_addr_ba2str(&peer, rpa_str);
+              LOGI("adv directed (paired; cached RPA %s age=%u ms; %u ms)",
+                   rpa_str, (unsigned)rpa_age_ms,
+                   (unsigned)ADV_INTERVAL_MS);
+            }
+          else
+            {
+              LOGI("adv connectable unnamed (paired; %s; %u ms)",
+                   have_rpa ? "directed cooldown" : "no fresh RPA",
+                   (unsigned)ADV_INTERVAL_MS);
+            }
+        }
+#else
+        LOGI("adv connectable unnamed (paired; %u ms)",
+             (unsigned)ADV_INTERVAL_MS);
+#endif
       }
     else
       {
-        /* 日志限频 10 s，免得每拍刷一行。 */
         static uint32_t last_quiet_log_ms;
 
         if (last_quiet_log_ms == 0 ||
@@ -1962,17 +2533,38 @@ static int companion_start_advertising(void)
             LOGI("adv off (unpaired, no window; ctl pair open 恢复广播)");
           }
 
-        return 0;               /* 不设 g_adv = 不广播 */
+        return 0;
       }
-  }
 
+  g_adv_directed = directed;
   companion_bridge_phase_set("hci_adv");
+#ifdef CONFIG_MYVENDOR_BLE_TEST_APP
+  if (directed && g_adv_fault_mode == 1)
+    {
+      g_adv_fault_mode = 0;
+      g_adv = NULL;
+      LOGI("injected synchronous directed start failure");
+    }
+  else
+#endif
   g_adv = bt_le_start_advertising(g_ins, &params,
-                                  g_adv_data, sizeof(g_adv_data),
-                                  g_scan_rsp, g_scan_rsp_len,
+                                  directed ? NULL : g_adv_data,
+                                  directed ? 0 : sizeof(g_adv_data),
+                                  directed ? NULL : g_scan_rsp,
+                                  directed ? 0 : rsp_len,
                                   (advertiser_callback_t *)&g_adv_cbs);
+  }
   if (g_adv == NULL)
     {
+      if (g_adv_directed)
+        {
+          g_adv_directed_retry_after_ms = mono_ms() + DIRECTED_ADV_RETRY_MS;
+          syslog(LOG_WARNING,
+                 "ble_companion: directed adv start rejected; "
+                 "fallback to undirected for %u ms\n",
+                 (unsigned)DIRECTED_ADV_RETRY_MS);
+        }
+      g_adv_directed = false;
 #ifdef CONFIG_MYVENDOR_BLE_LOG
       static uint32_t last_adv_fail_ms;
       uint32_t now = mono_ms();
@@ -2039,7 +2631,7 @@ void companion_ble_state_set_phone(bool linked)
 /** @brief 纯判定：从状态字段算出射频用途（快照与查询共用）。
  *
  * 方案：① 广播与扫描互斥；② 手机没连 + 有 sensor 想连 → 交替；③ 手机已连 →
- * 不需要广播；④ 手机没连 + 没有 sensor 想连 → 只广播。
+ * 不需要广播（sensor 侧仍间隔扫）；④ 手机没连 + 没有 sensor 想连 → 只广播。
  * 「节奏」（交替多快、不在场时退避多久、静止时是否找）不在这里 —— 那是执行侧
  * （ble_sensor）的事，本函数只回答"此刻该干什么"。
  */
@@ -2281,12 +2873,40 @@ static int companion_adapter_cycle(uint32_t now_ms)
   bt_status_t ret;
   bool sensor_on;
   bool radio_on;
+  bt_address_t peer;
 
+  /** **先走统一收尾，不能只清 `g_ctx` 那三个字段。**
+   *
+   *  2026-09-23 修：原来这里只清 `connected/ccc_enabled/mtu`，其余
+   *  （`companion_ble_state_set_phone(false)` / `companion_bridge_phone_set(false)` /
+   *  `companion_fs_on_disconnect()` / `companion_downlink_reset()` /
+   *  `companion_bridge_gnss_clear()` / 清 `COMPANION_STATUS_GPS_PHONE` 位）
+   *  全靠 `bt_adapter_disable()` 过程中的 GATTS 断开回调去兜。
+   *
+   *  问题是 cycle 恰恰常在**栈已经不回话**时才被发起（HCI 静默 / 收不到
+   *  Disconnection Complete）—— 那种时候回调不会来，于是：
+   *
+   *    `g_ble_state.phone_linked` 粘住 true
+   *      → `radio_state_from()` 返回 SCAN_ONLY
+   *      → `companion_ensure_advertising()` 里 `need` 恒为假
+   *      → **设备再也不广播、手机连不回来**（只能 `ctl radio on` 或重启）。
+   *
+   *  而本来为「断开回调丢失」准备的那条对账（主循环
+   *  `linked = !g_ctx.connected || myvendor_pair_phone_link_up()`）
+   *  **在这个场景下恰好被关掉**：cycle 已经把 `connected` 清成 false，
+   *  `linked` 就恒为真 ⇒ 对账永不触发。也就是说这条路原先没有任何兜底。
+   *  现场抓到过一次：`[radio] state 1 -> 0 (phone=1 …)`，此后整个开机
+   *  再没有 `[radio] state 0 -> …` 的转换。
+   *
+   *  直接复用 `companion_phone_gone()`：它本来就是「几类收尾共用一个漏斗」，
+   *  cycle 是又一个调用方。重复调用是幂等的（断开回调后到时会再走一次，
+   *  顺带还能从日志里看出"回调到底有没有来"）。
+   */
   pthread_mutex_lock(&g_ctx.lock);
-  g_ctx.connected   = false;
-  g_ctx.ccc_enabled = false;
-  g_ctx.mtu         = 0;
+  peer = g_ctx.peer;
   pthread_mutex_unlock(&g_ctx.lock);
+  companion_phone_gone(&peer, "adapter-cycle");
+
   sf32lb52_bt_hci_rx_stall_clear();
 
   ble_supervisor_cycle_begin(now_ms);
@@ -2379,13 +2999,18 @@ static int companion_adapter_cycle(uint32_t now_ms)
  * `ble_supervisor_watch_advertising()` 的 `expected = !phone_connected()` 恒为假
  * → 广播停滞看门狗永不触发 → 直到重启都不恢复）。
  *
- * **不看 `connected` 这个粘滞位，看"控制器还会不会说话"**：手机连着且已订阅时，
- * 主循环每 `COMPANION_STATUS_HEARTBEAT_SEC`(5 s) 发一次 status notify，控制器
- * 收到后必须回 `Number Of Completed Packets`（HCI 事件，走 RX 方向）。所以
+ * **不看 `connected` 这个粘滞位，看"控制器还会不会说话"**：手机连着时，
+ * 主循环会周期性 `bt_gatts_set_attr_value` 刷新 0xFF12，且 FS/控制写也会
+ * 产生 HCI；另当旧 App 仍订了 status CCC 时还会每
+ * `COMPANION_STATUS_HEARTBEAT_SEC`(5 s) 发一次 status notify。控制器收到后
+ * 必须回 `Number Of Completed Packets`（HCI 事件，走 RX 方向）。所以
  * `myvendor_bth4_activity()` 给出的"距最近一次收包"年龄超过
  * `COMPANION_LINK_STALE_MS`，就说明控制器/LCPU 不再说话。
  *
- * 这个判据与 App 行为无关（手机闲着也会回心跳），所以不会误判"手机没在推定位"；
+ * **2026-09-21**：App 已改为轮询读 0xFF12、且 0xFF16 按需订 —— 不能再要求
+ * `ccc_enabled`（status CCC）才武装看门狗，否则新 App 永远不触发链路判死。
+ *
+ * 这个判据与 App 行为无关（手机闲着也会有 HCI 活动），所以不会误判"手机没在推定位"；
  * 与 `phone silent` 那个探针（看 0xFF14 写入）互补，后者只在"手机 App 侧不说话"
  * 时才有意义。
  *
@@ -2406,7 +3031,7 @@ static void companion_link_watchdog(uint32_t now_ms)
   bool armed;
 
   pthread_mutex_lock(&g_ctx.lock);
-  armed = g_ctx.connected && g_ctx.ccc_enabled;
+  armed = g_ctx.connected;
   peer  = g_ctx.peer;
   pthread_mutex_unlock(&g_ctx.lock);
 
@@ -2512,7 +3137,7 @@ static bool companion_cycle_await_life(void)
  * 限频 5 分钟一次：复位本身不能变成新的循环（n005 的教训是"在 cycle 飞行中
  * 再叠一次复位"会崩，所以这里由 supervisor 决定、本线程独占执行）。
  */
-static void companion_controller_recover(uint32_t now_ms)
+static bool companion_controller_recover(uint32_t now_ms)
 {
   static uint32_t last_ms;
   bt_status_t ret;
@@ -2520,7 +3145,7 @@ static void companion_controller_recover(uint32_t now_ms)
   if (last_ms != 0 &&
       myvendor_mono_elapsed_ms(now_ms, last_ms) < 300000u)
     {
-      return;
+      return false;
     }
 
   last_ms = now_ms;
@@ -2565,7 +3190,7 @@ static void companion_controller_recover(uint32_t now_ms)
         }
 
       /* 阶梯不归零：下一轮 cycle 失败还会再来（5 分钟限频兜着）。 */
-      return;
+      return true;
     }
 
   (void)bt_conn_cb_register(&g_le_conn_cb);
@@ -2580,6 +3205,7 @@ static void companion_controller_recover(uint32_t now_ms)
   companion_apply_sensor_policy(true);
   ble_supervisor_escalation_done(now_ms);
   LOGI("BLE recovery: controller reset + enable ok — re-advertising");
+  return true;
 }
 
 static void companion_supervisor_pump(uint32_t now_ms)
@@ -2705,7 +3331,10 @@ static void companion_supervisor_pump(uint32_t now_ms)
   /* 换级：cycle 那一档连续失败之后，复位控制器再试（见上面的注释）。 */
   if (ble_supervisor_take_escalation())
     {
-      companion_controller_recover(now_ms);
+      if (!companion_controller_recover(now_ms))
+        {
+          ble_supervisor_defer_escalation();
+        }
       return;
     }
 
@@ -2776,9 +3405,67 @@ void companion_hold_le_adv(bool hold)
     }
 }
 
+/**
+ * @brief 让位闩锁的**空转兜底**：闩锁在、传感器却一直没真的用射频 ⇒ 收回。
+ *
+ * 为什么需要它：`g_hold_le_adv = transient || g_hold_req_latch`。`transient` 是
+ * 派生值（每拍由传感器上报"正在扫描/建链"），本身不会泄漏；但**闩锁那一路是电平**，
+ * 只要它的输入里混进一个常驻判据，广播就会被永久扣住（现场见
+ * `analysis/BLE_ADV_HOLD_LOCKOUT.md`：外设关机 72 min，手机全程扫不到设备）。
+ * 输入侧已经修过一轮，这条兜底是防"将来再混进别的常驻量"—— 让位是**借**射频，
+ * 任何输入异常都不该让广播永久停。
+ *
+ * 只认"空转"：`transient` 为真 = 传感器此刻真的在用射频 = 正常让位，不碰。
+ * 收回只清闩锁，**不动**传感器的 `g_adv_hold_want`（边沿记忆）——
+ * 它下一拍从 `ble_sensor_set_phone_state()` 学到"广播已解除"，若之后真的需要用
+ * 射频，`transient` 一路仍然能把让位顶起来。
+ *
+ * @param now_ms 当前单调毫秒。
+ */
+static void companion_adv_hold_watchdog(uint32_t now_ms)
+{
+  companion_ble_state_t st;
+  static uint32_t idle_since_ms;
+
+  if (!g_hold_req_latch)
+    {
+      idle_since_ms = 0u;
+      return;
+    }
+
+  /* 只读快照（本工程约定：跨线程共享读一律走快照）。 */
+  companion_ble_state_snapshot(&st);
+  if (st.transient)
+    {
+      idle_since_ms = 0u;
+      return;
+    }
+
+  if (idle_since_ms == 0u)
+    {
+      idle_since_ms = (now_ms != 0u) ? now_ms : 1u;
+      return;
+    }
+
+  if (myvendor_mono_elapsed_ms(now_ms, idle_since_ms) <
+      COMPANION_ADV_HOLD_MAX_MS)
+    {
+      return;
+    }
+
+  idle_since_ms = 0u;
+  syslog(LOG_WARNING,
+         "ble_companion: adv hold watchdog: latch idle %u s with no sensor "
+         "radio activity — releasing (phone was invisible)\n",
+         (unsigned)(COMPANION_ADV_HOLD_MAX_MS / 1000u));
+  companion_hold_le_adv(false);
+}
+
 /** @brief 应用 radio 策略（ADV on/off）。 */
 static void companion_apply_radio_policy(bool on)
 {
+  bool start = false;
+
   g_policy_adv_off = !on;
   if (on)
     {
@@ -2786,10 +3473,14 @@ static void companion_apply_radio_policy(bool on)
       if (!g_ctx.connected && !g_hold_le_adv)
         {
           g_ctx.adv_restart = true;
+          start = true;
         }
 
       pthread_mutex_unlock(&g_ctx.lock);
-      (void)companion_start_advertising();
+      if (start)
+        {
+          (void)companion_start_advertising();
+        }
       LOGI("phone radio on");
     }
   else
@@ -2827,19 +3518,50 @@ static void companion_sensor_autorc_all(void)
       return;
     }
 
-  for (i = 0; i < n; i++)
-    {
-      if (!recs[i].autorc)
-        {
-          continue;
-        }
+  /* 板级改动（my_vendor，2026-09-24）：**每个 kind 只武装一个地址**。
+   *
+   * 记录可以有多条（例如现场放了两台心率计，两条都 autorc=1），但同一个 kind
+   * 只有一个连接槽（`g_slots[SENSOR_KIND_COUNT]`），而 `ble_sensor_connect_addr()`
+   * 在"同 kind 已是另一个地址"时会**主动拆掉当前链路去切换**
+   * （日志 `switch to saved addr after disconnect`）⇒ 逐条武装的旧写法
+   * 会让两台设备互相顶掉：实测一个会话里 28 次断连、0 次成功。
+   *
+   * 新口径（用户 2026-09-24 定）：**记录多个、同时只连一个** ——
+   * 同一 kind 只取第一条 autorc 记录去连，其余留在 tsv 里当候选（被跳过时打一行日志，
+   * 想换哪台用 `ctl sensor ...` 显式指定）。 */
+  {
+    uint32_t armed = 0;
 
-      if (ble_sensor_connect_addr(recs[i].addr, recs[i].addr_type, recs[i].kind,
-                                  recs[i].name, NULL, 0) == 0)
-        {
-          LOGI("sensor autorc kind=%u", (unsigned)recs[i].kind);
-        }
-    }
+    for (i = 0; i < n; i++)
+      {
+        uint32_t bit;
+
+        if (!recs[i].autorc)
+          {
+            continue;
+          }
+
+        bit = 1u << (recs[i].kind & 31u);
+        if ((armed & bit) != 0u)
+          {
+            char skip[BT_ADDR_STR_LENGTH];
+            bt_address_t skip_addr;
+
+            memcpy(skip_addr.addr, recs[i].addr, BT_ADDR_LENGTH);
+            bt_addr_ba2str(&skip_addr, skip);
+            LOGI("sensor autorc skip kind=%u %s (same kind already armed)",
+                 (unsigned)recs[i].kind, skip);
+            continue;
+          }
+
+        if (ble_sensor_connect_addr(recs[i].addr, recs[i].addr_type, recs[i].kind,
+                                    recs[i].name, NULL, 0) == 0)
+          {
+            armed |= bit;
+            LOGI("sensor autorc kind=%u", (unsigned)recs[i].kind);
+          }
+      }
+  }
 }
 
 static void companion_apply_sensor_policy(bool on)
@@ -2862,7 +3584,19 @@ static void companion_apply_sensor_policy(bool on)
   else
     {
       ble_sensor_stop();
+      /* 外设关：收回扫描让位，并**强制重开**手机 ADV。
+       * hold 释放只置 adv_restart；若当前句柄还在（停在 ADV 窗）或刚
+       * 从扫描窗出来，不 stop 一下会沿用旧节奏。关外设后射频应整段
+       * 连续给手机（见 companion_start_advertising 快广播）。 */
       companion_hold_le_adv(false);
+      companion_stop_advertising();
+      pthread_mutex_lock(&g_ctx.lock);
+      if (!g_ctx.connected && !g_policy_adv_off)
+        {
+          g_ctx.adv_restart = true;
+        }
+
+      pthread_mutex_unlock(&g_ctx.lock);
       LOGI("sensor central off");
     }
 }
@@ -3017,9 +3751,8 @@ static int companion_start(void)
       return -1;
     }
 
-  /** 不要调 bt_device_set_bondable_le(false)：那会写全局 zblue bondable。
-   *  本服务 GATT 不加密，手机不需要 LE 配对。
-   */
+  /** 配对窗口外不允许新 LE 绑定（已绑定手机仍可用 LTK 回连）。 */
+  companion_sync_bondable();
 
   if (bt_adapter_get_le_address(g_ins, &le_addr, &le_addr_type) !=
       BT_STATUS_SUCCESS)
@@ -3237,8 +3970,17 @@ static void companion_apply_sensor_test(bt_instance_t *ins)
       case COMPANION_TEST_PAIR_UNBIND:
         {
           extern void myvendor_pair_unbind_request(void);
+          extern void myvendor_pair_unbind_request_slot(unsigned idx);
+          uint8_t slot = companion_bridge_test_pair_unbind_slot();
 
-          myvendor_pair_unbind_request();
+          if (slot == 0xffu)
+            {
+              myvendor_pair_unbind_request();
+            }
+          else
+            {
+              myvendor_pair_unbind_request_slot((unsigned)slot);
+            }
         }
         break;
 
@@ -3646,6 +4388,7 @@ int main(int argc, FAR char *argv[])
 
       /* 让位超时自愈：没人还回来的 hold 到点就收，否则广播永久停着、
        * 手机再也看不到设备。现在让位是派生上报的，漏配最多影响一拍。 */
+      companion_adv_hold_watchdog(mono_ms());
 
       /** 先消费 scanner 的 hold/release，再按新相位启 ADV；板级 SAL
        * radio guard 再等待上一角色的 HCI stop 真正完成。
@@ -3656,18 +4399,65 @@ int main(int argc, FAR char *argv[])
        * 所以它只置标志，这里由 companion 线程来停/重播（2026-09-20）。 */
       if (myvendor_pair_window_take_restart())
         {
+          companion_sync_bondable();
           companion_adv_restart_for_pair_window();
         }
 
-      /* 未配对连接的宽限到期检查（配对窗口/宽限的配套，见 myvendor_bt_pair.c）。 */
-      myvendor_pair_admit_poll();
+      /** **控制器不应答时，这两条"配对动作"一律不做。**
+       *
+       *  它们都不是纯主机动作，会发**同步 HCI**：
+       *    · `myvendor_pair_admit_poll()` → `bt_conn_disconnect()`（HCI_Disconnect）
+       *    · `myvendor_pair_unbind_poll()` → `bt_unpair()` → `bt_keys_clear()`
+       *      → `bt_id_del()` → `addr_res_enable()` → `LE Set Address Resolution
+       *      Enable`（**解析列表真的写进控制器之后才有这一步**）
+       *
+       *  控制器静默时这些同步命令只能等超时或干脆等不到，而它们跑在
+       *  **companion 主循环**上 ⇒ 心跳停 ⇒ diag 判 unhealthy ⇒ 三连杀；
+       *  卡在不可中断等待里杀不掉 ⇒ 僵尸 ⇒ 只能断电。
+       *
+       *  2026-09-23 18:5x 现场就是这么卡的 —— pid 回溯一条链走完：
+       *    `ble_companion_main → myvendor_pair_unbind_poll → bt_unpair →
+       *     bt_keys_clear → bt_id_del → addr_res_enable → bt_hci_cmd_send_sync`
+       *  （`id.c`，末帧停在 `k_msleep` 轮询上）。
+       *
+       *  门控只挡"此刻不做"：两个 poll 内部**不清请求标志**，下一拍适配器
+       *  能用时照常执行 —— 用户侧顶多是"点了解绑晚几秒生效"。
+       *
+       *  自证伪：若日志出现 `pair: unbind deferred` 长时间不消失（适配器一直
+       *  不可用），那是控制器本身没起来，属于另一个问题，别把门控当成病因。 */
+      if (adapter_is_usable())
+        {
+          /* 未配对连接的宽限到期检查（配对窗口/宽限的配套，见 myvendor_bt_pair.c）。 */
+          myvendor_pair_admit_poll();
 
-      /* `ctl pair unbind` / 设备 UI 的"解除绑定"：真解绑只能在蓝牙自己的线程里做。 */
-      myvendor_pair_unbind_poll();
+          /* `ctl pair unbind` / 设备 UI 的"解除绑定"：真解绑只能在蓝牙自己的线程里做。 */
+          myvendor_pair_unbind_poll();
+        }
+      else if (myvendor_pair_pending())
+        {
+          static uint32_t last_pair_defer_log_ms;
+
+          if (last_pair_defer_log_ms == 0 ||
+              myvendor_mono_elapsed_ms(mono_ms(), last_pair_defer_log_ms) >= 5000u)
+            {
+              last_pair_defer_log_ms = mono_ms();
+              syslog(LOG_WARNING,
+                     "pair: admit/unbind deferred: adapter not ready\n");
+            }
+        }
 
       /* **已加密对端对账**：链路加密就等于配对完成，立刻补手机记录（否则 UI 的
        * 「配对中 + 倒计时」会一直走到 0 也不显示"已配对"，见 myvendor_bt_pair.c）。 */
       myvendor_pair_peer_poll();
+
+      /* **延迟落盘**：配对过程中对端会先以"本次连接的 RPA"报一次、约 0.7 s 后
+       * 再以身份地址报一次；两次都只更新内存待写值（后到覆盖先到），等池稳定
+       * 后由这里一次性落盘并按"在不在池里"把关 ⇒ 废 RPA 根本不进文件，
+       * 名单也不会出现 3/3 的瞬时峰值（不会误触 FIFO 淘汰）。
+       * 不放在上面 `adapter_is_usable()` 的门里 —— 它只遍历密钥池、不发 HCI。 */
+      myvendor_pair_settle_poll();
+      companion_directed_peer_poll();
+      companion_directed_target_reconcile();
 
       /* **配对窗口过期 + 没记录 ⇒ 停播**：开机的 60 s 窗口过后如果还没绑上，
        * 广播就该收掉（射频让给传感器扫描），等下次开窗再拉起来。 */
@@ -3723,6 +4513,31 @@ int main(int argc, FAR char *argv[])
       companion_bridge_phase_set("adv");
       companion_ensure_advertising();
       now = mono_ms();
+
+      /* 定向广播起来了但手机一直没连：60 s 后回退无定向，避免"看起来在
+       * 广播、实际上手机永远连不上"（尤其是控制器接受了身份地址但没按
+       * RAL 解析 RPA 的情况）。 */
+      if (g_adv_directed && g_adv_active &&
+          myvendor_mono_elapsed_ms(now, g_adv_directed_since_ms) >=
+            DIRECTED_ADV_WINDOW_MS)
+        {
+          syslog(LOG_WARNING,
+                 "ble_companion: directed adv no connection in %u ms; "
+                 "fallback to undirected for %u ms\n",
+                 (unsigned)DIRECTED_ADV_WINDOW_MS,
+                 (unsigned)DIRECTED_ADV_RETRY_MS);
+          g_adv_directed_retry_after_ms = now + DIRECTED_ADV_RETRY_MS;
+          companion_stop_advertising();
+
+          pthread_mutex_lock(&g_ctx.lock);
+          if (!g_ctx.connected && !g_hold_le_adv && !g_policy_adv_off)
+            {
+              g_ctx.adv_restart = true;
+            }
+
+          pthread_mutex_unlock(&g_ctx.lock);
+        }
+
       companion_bridge_phase_set("supervisor");
       companion_supervisor_pump(now);
 #ifdef CONFIG_MYVENDOR_BLE_LOG

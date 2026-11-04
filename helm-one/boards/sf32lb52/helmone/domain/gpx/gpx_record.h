@@ -127,12 +127,13 @@ int gpx_record_stop(gpx_record_t *rec);
  * @param rec  录制器句柄
  * @return 0 成功，负 errno 失败
  */
+/* Returns close error, or -ETIMEDOUT after 10 seconds of waiting. */
 int gpx_record_wait_close(gpx_record_t *rec);
 
 /**
  * @brief 释放录制器：发送 release 命令，join 线程并 free 句柄。
  *
- * 若仍在录制，会先 stop 再退出。调用后 *rec 置 NULL。
+ * 若仍在录制，会先 stop 再退出。成功后 *rec 置 NULL；保存失败保留句柄供 stop 重试。
  *
  * @param rec  句柄指针（可为 NULL）
  * @return 0 成功，负 errno 失败
@@ -154,6 +155,9 @@ bool gpx_record_is_recording(gpx_record_t *rec);
  * @return true 正在落盘关闭
  */
 bool gpx_record_is_closing(gpx_record_t *rec);
+
+/** Last close result; a failure retains queued points/cache for stop retry. */
+int gpx_record_close_error(gpx_record_t *rec);
 
 /**
  * @brief 工作线程是否仍在运行（create 后、release 前）。

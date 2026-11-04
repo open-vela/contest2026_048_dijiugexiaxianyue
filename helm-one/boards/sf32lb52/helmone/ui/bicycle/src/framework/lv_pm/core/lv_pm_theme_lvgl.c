@@ -142,6 +142,9 @@ void lv_pm_theme_lvgl_attach_focus(lv_obj_t * obj)
     lv_obj_add_style(obj, &s_style_focus, LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
 }
 
+/** @brief 待办的"整树样式重算"（见 `lv_pm_theme_lvgl_bind()` 的注释）。 */
+static bool s_style_report_pending;
+
 /**
  * @brief lv_pm theme lvgl bind。
  */
@@ -165,5 +168,27 @@ void lv_pm_theme_lvgl_bind(const lv_pm_theme_def_t * def)
         lv_display_set_theme(disp, s_pm_theme);
     }
 
+    /* ⚠ **整树样式重算不在这里做**（2026-09-27，用户现场"点一下像要点两次"）：
+     * `lv_obj_report_style_change(NULL)` 让 LVGL 把**每个对象**的样式重算一遍，
+     * 这颗 MCU 上（菜单 15 行 + 主界面那一层 + 状态栏）实测 **1.2~1.5 秒**。
+     * 它排在换主题的同步路径里 ⇒ 点一下要 1.7 秒**屏幕上才动**（实测：点完 +1.16s
+     * 才轮到调色板、+1.66s 才轮到菜单重画；同期"地图"那部分因为本来就是"回主界面
+     * 才重建"（helm_shell_theme_apply 的闸门）所以看着总是跟上了 —— 这正是用户
+     * "地图切换过去了、菜单没切换过去"的来源）。
+     * ⇒ 这里只置待办，由 UI 主循环在**循环顶**补跑（安全点同 helm_theme_poll_apply）。
+     * 代价：靠**继承** LVGL 主题的控件（基本都是 lv_pm 自己的栏/壳；我们自己的控件
+     * 全都显式设样式）晚一帧换色 —— 肉眼无感。 */
+    s_style_report_pending = true;
+}
+
+/** @brief 循环顶补跑待办的"整树样式重算"；没有待办时是空操作。
+ *  @note 由 `lv_pm_theme_poll_styles()`（`lv_pm_theme.c`）统一驱动。 */
+void lv_pm_theme_report_styles_now(void)
+{
+    if (!s_style_report_pending) {
+        return;
+    }
+
+    s_style_report_pending = false;
     lv_obj_report_style_change(NULL);
 }

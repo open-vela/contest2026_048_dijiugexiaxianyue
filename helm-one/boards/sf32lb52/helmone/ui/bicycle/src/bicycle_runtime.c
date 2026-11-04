@@ -57,8 +57,19 @@ static char g_sensor_prev[24];
 #define RT_FILT_HOLD_KPH       2.8f
 #define RT_FILT_COURSE_KPH     3.5f
 #define RT_FILT_MAX_KPH        320.0f
+/* 速度路径的门限（rt_trust_speed / rt_disp_note_fix）。 */
 #define RT_FILT_TELEPORT_KPH   280.0f
-#define RT_FILT_MAX_MPS        90.0f
+/** @brief 位置门限：只喂 rt_smooth_fix 里"这个坐标能不能进轨迹"那一判。
+ *
+ *  @details 与上面那条**速度**门限拆开，是用户 2026-10-01 的裁定：
+ *           "轨迹点获取改回 2026-09-15 的样子，时速保持现状"。
+ *           2026-09-15 这两个位置门限就是 160 km/h / 50 m/s；2026-09-16 的
+ *           `818ce499` 把它们和速度门限一起抬到 280 / 90，于是模组那种
+ *           "2 秒 151.85 m（273 km/h）"的坏点从**被拦下**变成**写进 GPX**，
+ *           现场表现就是轨迹沿原航向冲出去、再飘回正确位置。
+ *           ⚠ 改这里只影响轨迹，不动时速显示。 */
+#define RT_FILT_POS_TELEPORT_KPH 160.0f
+#define RT_FILT_MAX_MPS        50.0f
 #define RT_FILT_INVALID_MS     8000u
 #define RT_SPEED_HOLD_INV_MS   2500u
 #define RT_SPEED_DISP_HYST     0.25f
@@ -962,9 +973,11 @@ static float rt_shape_speed(const bicycle_gnss_fix_t * fix, bool valid)
         }
     }
 
-    /* 静止判定压过一切平滑结果：位置没离开半径就别报速度 —— 治"3D 高→低
+    /* 静止判定压过平滑结果：位置没离开半径就别报速度 —— 治"3D 高→低
      * 跳变时车不动也有几 km/h"（那时显示以位移窗为基准，而位移窗被噪声喂饱）。
-     * 离开静止时从 0 起按 slew 爬升，不会有阶跃。 */
+     * 离开静止时从 0 起按 slew 爬升，不会有阶跃。
+     * ⚠ 这条能生效的前提是**静止门自己解得开** —— 见 rt_smooth_fix 钉住分支里的
+     *   `rt_still_gate(dist)`：门锁存后若没人喂它，这里会把时速永远压成 0。 */
     if (rt_still_gate(0.0f, now)) {
         out = 0.0f;
     }
@@ -1051,6 +1064,9 @@ static void rt_smooth_fix(bicycle_gnss_fix_t * fix)
     dist = vmap_geo_haversine_m((double)g_filt.lon, (double)g_filt.lat,
         (double)meas_lon, (double)meas_lat);
     implied_kph = (dt_s > 0.0f) ? (float)(dist / (double)dt_s * 3.6) : 0.0f;
+    /* ⚠ 只喂**速度**判定（下面 dist < 0.8 那条分支里"要不要把时速清零"），
+     * **不参与"钉不钉住坐标"** —— 位置那一侧按 2026-09-15 的算法，
+     * 见再下面那条"钉住坐标"的分支。别把这两个又接回位置判定。 */
     implied_move = (implied_kph >= RT_SOG_MOVE_KPH)
         && (implied_kph <= RT_FILT_TELEPORT_KPH);
     parked = still && !implied_move;
@@ -1079,17 +1095,40 @@ static void rt_smooth_fix(bicycle_gnss_fix_t * fix)
         return;
     }
 
-    /* 真静止或 3D 低飞点：钉住。SOG=0 但位移很快时不要清零，跟位移。 */
-    if (parked || (poor && sog < RT_FILT_POOR_SOG_KPH && !implied_move)) {
+    /* 静止或 3D 低且 SOG 近静止：**钉住坐标** —— 位置这一侧完全按 2026-09-15
+     * 的算法（`still || (poor && sog < 8)`，不带 `!implied_move`）。
+     * 下面那句 `g_filt.speed < RT_SOG_MOVE_KPH` 才是 09-16 加的，只用于
+     * "位移窗还在动时不要把时速清零"，属速度侧，按用户要求保留。 */
+    if (still || (poor && sog < RT_FILT_POOR_SOG_KPH)) {
         rt_publish_held(fix, now, dist < RT_FILT_HOLD_MAX_M);
+
+        /* ★ 别让这个分支变成静止门的牢笼（2026-10-01 修"汽车急加速时速归 0"）。
+         *
+         * 本分支是**唯一**会命中后提前返回、不喂 `rt_still_gate(step)` 的路径。
+         * 汽车急加速时模组多普勒跟不上、SOG 还压在低位 ⇒ 本分支连续命中 ⇒
+         * `g_still` 锁存后再没人喂它，**永远解不开**。而锁存会同时掐死两处：
+         *   · `rt_shape_speed()` 末尾 `if (rt_still_gate(0)) out = 0` ⇒ 时速钉死 0；
+         *   · `rt_disp_note_fix()` 里那句 `|| rt_still_gate(0)` ⇒ **位移窗也停止累计**
+         *     ⇒ `path` 恒为 0，连"SOG 塌了就改跟位移"那条补救都拿不到数。
+         * 这就是"位置在以 40~126 km/h 走、时速却连续 6 个点是 0"的成因
+         * （TRK_20260930_074235.gpx 43:13~43:25）。
+         *
+         * 判据用**自钉住点的累计位移** `dist`，且只在已超过 `RT_STILL_EXIT_M`
+         * （"真的走了"的迟滞阈值）时才喂：真停车时位置噪声累加不到 8 m，
+         * "停稳就报 0"照旧生效。 */
+        if (dist >= RT_STILL_EXIT_M) {
+            rt_still_gate((float)dist, now);
+        }
+
         if (g_filt.speed < RT_SOG_MOVE_KPH) {
             rt_speed_hold_zero(fix);
         }
         return;
     }
 
-    /* 单点超传送门限：丢弃坐标。3D 高时保留 SOG，别用空位移窗写成 0。 */
-    if (implied_kph > RT_FILT_TELEPORT_KPH) {
+    /* 单点超**位置**门限：丢弃坐标。3D 高时保留 SOG，别用空位移窗写成 0。
+     * 用 160 而不是速度那条 280 —— 这条判的是"进不进轨迹"。 */
+    if (implied_kph > RT_FILT_POS_TELEPORT_KPH) {
         if ((now - g_filt.last_ms) >= RT_FILT_INVALID_MS) {
             g_filt.lat = meas_lat;
             g_filt.lon = meas_lon;
@@ -1506,6 +1545,13 @@ void bicycle_runtime_seed_session(double dist_m, uint64_t elapsed_ms)
  */
 void bicycle_runtime_set_recording(bool recording)
 {
+    if (!recording && g_rt.recording) {
+        /* 骑行结束（含暂停）：先把最后没骑满一段的净高度变化结掉，
+         * 再停录 —— 见 bicycle_env_flush_gain()。放在清 recording 之前，
+         * 这笔账才过得了 add_dalt 里的录制判据。 */
+        bicycle_env_flush_gain();
+    }
+
     g_rt.recording = recording;
     if (!recording) {
         g_last_tick_ms = 0;
@@ -1628,6 +1674,25 @@ void bicycle_runtime_update_gnss(const bicycle_gnss_fix_t * fix)
     bicycle_runtime_ui_sync();
 }
 
+/**
+ * @brief 计入一段净高度变化（正=爬升、负=下降）。
+ *
+ * 与 update_env 同一口径：只在录制中累计。env 的段结账与骑行结束的
+ * `bicycle_env_flush_gain()` 都走这里。
+ */
+void bicycle_runtime_add_dalt(float dalt_m)
+{
+    if (!g_rt.recording) {
+        return;
+    }
+
+    if (dalt_m > 0.0f) {
+        g_rt.gain_m += dalt_m;
+    } else if (dalt_m < 0.0f) {
+        g_rt.loss_m += -dalt_m;
+    }
+}
+
 void bicycle_runtime_update_env(float altitude_m, bool has_altitude,
     float grade_pct, float dalt_m)
 {
@@ -1638,10 +1703,24 @@ void bicycle_runtime_update_env(float altitude_m, bool has_altitude,
 
     g_rt.grade_pct = grade_pct;
     if (g_rt.recording) {
-        if (dalt_m > 0.0f) {
-            g_rt.gain_m += dalt_m;
-        } else if (dalt_m < 0.0f) {
-            g_rt.loss_m += -dalt_m;
+        bicycle_runtime_add_dalt(dalt_m);
+
+        /* 海拔极值：和 gain/loss 同一个数据源、同一个"只在记录中统计"口径
+         * （数据页/海拔页的"最高/最低"用它；没记录过就 alt_range_valid=false，
+         * 界面显示 "--" 而不是 0 —— 0 m 是合法海拔，不能当"没数据"）。 */
+        if (has_altitude) {
+            if (!g_rt.alt_range_valid) {
+                g_rt.alt_range_valid = true;
+                g_rt.altitude_max_m = altitude_m;
+                g_rt.altitude_min_m = altitude_m;
+            } else {
+                if (altitude_m > g_rt.altitude_max_m) {
+                    g_rt.altitude_max_m = altitude_m;
+                }
+                if (altitude_m < g_rt.altitude_min_m) {
+                    g_rt.altitude_min_m = altitude_m;
+                }
+            }
         }
     }
 

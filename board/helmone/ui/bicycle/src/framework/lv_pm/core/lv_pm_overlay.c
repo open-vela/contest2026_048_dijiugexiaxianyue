@@ -8,6 +8,7 @@
 #include "../include/lv_pm_disp.h"
 
 #include "helm_font.h"
+#include "helm_icon.h"   /* 内置图标：系统通知的左侧图标，与 App 通知的 PNG 同一个槽 */
 
 #include <unistd.h>
 
@@ -336,10 +337,15 @@ void lv_pm_overlay_init(lv_obj_t * parent)
 
     s_notify.title = lv_label_create(s_notify.text_col);
     lv_label_set_text(s_notify.title, "");
+    /* ⚠ 宽度必须撑满文字列：标签默认"跟内容一样宽"，那时 text_align=CENTER 等于没效果
+     * （用户 2026-09-27 实测：文字贴在图标右边、右侧一片空）。撑满后 *_show_ex() 里的
+     * 对齐（App 通知左对齐 / 系统通知居中）才真正生效。 */
+    lv_obj_set_width(s_notify.title, LV_PCT(100));
     overlay_style_label_fixed(s_notify.title, overlay_font());
 
     s_notify.body = lv_label_create(s_notify.text_col);
     lv_label_set_text(s_notify.body, "");
+    lv_obj_set_width(s_notify.body, LV_PCT(100));
     overlay_style_label_fixed(s_notify.body, overlay_font());
 
     s_notify.timer = lv_timer_create(notify_timer_cb, LV_PM_NOTIFY_DEFAULT_MS, NULL);
@@ -347,17 +353,86 @@ void lv_pm_overlay_init(lv_obj_t * parent)
 
     s_bottom.card = lv_obj_create(parent);
     overlay_style_bottom_card(s_bottom.card);
-    lv_obj_align(s_bottom.card, LV_ALIGN_CENTER, 0, LV_PM_BOTTOM_Y_OFS);
-    lv_obj_add_flag(s_bottom.card, LV_OBJ_FLAG_HIDDEN);
 
     s_bottom.label = lv_label_create(s_bottom.card);
     lv_label_set_text(s_bottom.label, "");
     overlay_style_label_fit(s_bottom.label, overlay_font());
 
+    /* 先把 label 建出来再定宽对齐（空卡片先对齐 = 拿 padding 宽落位，见 show 的注释）。 */
+    lv_obj_update_layout(s_bottom.card);
+    lv_obj_align(s_bottom.card, LV_ALIGN_CENTER, 0, LV_PM_BOTTOM_Y_OFS);
+    lv_obj_add_flag(s_bottom.card, LV_OBJ_FLAG_HIDDEN);
+
     s_bottom.timer = lv_timer_create(bottom_timer_cb, LV_PM_BOTTOM_DEFAULT_MS, NULL);
     lv_timer_pause(s_bottom.timer);
 
     overlay_raise_status_chrome();
+}
+
+/** @brief 本次通知要画的内置图标（0 = 无）+ 它建出来的对象（每次 show 重建）。 */
+static int s_notify_ico;
+static lv_obj_t * s_notify_ico_obj;
+
+/**
+ * @brief 按标题猜一个内置图标 —— 兜底用，见 `_ex` 里的说明。
+ *
+ * @details 全树有 20+ 个 `lv_pm_notify_show()` 调用点（菜单里的蓝牙/清除/删除/骑行…），
+ *          一个个补图标参数既啰嗦又容易漏；所以**在通知层按标题关键词兜底**，新加的通知
+ *          自动就有图标。要求精确时仍可用 `lv_pm_notify_show_icon()` 显式指定（优先级更高）。
+ * @param title 通知标题（可为 NULL）。
+ * @return `helm_ico_id_t` 取值；认不出来时给 `HELM_ICO_BELL`。
+ */
+static int notify_ico_for_title(const char * title)
+{
+    if (title == NULL) {
+        return HELM_ICO_NONE;
+    }
+    if (strstr(title, "蓝牙") != NULL) {
+        return HELM_ICO_BLE;
+    }
+    if (strstr(title, "亮度") != NULL) {
+        return HELM_ICO_SUN;
+    }
+    if (strstr(title, "电量") != NULL || strstr(title, "充电") != NULL) {
+        return HELM_ICO_BATT;
+    }
+    if (strstr(title, "导航") != NULL || strstr(title, "返航") != NULL) {
+        return HELM_ICO_NAV;
+    }
+    if (strstr(title, "骑行") != NULL || strstr(title, "回放") != NULL) {
+        return HELM_ICO_GPX;
+    }
+    if (strstr(title, "删除") != NULL || strstr(title, "清除") != NULL) {
+        return HELM_ICO_XMARK;
+    }
+    if (strstr(title, "保存") != NULL || strstr(title, "记录") != NULL) {
+        return HELM_ICO_SAVE;
+    }
+    if (strstr(title, "USB") != NULL) {
+        return HELM_ICO_USB;
+    }
+    if (strstr(title, "手机") != NULL || strstr(title, "App") != NULL) {
+        return HELM_ICO_CALL;
+    }
+    if (strstr(title, "固件") != NULL) {
+        return HELM_ICO_CHIP;
+    }
+
+    return HELM_ICO_BELL;   /* 认不出来也给一个：有图标比没图标好 */
+}
+
+/**
+ * @brief 同 lv_pm_notify_show，但左侧画一个**内置图标**（系统通知用）。
+ *
+ * @note 只设 `s_notify_ico`，真正的对象在 `lv_pm_notify_show_ex()` 里建（与 PNG 图标
+ *       互斥、PNG 优先）；那边用完即把 `s_notify_ico` 清 0，所以**不会**被下一次
+ *       普通 `lv_pm_notify_show()` 继承。
+ */
+bool lv_pm_notify_show_icon(const char * title, const char * text, int ico,
+                            uint32_t duration_ms)
+{
+    s_notify_ico = ico;
+    return lv_pm_notify_show_ex(title, text, NULL, duration_ms);
 }
 
 /**
@@ -375,6 +450,7 @@ bool lv_pm_notify_show_ex(const char * title, const char * text,
                           const char * icon_path, uint32_t duration_ms)
 {
     bool have_icon = false;
+    bool icon_builtin = false;   /* 内置图标（系统通知）与 App 的 PNG 图标对齐策略不同 */
 
     if (s_notify.card == NULL || text == NULL) {
         return false;
@@ -392,13 +468,38 @@ bool lv_pm_notify_show_ex(const char * title, const char * text,
         lv_obj_add_flag(s_notify.icon, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (s_notify.title != NULL) {
-        lv_obj_set_style_text_align(s_notify.title,
-            have_icon ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER, 0);
+    /* 内置图标（系统通知）：PNG 优先；没显式指定就按标题兜底（覆盖全树 20+ 个调用点） */
+    if (s_notify_ico == 0) {
+        s_notify_ico = notify_ico_for_title(title);
     }
-    if (s_notify.body != NULL) {
-        lv_obj_set_style_text_align(s_notify.body,
-            have_icon ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER, 0);
+    if (s_notify_ico_obj != NULL) {
+        lv_obj_del(s_notify_ico_obj);
+        s_notify_ico_obj = NULL;
+    }
+    if (!have_icon && s_notify_ico > 0 && s_notify.card != NULL) {
+        s_notify_ico_obj = helm_icon_create(s_notify.card, (helm_ico_id_t)s_notify_ico,
+                                            LV_PM_NOTIFY_ICON_PX);
+        if (s_notify_ico_obj != NULL) {
+            /* ⚠ 内置图标**脱离布局**（FLOATING）自己贴左：这样文字列能占满整条横幅，
+             * "居中"才是相对**整条通知**居中（用户 2026-09-27 明确要求）——若让图标留在
+             * 布局里，文字只能在图标右边那块区域里居中，看着偏左。 */
+            lv_obj_add_flag(s_notify_ico_obj, LV_OBJ_FLAG_FLOATING);
+            lv_obj_align(s_notify_ico_obj, LV_ALIGN_LEFT_MID, 10, 0);
+            have_icon = true;
+            icon_builtin = true;
+        }
+    }
+    s_notify_ico = 0;   /* 用完即清：普通 show() 不该继承上次的内置图标 */
+
+    /*
+     * ⚠ 内置图标是 FLOATING（不占布局）⇒ 长文字居中时会钻到图标底下（用户 2026-09-27
+     * 追问的正是这个）。这里给文字列加**对称**内边距，宽度 = 图标那一条（左 10 间距 +
+     * 32 图标 + 8 余量）：既保证文字永不压到图标，又因为左右相等 ⇒ 居中依然是相对
+     * **整条横幅**居中（不对称的话就会变成"图标右侧那块居中"，正是上一版被否掉的）。
+     */
+    if (s_notify.text_col != NULL) {
+        lv_obj_set_style_pad_hor(s_notify.text_col,
+            icon_builtin ? (10 + LV_PM_NOTIFY_ICON_PX + 8) : 0, 0);
     }
 
     if (title != NULL && title[0] != '\0') {
@@ -410,11 +511,39 @@ bool lv_pm_notify_show_ex(const char * title, const char * text,
     }
 
     lv_label_set_text(s_notify.body, text);
+
+    /*
+     * 对齐（用户 2026-09-27）：**App 通知（手机下发的 PNG 图标）保持左对齐**（手机那边
+     * 就是这么排的）；**系统通知的内置图标则让文字居中** —— 左边一个图标配左对齐文字
+     * 看着突兀。没有图标时本来就居中。
+     * ⚠ 必须放在 lv_label_set_text() 之后：先设对齐再换文本时，标签可能带着旧宽度/旧
+     * 对齐先排一次，首帧看着偏左（用户 2026-10-18 报"有概率暂时偏左"）。设完文本再对齐
+     * 并重排，首帧即按新文本排好。
+     */
+    {
+        const lv_text_align_t al = (have_icon && !icon_builtin)
+                                   ? LV_TEXT_ALIGN_LEFT : LV_TEXT_ALIGN_CENTER;
+
+        if (s_notify.title != NULL) {
+            lv_obj_set_style_text_align(s_notify.title, al, 0);
+        }
+        if (s_notify.body != NULL) {
+            lv_obj_set_style_text_align(s_notify.body, al, 0);
+        }
+    }
+
+    if (s_notify.text_col != NULL) {
+        lv_obj_update_layout(s_notify.text_col);
+    }
     lv_obj_update_layout(s_notify.card);
     overlay_notify_layout_card();
 
     notify_stop_timer();
     lv_obj_clear_flag(s_notify.card, LV_OBJ_FLAG_HIDDEN);
+    /* ⚠ hidden 期间布局可能被延迟/清掉，通知卡会带着旧坐标进入滑入动画；这里在可见后
+     * 再对齐一次（内部 translate_x=0 → update_layout → align TOP_MID），保证滑入动画
+     * 第一帧 x 就是正确的（用户 2026-10-18 报"有概率暂时偏左"）。 */
+    overlay_notify_layout_card();
     overlay_bring_top(s_notify.card);
     overlay_raise_status_chrome();
 
@@ -455,6 +584,12 @@ bool lv_pm_notify_is_showing(void)
 
 /**
  * @brief lv_pm bottom show。
+ *
+ * @note **顺序不能反**（用户 2026-11-03 现场："上来的通知明显靠左"）：卡片是
+ *       `LV_SIZE_CONTENT`，横幅第一次出现时还处于 hidden。先 `lv_obj_align()`
+ *       再 unhide 的话，对齐用的是**旧宽度（空文案 = 只有 padding）**，等文案撑开
+ *       卡片就变成"按旧左边缘往右长"⇒ 首帧整体偏。正确顺序：
+ *       先 unhide → 算内容尺寸 → 再居中 → 再落一次位。
  */
 bool lv_pm_bottom_show(const char * text, uint32_t duration_ms)
 {
@@ -464,14 +599,18 @@ bool lv_pm_bottom_show(const char * text, uint32_t duration_ms)
 
     overlay_apply_chrome();
     lv_label_set_text(s_bottom.label, text);
-    lv_obj_update_layout(s_bottom.card);
-    lv_obj_align(s_bottom.card, LV_ALIGN_CENTER, 0, LV_PM_BOTTOM_Y_OFS);
 
     bottom_stop_timer();
     lv_anim_delete(s_bottom.card, overlay_anim_y);
     lv_obj_set_style_translate_y(s_bottom.card, 0, 0);
     lv_obj_set_style_opa(s_bottom.card, LV_OPA_COVER, 0);
     lv_obj_clear_flag(s_bottom.card, LV_OBJ_FLAG_HIDDEN);
+
+    /* 可见后再算尺寸、再居中；align 只是写样式，宽度定下来后再 update 一次把位置落下去。 */
+    lv_obj_update_layout(s_bottom.card);
+    lv_obj_align(s_bottom.card, LV_ALIGN_CENTER, 0, LV_PM_BOTTOM_Y_OFS);
+    lv_obj_update_layout(s_bottom.card);
+
     overlay_bring_top(s_bottom.card);
     s_bottom.showing = true;
 

@@ -111,6 +111,69 @@ void bicycle_route_sim_set_speed(float speed_kph);
 /** @brief 路线 sim 与 GPX 回放同时存在时，优先使用路线 sim 定位。 */
 bool bicycle_gpx_sim_get_fix(bicycle_gnss_fix_t * out);
 
+/**
+ * @brief 冻结/恢复 GPX 回放（定位停住、速度报 0）。
+ *
+ * @details 演示「暂停骑行」用：真实按键只暂停录制，板载 GNSS 仍在跑；回放如果继续
+ *          前进，屏上速度/里程会一直变，看不出"停下"的样子。冻结后回放线程原地
+ *          待命，重新放开时从**同一个位置**继续（不回到起点）。
+ *          只作用于 GPX 回放；路线 sim / 全国跳不受影响。
+ */
+void bicycle_gpx_sim_set_hold(bool on);
+/** @brief 当前是否冻结（未在回放时恒 false）。 */
+bool bicycle_gpx_sim_hold(void);
+
+/**
+ * @brief 往返循环开关（长测用）。
+ *
+ * @details 打开后，回放到**端点**时不再停住（默认行为）而是**掉头**继续骑 —— 长测里
+ *          让它一直有定位更新 ⇒ 地图一直有平移/重绘负载。掉头（而不是跳回起点）是为了
+ *          避免一次上千公里的瞬移把瓦片整批打掉、造成周期性尖峰。
+ *          NSH：`bicycle_nsh gnss sim <gpx> ... loop`（不带 loop 就回到默认的一次性回放）。
+ *
+ * @note 掉头时日志会打 `gpx_sim: loop turn -> fwd/rev at idx=i/n`：长测里"它在循环"的
+ *       唯一证据，一次往返一行。
+ */
+void bicycle_gpx_sim_set_loop(bool on);
+/** @brief 往返循环是否已打开。 */
+bool bicycle_gpx_sim_loop_enabled(void);
+
+/** @brief 跳点表的一行（`bicycle_gnss_hop_set_pts()` 用；字段顺序与内置表一致）。 */
+typedef struct {
+    const char * name;
+    float lat;
+    float lon;
+} bicycle_gnss_hop_pt_t;
+
+/**
+ * @brief 全国跳（调试用合成定位）。
+ *
+ * @details 每 period_ms 在固定的城市序列里换一个点（经度/纬度都是上千公里的大跳），
+ * 用来**可重复地**逼出"瓦片整批作废 + 重载 + 全屏重绘"这条路径 —— 小幅平移常常
+ * 一个新瓦片都不需要，`[vperf] frame` 因此不出帧。用于渲染性能 A/B（WT vs WB）。
+ *
+ * @param period_ms 换点周期（下限 200 ms）。
+ * @param count     总次数；0 = 不限次（用 bicycle_gnss_hop_stop() 停）。
+ */
+void bicycle_gnss_hop_start(unsigned period_ms, unsigned count);
+
+/**
+ * @brief 换一组跳点（演示模式用来跳太湖/青海湖这类风景点）。
+ * @param pts 点表；**调用方持有**，跳点期间必须一直有效（演示里是静态表）。
+ * @param n   点数；传 NULL 或 0 回到内置城市序列。
+ * @note 只对**接下来这一次**跳点有效：跳点停掉（手动或跳够 count 自动停）就失效
+ *       ⇒ `bicycle_nsh gnss hop` 的城市序列口径不变。
+ */
+void bicycle_gnss_hop_set_pts(const bicycle_gnss_hop_pt_t * pts, uint32_t n);
+/** @brief 停止全国跳；随后回到真实 GNSS。 */
+void bicycle_gnss_hop_stop(void);
+/** @brief 是否在跳。 */
+bool bicycle_gnss_hop_active(void);
+/** @brief 当前所在城市名（未跳时为 "-"）；仅日志用。 */
+const char * bicycle_gnss_hop_cur_name(void);
+/** @brief 取当前跳到的定位（在 bicycle_gpx_sim_get_fix() 里最优先）。 */
+bool bicycle_gnss_hop_get_fix(bicycle_gnss_fix_t * out);
+
 /** @brief GPX 点上的墙钟（回放轨迹时间）。无则 false. */
 bool bicycle_gpx_sim_get_wall_hms(int * hour, int * min);
 

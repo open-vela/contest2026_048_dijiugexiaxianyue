@@ -163,7 +163,6 @@ static bool g_cycle_pending;
 static bool g_recovering;
 static bool g_retry_cycle;
 static bool g_escalation_req;
-static bool g_heavy_req;
 
 static bool deadline_reached(uint32_t now_ms, uint32_t deadline_ms)
 {
@@ -440,6 +439,13 @@ bool ble_supervisor_take_escalation(void)
   return req;
 }
 
+void ble_supervisor_defer_escalation(void)
+{
+  pthread_mutex_lock(&g_lock);
+  g_escalation_req = true;
+  pthread_mutex_unlock(&g_lock);
+}
+
 void ble_supervisor_escalation_done(uint32_t now_ms)
 {
   pthread_mutex_lock(&g_lock);
@@ -455,7 +461,7 @@ bool ble_supervisor_cycle_requested(void)
   bool pending;
 
   pthread_mutex_lock(&g_lock);
-  pending = g_cycle_pending && !g_recovering;
+  pending = (g_cycle_pending || g_escalation_req) && !g_recovering;
   pthread_mutex_unlock(&g_lock);
   return pending;
 }
@@ -465,7 +471,7 @@ enum ble_supervisor_fault ble_supervisor_pending_reason(void)
   enum ble_supervisor_fault reason;
 
   pthread_mutex_lock(&g_lock);
-  reason = g_cycle_reason;
+  reason = g_escalation_req ? BLE_SUPERVISOR_FAULT_ADAPTER : g_cycle_reason;
   pthread_mutex_unlock(&g_lock);
   return reason;
 }
@@ -476,7 +482,7 @@ bool ble_supervisor_take_adapter_cycle(enum ble_supervisor_fault *reason)
 
   pthread_mutex_lock(&g_lock);
 
-  if (g_cycle_pending && !g_recovering)
+  if (g_cycle_pending && !g_recovering && !g_escalation_req)
     {
       if (reason != NULL)
         {
@@ -555,9 +561,18 @@ void ble_supervisor_cycle_complete(bool success, uint32_t now_ms)
        * 复位本身有 5 分钟限频兜着，不会变成新循环。 */
       fatal = (g_cycle_failures >= 1);
 
-      /* 连续两次救不回来 ⇒ 换级：cycle 那一档已经证明无效，别再 60 s 一轮地
-       * 空转（现场 23 次）。置请求，让 companion 线程去复位控制器；同时把
-       * 普通重试停掉，避免复位和 cycle 抢同一根绳。 */
+      /* **第一次** cycle 失败就换级**是故意的**（`fatal = failures >= 1`），
+       * 理由见上面 1->2 那条：cycle 这一档已经证明 enable 回不来，再等 60 s
+       * 冷却试第二遍只是空转（现场 23 次）。复位本身有 5 分钟限频兜着，
+       * 不会变成新循环。
+       *
+       * 2026-09-23 更正这里的注释：原来写的是"连续两次救不回来 ⇒ 换级"，
+       * 与代码（`>= 1`）和上面那条注释都矛盾，审计时按"代码与注释不一致"
+       * 记了一笔。核对后确认**行为是对的、错的是这段注释** —— 保持 `>= 1`
+       * 不动，只把说法改对，免得下一个人照着它去改成 `>= 2`。
+       *
+       * 置请求，让 companion 线程去复位控制器；同时把普通重试停掉，
+       * 避免复位和 cycle 抢同一根绳。 */
       if (fatal)
         {
           struct sup_evt *e2;

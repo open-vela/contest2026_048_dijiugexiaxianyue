@@ -75,7 +75,7 @@ static void bicycle_handler_stat_emit(const struct timespec * now_ts)
         (uint32_t)(s_usleep_min_ns / 1000u);
     uint32_t usleep_max_us = (uint32_t)(s_usleep_max_ns / 1000u);
 
-    LV_LOG_USER(
+    LV_LOG_INFO(
         "[handler] t=%llu.%06llu win=%u.%03us calls=%u loop=%uHz "
         "handler=%u.%03ums share=%u.%u%% max=%uus "
         "sleep_req=%llums sleep_act=%ums avg=%uus min=%uus max=%uus",

@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 16 px
  * Bpp: 4
- * Opts: --font /home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/fonts/fa-solid-900.ttf --size 16 --bpp 4 --format lvgl --no-compress --no-kerning --lv-include lvgl/lvgl.h --lv-font-name helm_fa_16 -o /home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/fonts/helm_fa_16.c -r 0xF00C,0xF00D,0xF017,0xF04C,0xF201,0xF4D7,0xF6FC
+ * Opts: --font /home/jinsc/SDK/vela/openvela/vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/fonts/fa-solid-900.ttf --size 16 --bpp 4 --format lvgl --no-compress --no-kerning --lv-include lvgl/lvgl.h --lv-font-name helm_fa_16 -o /home/jinsc/SDK/vela/openvela/vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/src/lvgl_page/fonts/helm_fa_16.c -r 0xF00C,0xF00D,0xF017,0xF04C,0xF201,0xF4D7,0xF6FC
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

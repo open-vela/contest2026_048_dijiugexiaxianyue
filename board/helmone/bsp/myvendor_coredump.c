@@ -44,6 +44,9 @@
 #include <sched.h>
 
 #include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <nuttx/clock.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -52,10 +55,11 @@
 #include <string.h>
 #include <syslog.h>
 #include <time.h>
+#include <unistd.h>
 #include <sys/stat.h>
 
 #ifndef CONFIG_MYVENDOR_COREDUMP_KEEP
-#  define CONFIG_MYVENDOR_COREDUMP_KEEP 20
+#  define CONFIG_MYVENDOR_COREDUMP_KEEP 10
 #endif
 
 #define COREDUMP_SEQ_PATH   "/coredump/seq"
@@ -438,6 +442,131 @@ static void note_one_task(FAR struct tcb_s *tcb, FAR void *arg)
     }
 }
 
+struct note_find_s
+{
+  FAR const char   *name;
+  FAR struct tcb_s *tcb;
+};
+
+static void note_find_task(FAR struct tcb_s *tcb, FAR void *arg)
+{
+  FAR struct note_find_s *f = (FAR struct note_find_s *)arg;
+
+  if (f->tcb != NULL || tcb == NULL)
+    {
+      return;
+    }
+
+  if (strcmp(get_task_name(tcb), f->name) == 0)
+    {
+      f->tcb = tcb;
+    }
+}
+
+/**
+ * @brief 把指定任务栈顶 48 个字（192 B）写进 note。
+ *
+ * 为什么需要：WDT 停喂的现场只留下 `wait=0x… wd=0`（无超时 sem_wait）和
+ * `nxsem_wait_slow` 里的 pc/lr —— **上层调用者在栈上**。没有这段栈切片，
+ * 就只能知道"卡在某把锁"，不能知道"从哪一行开始等"。
+ *
+ * 放在任务表之前：note 容量只有 16 KB，任务表会把尾部截掉（现场那份就截在
+ * pid=21）。栈切片按 sp 往上取，覆盖 setjmp 保存区与上层返回地址。
+ */
+static void note_stack_slice(size_t *off, FAR const char *name)
+{
+  struct note_find_s f;
+  uintptr_t lo;
+  uintptr_t hi;
+  uintptr_t sp;
+  size_t size;
+  int i;
+
+  /* 任务表用完之后 tcb 的引用就释放了：把"查表 + 取栈 + 读内存"整段放进
+   * sched_lock 里，避免任务在这一小段窗口里退出/被重建（本板单核，代价极小）。 */
+  sched_lock();
+
+  f.name = name;
+  f.tcb  = NULL;
+  nxsched_foreach(note_find_task, &f);
+
+  if (f.tcb == NULL)
+    {
+      sched_unlock();
+      note_append(off, "stack[%s] no-tcb\n", name);
+      return;
+    }
+
+  /* 本 port 的可用栈区间 = [stack_base_ptr, stack_base_ptr + adj_stack_size)：
+   * arm_createstack.c:161 把 stack_base_ptr 直接设为 stack_alloc_ptr（**下界**），
+   * adj_stack_size 是向下对齐后的实际大小。曾经把 stack_base_ptr 当上界用，
+   * 会把正常栈判成 BAD、让这段取证整体失效（Codex 审查 P1）。 */
+  lo   = (uintptr_t)f.tcb->stack_base_ptr;
+  size = f.tcb->adj_stack_size;
+  hi   = lo + (uintptr_t)size;
+
+  /* ① 先验证区间本身，再碰任何指针：非零 / 不回绕。 */
+  if (lo == 0 || size == 0 || hi <= lo)
+    {
+      sched_unlock();
+      note_append(off, "stack[%s] range lo=%08lx size=%lu BAD\n",
+                  name, (unsigned long)lo, (unsigned long)size);
+      return;
+    }
+
+  /* ② 再验证寄存器保存区是否**可读**：必须 4 字节对齐，且落在本任务栈或 TCB
+   *    本体之内 —— 只有这两块是确定属于该任务的内存。其它地址一律不读，
+   *    否则坏上下文/栈溢出时会在后面的 BAD 检查之前就先异常（Codex 审查 P2）。 */
+  {
+    uintptr_t rp   = (uintptr_t)f.tcb->xcp.regs;
+    uintptr_t tp   = (uintptr_t)f.tcb;
+    uintptr_t need = ((uintptr_t)REG_SP + 1u) * sizeof(uint32_t);
+    bool in_stack  = (rp != 0 && (rp & 3u) == 0 &&
+                      rp >= lo && rp <= hi && (hi - rp) >= need);
+    bool in_tcb    = (rp != 0 && (rp & 3u) == 0 &&
+                      rp >= tp && (rp - tp) <= sizeof(struct tcb_s) &&
+                      ((uintptr_t)sizeof(struct tcb_s) - (rp - tp)) >= need);
+
+    if (!in_stack && !in_tcb)
+      {
+        sched_unlock();
+        note_append(off, "stack[%s] regs=%08lx lo=%08lx size=%lu BAD\n",
+                    name, (unsigned long)rp, (unsigned long)lo,
+                    (unsigned long)size);
+        return;
+      }
+  }
+
+  sp = (uintptr_t)f.tcb->xcp.regs[REG_SP];
+
+  /* ③ SP 必须是区间内的 4 字节对齐地址，且剩余长度够 48 字。 */
+  if (sp < lo || (sp & 3u) != 0 ||
+      sp > hi || (hi - sp) < (uintptr_t)(48 * 4))
+    {
+      sched_unlock();
+      note_append(off, "stack[%s] sp=%08lx lo=%08lx size=%lu BAD\n",
+                  name, (unsigned long)sp, (unsigned long)lo,
+                  (unsigned long)size);
+      return;
+    }
+
+  note_append(off, "stack[%s] sp=%08lx lo=%08lx hi=%08lx\n",
+              name, (unsigned long)sp, (unsigned long)lo, (unsigned long)hi);
+
+  for (i = 0; i + 8 <= 48; i += 8)
+    {
+      FAR const uint32_t *p = (FAR const uint32_t *)(sp + (uintptr_t)(i * 4));
+
+      note_append(off, " %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n",
+                  (unsigned long)p[0], (unsigned long)p[1],
+                  (unsigned long)p[2], (unsigned long)p[3],
+                  (unsigned long)p[4], (unsigned long)p[5],
+                  (unsigned long)p[6], (unsigned long)p[7]);
+    }
+
+  sched_unlock();
+}
+
 static void note_board_snap(size_t *off)
 {
   /* 崩溃路径：快照结构体几百字节，不能放栈上。 */
@@ -460,10 +589,11 @@ static void note_board_snap(size_t *off)
   note_append(off, "schedmon copy_ok=%d\n", ok ? 1 : 0);
   note_append(off,
               "schedmon tasks=%u lockmax=%d waitsem=%u semnull=%u "
-              "mutexbad=%u gen=%u\n",
+              "mutexbad=%u readyorphan=%u gen=%u\n",
               (unsigned)s->ntask, (int)s->lockmax,
               (unsigned)s->n_wait_sem, (unsigned)s->null_n,
-              (unsigned)s->mutex_bad_n, (unsigned)s->gen);
+              (unsigned)s->mutex_bad_n, (unsigned)s->ready_orphan_n,
+              (unsigned)s->gen);
 
   if (s->null_n != 0)
     {
@@ -480,6 +610,18 @@ static void note_board_snap(size_t *off)
                   (int)e->run_lock);
     }
 
+  if (s->ready_orphan_n != 0)
+    {
+      e = &s->last_ready_orphan;
+      note_append(off,
+                  "readyorphan n=%u "
+                  "head pid=%d %s st=%u pri=%d "
+                  "idle pid=%d %s st=%u\n",
+                  (unsigned)e->seq,
+                  (int)e->wt_pid, e->wt_name, (unsigned)e->wt_state,
+                  (int)e->wt_pri,
+                  (int)e->run_pid, e->run_name, (unsigned)e->run_state);
+    }
   if (s->mutex_bad_n != 0)
     {
       const struct myvendor_schedmon_mutex_s *m = &s->last_mutex;
@@ -814,34 +956,29 @@ static bool crash_is_note_name(const char *name)
   return len >= 8 && memcmp(name + len - 4, ".txt", 4) == 0;
 }
 
-/** @brief 日历戳 YYYYMMDDHHMMSS；旧名 nNNN.txt 视为 0（更老）。 */
-static uint64_t crash_note_stamp(const char *name)
+/** @brief 从 nNNN… 取槽号（0..999）。日历戳可能异常，裁剪只看编号。 */
+static bool crash_note_seq(const char *name, unsigned *seq_out)
 {
   unsigned slot = 0;
-  int y = 0;
-  int mo = 0;
-  int d = 0;
-  int h = 0;
-  int mi = 0;
-  int s = 0;
 
-  if (sscanf(name, "n%u_%4d%2d%2d_%2d%2d%2d.txt",
-             &slot, &y, &mo, &d, &h, &mi, &s) == 7)
+  if (name == NULL || name[0] != 'n' || seq_out == NULL)
     {
-      return (uint64_t)y * 10000000000ull +
-             (uint64_t)mo * 100000000ull +
-             (uint64_t)d * 1000000ull +
-             (uint64_t)h * 10000ull +
-             (uint64_t)mi * 100ull +
-             (uint64_t)s;
+      return false;
     }
 
-  if (sscanf(name, "n%u.txt", &slot) == 1)
+  if (sscanf(name, "n%u", &slot) != 1)
     {
-      return 0;
+      return false;
     }
 
-  return UINT64_MAX;
+  *seq_out = slot % 1000u;
+  return true;
+}
+
+/** @brief 相对最新槽的年龄：0=最新，越大越旧（模 1000）。 */
+static unsigned crash_seq_age(unsigned newest, unsigned seq)
+{
+  return (newest + 1000u - (seq % 1000u)) % 1000u;
 }
 
 static void crash_prune_old(unsigned keep, const char *keep_name)
@@ -851,14 +988,25 @@ static void crash_prune_old(unsigned keep, const char *keep_name)
   lfs_dir_t dir;
   struct lfs_info info;
   unsigned count;
-  uint64_t oldest_stamp;
-  uint64_t stamp;
+  unsigned newest = 0;
+  unsigned oldest_age;
+  unsigned seq;
+  unsigned age;
+
+  if (keep_name != NULL && crash_note_seq(keep_name, &newest))
+    {
+      /* keep_name 即刚写入的最新槽。 */
+    }
+  else
+    {
+      newest = 0;
+    }
 
   for (;;)
     {
       count = 0;
       oldest[0] = '\0';
-      oldest_stamp = UINT64_MAX;
+      oldest_age = 0;
 
       if (lfs_dir_open(&g_crash_lfs, &dir, COREDUMP_DIR_LFS) != 0)
         {
@@ -872,24 +1020,23 @@ static void crash_prune_old(unsigned keep, const char *keep_name)
               continue;
             }
 
+          if (!crash_note_seq(info.name, &seq))
+            {
+              continue;
+            }
+
           if (keep_name != NULL && strcmp(info.name, keep_name) == 0)
             {
               count++;
               continue;
             }
 
-          stamp = crash_note_stamp(info.name);
-          if (stamp == UINT64_MAX)
-            {
-              continue;
-            }
-
           count++;
-          if (stamp < oldest_stamp ||
-              (stamp == oldest_stamp &&
-               (oldest[0] == '\0' || strcmp(info.name, oldest) < 0)))
+          age = crash_seq_age(newest, seq);
+          if (oldest[0] == '\0' || age > oldest_age ||
+              (age == oldest_age && strcmp(info.name, oldest) < 0))
             {
-              oldest_stamp = stamp;
+              oldest_age = age;
               snprintf(oldest, sizeof(oldest), "%s", info.name);
             }
         }
@@ -1265,6 +1412,275 @@ void myvendor_coredump_early(void)
   panic_notifier_chain_register(&nb);
 }
 
+/**
+ * @brief 开机时按 VFS 裁剪 `/mnt/kv/coredump`：只留最新 KEEP 个 n*.txt。
+ *
+ * 崩溃路径里的 `crash_prune_old` 只在裸机写盘时跑；若多次 soft dump /
+ * 旧 KEEP=20 遗留，目录会在正常运行中无限堆。开机 KV 挂上后用普通
+ * opendir/unlink 清一次，与 diaglog 的 KEEP=10 对齐。
+ *
+ * 谁旧只看文件名里的 nNNN（模 1000），**不看**日历戳——异常时间会把新旧弄反。
+ */
+static unsigned coredump_vfs_read_seq(void)
+{
+  char path[96];
+  char buf[16];
+  int fd;
+  ssize_t n;
+  long v;
+
+  snprintf(path, sizeof(path), "%s/seq", MYVENDOR_COREDUMP_DIR);
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
+    {
+      return 0;
+    }
+
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0)
+    {
+      return 0;
+    }
+
+  buf[n] = '\0';
+  v = strtol(buf, NULL, 10);
+  return (v < 0) ? 0 : (unsigned)v;
+}
+
+/**
+ * @brief 目录里**除 `seq` 与 coredump note 外，一律当垃圾清掉**
+ *        （用户 2026-09-25 定调："除了 seq 和日志，其他的都当垃圾清理"）。
+ *
+ * @details 判"是 note"要**同时**过两关：`crash_is_note_name()`（n 开头 + ..txt）
+ *          并且能解出槽号 —— 只有前者的话 `nonsense.txt` 也会被当 note 留着。
+ *          与 diag 侧同一口径：认不出的就是垃圾。
+ *          注意：`.` / `..` 必须显式跳过。
+ *          崩溃路径写盘时本函数不会并发（写盘在裸机、独占 CPU 且重置了 SDIO/LFS），
+ *          所以不存在"删到正在写的 note"的竞态。
+ */
+static void coredump_scrub_unknown(void)
+{
+  DIR           *dir;
+  struct dirent *de;
+
+  dir = opendir(MYVENDOR_COREDUMP_DIR);
+  if (dir == NULL)
+    {
+      return;
+    }
+
+  while ((de = readdir(dir)) != NULL)
+    {
+      const char *n = de->d_name;
+      char        path[96];
+
+      if (n[0] == '\0' || strcmp(n, ".") == 0 || strcmp(n, "..") == 0 ||
+          strcmp(n, "seq") == 0)         /* 序号文件保留 */
+        {
+          continue;
+        }
+
+      /* note 保留 —— 但必须**同时**能解出槽号才算数（`crash_is_note_name()` 只要求
+       * "n 开头 + ..txt"，像 `nonsense.txt` 这种也能过）。与 diag 侧同一口径：
+       * "像日志但不是" 的一律当垃圾。 */
+      if (crash_is_note_name(n))
+        {
+          unsigned seq;
+
+          if (crash_note_seq(n, &seq))
+            {
+              continue;
+            }
+        }
+
+      snprintf(path, sizeof(path), "%s/%s", MYVENDOR_COREDUMP_DIR, n);
+      if (unlink(path) != 0)
+        {
+          syslog(LOG_WARNING, "[coredump] scrub unlink %s errno=%d\n",
+                 path, errno);
+        }
+      else
+        {
+          syslog(LOG_INFO, "[coredump] scrub %s (not seq/note)\n", n);
+        }
+    }
+
+  closedir(dir);
+}
+
+/**
+ * @brief 清垃圾 + 按槽号顺序删到只剩 `keep` 个 note。
+ *
+ * @details "最新槽"从 `/mnt/kv/seq` 推（seq 记的是**下一次**编号，故最新 = seq-1）；
+ *          seq 缺失时退化成"目录里出现的最大槽号"，没有环绕信息就只能这么兜底。
+ *          先清垃圾再数，两者互不阻塞。
+ *
+ * @param keep 要保留的 note 个数（= `CONFIG_MYVENDOR_COREDUMP_KEEP`）。
+ * @return true = 跑完了（目录已 ≤ keep）；false = 中途失败/卡住，调用方按节流再试。
+ */
+static bool coredump_vfs_prune(unsigned keep)
+{
+  unsigned seq_file;
+  unsigned newest;
+
+  coredump_scrub_unknown();
+
+  seq_file = coredump_vfs_read_seq();
+
+  /* seq 文件是「下一次」编号；最新已写槽 = (seq-1) mod 1000。 */
+  newest = (seq_file > 0u) ? ((seq_file - 1u) % 1000u) : 0u;
+
+  /* seq 缺失时：用目录里出现的最大槽号当 newest（无环绕信息时的兜底）。 */
+  if (seq_file == 0u)
+    {
+      DIR *dir;
+      struct dirent *de;
+      unsigned seq;
+      bool have = false;
+
+      dir = opendir(MYVENDOR_COREDUMP_DIR);
+      if (dir != NULL)
+        {
+          while ((de = readdir(dir)) != NULL)
+            {
+              if (!crash_is_note_name(de->d_name) ||
+                  !crash_note_seq(de->d_name, &seq))
+                {
+                  continue;
+                }
+
+              if (!have || seq > newest)
+                {
+                  newest = seq;
+                  have = true;
+                }
+            }
+
+          closedir(dir);
+        }
+    }
+
+  for (; ; )
+    {
+      DIR *dir;
+      struct dirent *de;
+      char oldest[64];
+      unsigned oldest_age = 0;
+      unsigned count = 0;
+      unsigned seq;
+      unsigned age;
+
+      oldest[0] = '\0';
+      dir = opendir(MYVENDOR_COREDUMP_DIR);
+      if (dir == NULL)
+        {
+          syslog(LOG_WARNING, "[coredump] prune opendir %s errno=%d\n",
+                 MYVENDOR_COREDUMP_DIR, errno);
+          return false;
+        }
+
+      while ((de = readdir(dir)) != NULL)
+        {
+          if (!crash_is_note_name(de->d_name))
+            {
+              continue;
+            }
+
+          if (!crash_note_seq(de->d_name, &seq))
+            {
+              continue;
+            }
+
+          count++;
+          age = crash_seq_age(newest, seq);
+          if (oldest[0] == '\0' || age > oldest_age ||
+              (age == oldest_age && strcmp(de->d_name, oldest) < 0))
+            {
+              oldest_age = age;
+              snprintf(oldest, sizeof(oldest), "%s", de->d_name);
+            }
+        }
+
+      closedir(dir);
+
+      if (count <= keep || oldest[0] == '\0')
+        {
+          if (count > keep)
+            {
+              syslog(LOG_WARNING,
+                     "[coredump] prune stuck count=%u keep=%u\n",
+                     count, keep);
+              return false;
+            }
+
+          if (count > 0)
+            {
+              syslog(LOG_INFO, "[coredump] prune ok count=%u keep=%u\n",
+                     count, keep);
+            }
+
+          return true;
+        }
+
+      {
+        char path[96];
+
+        snprintf(path, sizeof(path), "%s/%s", MYVENDOR_COREDUMP_DIR, oldest);
+        if (unlink(path) != 0)
+          {
+            syslog(LOG_WARNING, "[coredump] unlink %s errno=%d\n",
+                   path, errno);
+            return false;
+          }
+
+        syslog(LOG_INFO, "[coredump] prune %s by seq (%u > %u)\n",
+               oldest, count, keep);
+      }
+    }
+}
+
+/** 本次运行**成功**清过一次就不再清（用户 2026-09-25 定调："一次运行只需要清理成功
+ *  一次就不清理了"）；失败才按下面的节流重试 —— 失败每次都打 WARNING，节流是为了
+ *  不把日志刷爆。开机那次若已成功，这里直接就是空转。 */
+static bool s_prune_done;
+
+/** 失败后的重试间隔（秒）。成功路径不进这个节流。 */
+#define MYVENDOR_COREDUMP_PRUNE_RETRY_S 600u
+
+/**
+ * @brief 运行期周期性清理入口（线程上下文；内部限频，默认 10 分钟）。
+ *
+ * @details 崩溃路径的裁剪只在"写新 dump"时跑，开机那次也只在开机跑 —— 长时间不重启、
+ *          期间只有 soft dump 时目录会只涨不落（2026-09-25 用户反馈）。本入口由 diag
+ *          线程每拍调用，自身限频；成功**一次**即整场空转，失败才按
+ *          `MYVENDOR_COREDUMP_PRUNE_RETRY_S` 重试（失败由 `prune stuck` 出声）。
+ */
+void myvendor_coredump_prune(void)
+{
+  static clock_t s_retry;
+
+  if (s_prune_done)
+    {
+      return;
+    }
+
+  if (s_retry != 0 &&
+      (clock_t)(clock_systime_ticks() - s_retry) <
+        (clock_t)MYVENDOR_COREDUMP_PRUNE_RETRY_S * (clock_t)TICK_PER_SEC)
+    {
+      return;
+    }
+
+  if (coredump_vfs_prune((unsigned)CONFIG_MYVENDOR_COREDUMP_KEEP))
+    {
+      s_prune_done = true;
+      return;
+    }
+
+  s_retry = clock_systime_ticks();
+}
+
 void myvendor_coredump_init(void)
 {
   int ret;
@@ -1279,7 +1695,14 @@ void myvendor_coredump_init(void)
       return;
     }
 
-  syslog(LOG_INFO, "[coredump] dir %s\n", MYVENDOR_COREDUMP_DIR);
+  /* 开机这次若成功，运行期入口（diag 拍）就空转 —— 一次运行清一次就够。 */
+  if (coredump_vfs_prune((unsigned)CONFIG_MYVENDOR_COREDUMP_KEEP))
+    {
+      s_prune_done = true;
+    }
+
+  syslog(LOG_INFO, "[coredump] dir %s keep=%u\n",
+         MYVENDOR_COREDUMP_DIR, (unsigned)CONFIG_MYVENDOR_COREDUMP_KEEP);
 }
 
 void myvendor_coredump_wdt(void)
@@ -1323,6 +1746,10 @@ void myvendor_coredump_wdt(void)
 
   note_hw_cpu(&off);
   note_scb_fault(&off);
+
+  /* 先打 UI 任务的栈顶：任务表会吃掉 note 的尾部预算（16 KB 上限）。 */
+  note_stack_slice(&off, "bicycle_ui");
+
   note_board_snap(&off);
   nxsched_foreach(note_one_task, &off);
 

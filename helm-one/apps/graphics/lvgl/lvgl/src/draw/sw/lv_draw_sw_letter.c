@@ -129,6 +129,16 @@ void lv_draw_sw_label(lv_draw_task_t * t, const lv_draw_label_dsc_t * dsc, const
 static void LV_ATTRIBUTE_FAST_MEM draw_letter_cb(lv_draw_task_t * t, lv_draw_glyph_dsc_t * glyph_draw_dsc,
                                                  lv_draw_fill_dsc_t * fill_draw_dsc, const lv_area_t * fill_area)
 {
+#if LV_USE_SIFLI_EPIC
+    /* TEMP benchmark instrumentation */
+    extern uint32_t lv_sifli_epic_dbg_cyc(void);
+    extern uint32_t lv_sifli_epic_dbg_sw_cb_cyc;
+    extern uint32_t lv_sifli_epic_dbg_sw_fetch_cyc;
+    extern uint32_t lv_sifli_epic_dbg_sw_blend_cyc;
+    uint32_t dbg_t_cb = lv_sifli_epic_dbg_cyc();
+    uint32_t dbg_t0;
+#endif
+
     if(glyph_draw_dsc) {
         switch(glyph_draw_dsc->format) {
             case LV_FONT_GLYPH_FORMAT_NONE: {
@@ -166,10 +176,22 @@ static void LV_ATTRIBUTE_FAST_MEM draw_letter_cb(lv_draw_task_t * t, lv_draw_gly
                             blend_dsc.mask_stride = glyph_draw_dsc->g->stride;
                             blend_dsc.blend_area = glyph_draw_dsc->letter_coords;
                             blend_dsc.mask_res = LV_DRAW_SW_MASK_RES_CHANGED;
+#if LV_USE_SIFLI_EPIC
+                            dbg_t0 = lv_sifli_epic_dbg_cyc();
+#endif
                             lv_draw_sw_blend(t, &blend_dsc);
+#if LV_USE_SIFLI_EPIC
+                            lv_sifli_epic_dbg_sw_blend_cyc += lv_sifli_epic_dbg_cyc() - dbg_t0;
+#endif
                         }
                         else {
+#if LV_USE_SIFLI_EPIC
+                            dbg_t0 = lv_sifli_epic_dbg_cyc();
+#endif
                             glyph_draw_dsc->glyph_data = lv_font_get_glyph_bitmap(glyph_draw_dsc->g, glyph_draw_dsc->_draw_buf);
+#if LV_USE_SIFLI_EPIC
+                            lv_sifli_epic_dbg_sw_fetch_cyc += lv_sifli_epic_dbg_cyc() - dbg_t0;
+#endif
                             if(glyph_draw_dsc->glyph_data == NULL) {
                                 LV_LOG_WARN("Couldn't get the bitmap of a glyph");
                                 break;
@@ -186,11 +208,23 @@ static void LV_ATTRIBUTE_FAST_MEM draw_letter_cb(lv_draw_task_t * t, lv_draw_gly
                             blend_dsc.mask_stride = draw_buf->header.stride;
                             blend_dsc.blend_area = glyph_draw_dsc->letter_coords;
                             blend_dsc.mask_res = LV_DRAW_SW_MASK_RES_CHANGED;
+#if LV_USE_SIFLI_EPIC
+                            dbg_t0 = lv_sifli_epic_dbg_cyc();
+#endif
                             lv_draw_sw_blend(t, &blend_dsc);
+#if LV_USE_SIFLI_EPIC
+                            lv_sifli_epic_dbg_sw_blend_cyc += lv_sifli_epic_dbg_cyc() - dbg_t0;
+#endif
                         }
                     }
                     else {
+#if LV_USE_SIFLI_EPIC
+                        dbg_t0 = lv_sifli_epic_dbg_cyc();
+#endif
                         glyph_draw_dsc->glyph_data = lv_font_get_glyph_bitmap(glyph_draw_dsc->g, glyph_draw_dsc->_draw_buf);
+#if LV_USE_SIFLI_EPIC
+                        lv_sifli_epic_dbg_sw_fetch_cyc += lv_sifli_epic_dbg_cyc() - dbg_t0;
+#endif
                         lv_draw_image_dsc_t img_dsc;
                         lv_draw_image_dsc_init(&img_dsc);
                         img_dsc.rotation = glyph_draw_dsc->rotation;
@@ -222,6 +256,10 @@ static void LV_ATTRIBUTE_FAST_MEM draw_letter_cb(lv_draw_task_t * t, lv_draw_gly
     if(fill_draw_dsc && fill_area) {
         lv_draw_sw_fill(t, fill_draw_dsc, fill_area);
     }
+
+#if LV_USE_SIFLI_EPIC
+    lv_sifli_epic_dbg_sw_cb_cyc += lv_sifli_epic_dbg_cyc() - dbg_t_cb;
+#endif
 }
 
 #if LV_USE_FREETYPE && LV_USE_VECTOR_GRAPHIC && LV_USE_THORVG

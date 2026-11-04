@@ -27,12 +27,13 @@
 extern "C" {
 #endif
 
-#define SF32LB_DVFS_MHZ_72    72u   /**< S0，DLL1 最低安全档（>48，DLL2 仍开）。 */
-#define SF32LB_DVFS_MHZ_96    96u   /**< S0。 */
+#define SF32LB_DVFS_MHZ_72    72u   /**< S0。**已取消**（2026-10-01，见 g_gears[]）。 */
+#define SF32LB_DVFS_MHZ_96    96u   /**< S0。**已取消**（2026-09-26）。 */
 #define SF32LB_DVFS_MHZ_144  144u   /**< S0。 */
-#define SF32LB_DVFS_MHZ_240  240u   /**< S1。 */
+#define SF32LB_DVFS_MHZ_240  240u   /**< S1：掉电前/充电时钉住的高档。 */
 
-#define SF32LB_DVFS_MHZ_LOW   SF32LB_DVFS_MHZ_72
+/** 现役档位只有两档（`g_gears[]`）：144（S0）与 240（S1）。 */
+#define SF32LB_DVFS_MHZ_LOW   SF32LB_DVFS_MHZ_144
 #define SF32LB_DVFS_MHZ_HIGH  SF32LB_DVFS_MHZ_240
 
 /** 随机跳频测试默认周期（ms）。 */
@@ -86,6 +87,28 @@ void sf32lb_dvfs_interact(void);
  * @return 0 成功，负值为错误。
  */
 int sf32lb_dvfs_force(uint32_t mhz);
+
+/**
+ * @brief 开关"**充电时也按负载动态调频**"（`ctl dvfs charge on|off`）。
+ *
+ * @details
+ * 默认关。开启后，`SF32LB_DVFS_HOLD_CHARGE` 不再把 HCLK 抬到 240 MHz
+ * —— 插电调试时跑的就是**电池使用时的同一套负载策略**，现场可以复现。
+ * `HOLD_CHARGE` 位本身照旧记录（`holds=` 里仍能看到 `charge`），只是不抬地板。
+ * `BOOT` / `MAP` / `OFFING` 仍钉 240（那三个是"不能低"的场合）。
+ *
+ * 与 `sf32lb_dvfs_hop_start()` 的区别：hop 走 force 路径、把 hold/governor/
+ * 交互下限**全部绕过**，是合成扫描；本模式只摘一位地板，其余策略不动。
+ *
+ * @param on true = 开。
+ * @return true = 已处在请求的状态。
+ */
+bool sf32lb_dvfs_charge_dyn_set(bool on);
+
+/**
+ * @brief 查询"充电时也按负载动态调频"当前是否开启。
+ */
+bool sf32lb_dvfs_charge_dyn(void);
 
 /**
  * @brief 获取当前已应用的 HCLK。
@@ -221,6 +244,17 @@ static inline int sf32lb_dvfs_force(uint32_t mhz)
 {
   (void)mhz;
   return -1;
+}
+
+static inline bool sf32lb_dvfs_charge_dyn_set(bool on)
+{
+  (void)on;
+  return false;
+}
+
+static inline bool sf32lb_dvfs_charge_dyn(void)
+{
+  return false;
 }
 
 static inline uint32_t sf32lb_dvfs_hclk_mhz(void)

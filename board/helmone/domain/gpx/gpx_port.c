@@ -437,7 +437,7 @@ static int gpx_port_file_flush_once(gpx_port_file_t *file)
   size_t wrote = 0;
   int ret;
 
-  if (file == NULL || file->wbuf == NULL || file->wlen == 0)
+  if (file == NULL || file->wbuf == NULL || (file->wlen == 0 && file->fd < 0))
     {
       return 0;
     }
@@ -445,65 +445,6 @@ static int gpx_port_file_flush_once(gpx_port_file_t *file)
   ret = gpx_port_sys_write_all(file->fd, file->wbuf, file->wlen, &wrote);
   gpx_port_file_consume_w(file, (uint32_t)wrote);
   return ret;
-}
-
-static int gpx_port_file_flush_try(gpx_port_file_t *file)
-{
-  int ret = 0;
-  unsigned i;
-
-  if (file == NULL || file->wbuf == NULL || file->wlen == 0)
-    {
-      return 0;
-    }
-
-  for (i = 0; i < GPX_PORT_FLUSH_TRY; i++)
-    {
-      ret = gpx_port_file_flush_once(file);
-      if (ret == 0)
-        {
-          return 0;
-        }
-
-      myvendor_watchdog_hw_pet();
-      if (i + 1u < GPX_PORT_FLUSH_TRY)
-        {
-          gpx_port_sleep_ms(20);
-        }
-    }
-
-  return ret;
-}
-
-/* 缓存满或关文件：没关机就一直刷，不把已攒的点扔掉。 */
-static int gpx_port_file_flush_wait(gpx_port_file_t *file)
-{
-  unsigned n = 0;
-
-  if (file == NULL || file->wbuf == NULL || file->wlen == 0)
-    {
-      return 0;
-    }
-
-  for (;;)
-    {
-      int ret = gpx_port_file_flush_once(file);
-
-      if (ret == 0)
-        {
-          return 0;
-        }
-
-      n++;
-      if ((n % 64u) == 1u)
-        {
-          printf("gpx: flush wait %u (%d) keep %lu\n", n, ret,
-                 (unsigned long)file->wlen);
-        }
-
-      myvendor_watchdog_hw_pet();
-      gpx_port_sleep_ms(50);
-    }
 }
 
 /* 开录时占住空文件，后续 dump 走 O_APPEND，停表不必再创 inode。 */
@@ -543,107 +484,64 @@ static int gpx_port_file_plant_empty(const char *path)
     }
 }
 
-/* open → write wbuf → fsync → close。成功才把 created 置位。 */
+/* Bounded retries. Keep fd and remaining cache on failure so a later close
+ * can resume without duplicating bytes already accepted by write(). */
 static int gpx_port_file_commit(gpx_port_file_t *file, bool wait)
 {
-  unsigned n = 0;
+  unsigned attempt;
+  unsigned limit = wait ? GPX_PORT_FLUSH_TRY : 1;
+  int ret = 0;
 
-  if (file == NULL || file->wbuf == NULL || file->wlen == 0)
-    {
-      return 0;
-    }
-
-  if (file->path[0] == '\0')
+  if (file == NULL || file->wbuf == NULL)
     {
       return -EINVAL;
     }
 
-  for (;;)
+  for (attempt = 0; attempt < limit; attempt++)
     {
-      int flags = O_WRONLY | O_CREAT | (file->created ? O_APPEND : O_TRUNC);
-      int fd;
-      int ret;
-      uint32_t before;
+      if (file->fd < 0)
+        {
+          if (file->wlen == 0)
+            {
+              return 0;
+            }
 
-      fd = open(file->path, flags, 0666);
-      if (fd < 0)
+          file->fd = open(file->path, O_WRONLY | O_APPEND);
+        }
+
+      if (file->fd < 0)
         {
           ret = -errno;
-          if (!wait)
+        }
+      else
+        {
+          ret = gpx_port_file_flush_once(file);
+          if (ret == 0 && fsync(file->fd) != 0)
             {
-              return ret;
+              ret = -errno;
             }
 
-          n++;
-          if ((n % 64u) == 1u)
+          if (ret == 0)
             {
-              printf("gpx: open wait %u (%d) keep %lu\n", n, ret,
-                     (unsigned long)file->wlen);
+              int fd = file->fd;
+              file->fd = -1;
+              return close(fd) == 0 ? 0 : -errno;
             }
+        }
 
-          myvendor_watchdog_hw_pet();
+      /* Permanent errors need user/storage recovery, not busy retrying. */
+      if (ret != -EINTR && ret != -EAGAIN && ret != -EBUSY)
+        {
+          break;
+        }
+
+      if (attempt + 1 < limit)
+        {
           gpx_port_sleep_ms(50);
-          continue;
         }
-
-      file->fd = fd;
-      before = file->wlen;
-      ret = wait ? gpx_port_file_flush_wait(file)
-                 : gpx_port_file_flush_try(file);
-      if (file->wlen < before)
-        {
-          file->created = true;
-        }
-
-      if (ret == 0)
-        {
-          unsigned fs = 0;
-
-          while (fsync(fd) != 0)
-            {
-              int err = -errno;
-
-              if (!wait)
-                {
-                  (void)close(fd);
-                  file->fd = -1;
-                  return err;
-                }
-
-              fs++;
-              if ((fs % 64u) == 1u)
-                {
-                  printf("gpx: fsync wait %u (%d%s)\n", fs, err,
-                         err == -EFAULT ? " lfs-corrupt" : "");
-                }
-
-              myvendor_watchdog_hw_pet();
-              gpx_port_sleep_ms(50);
-            }
-
-          (void)close(fd);
-          file->fd = -1;
-          printf("gpx: dump %lu then close\n", (unsigned long)before);
-          return 0;
-        }
-
-      (void)close(fd);
-      file->fd = -1;
-      if (!wait)
-        {
-          return ret;
-        }
-
-      n++;
-      if ((n % 64u) == 1u)
-        {
-          printf("gpx: dump wait %u (%d) keep %lu\n", n, ret,
-                 (unsigned long)file->wlen);
-        }
-
-      myvendor_watchdog_hw_pet();
-      gpx_port_sleep_ms(50);
     }
+
+  return ret;
 }
 
 int gpx_port_file_open_read(gpx_port_file_t *file, const char *path)
@@ -709,6 +607,11 @@ static int gpx_port_file_open_out(gpx_port_file_t *file, const char *path,
   file->fd = -1;
 
   wbuf = gpx_port_file_alloc_write(&wcap);
+  if (wbuf == NULL)
+    {
+      return -ENOMEM;
+    }
+
   snprintf(file->path, sizeof(file->path), "%s", path);
   file->wbuf = wbuf;
   file->wcap = (wbuf != NULL) ? wcap : 0;
@@ -732,22 +635,6 @@ static int gpx_port_file_open_out(gpx_port_file_t *file, const char *path,
     }
 
   file->created = true;
-
-  if (wbuf == NULL)
-    {
-      file->fd = open(path, O_WRONLY | O_APPEND, 0666);
-      if (file->fd < 0)
-        {
-          int err = -errno;
-
-          file->path[0] = '\0';
-          file->created = false;
-          return err;
-        }
-
-      printf("gpx: write cache none, write-through\n");
-      return 0;
-    }
 
   printf("gpx: write cache %lu KiB, dump on full/close\n",
          (unsigned long)(wcap / 1024u));
@@ -773,43 +660,19 @@ int gpx_port_file_close(gpx_port_file_t *file)
       return 0;
     }
 
-  if (file->wbuf != NULL && file->wlen > 0)
+  if (file->wbuf != NULL)
     {
       ret = gpx_port_file_commit(file, true);
+      if (ret != 0)
+        {
+          /* Caller owns the cache/fd until a successful retry or discard. */
+          return ret;
+        }
     }
   else if (file->fd >= 0)
     {
-      unsigned n = 0;
-
-      for (;;)
-        {
-          if (fsync(file->fd) == 0)
-            {
-              break;
-            }
-
-          n++;
-          if ((n % 64u) == 1u)
-            {
-              printf("gpx: fsync wait %u (%d%s)\n", n, -errno,
-                     errno == EFAULT ? " lfs-corrupt" : "");
-            }
-
-          myvendor_watchdog_hw_pet();
-          gpx_port_sleep_ms(50);
-        }
-
-      if (close(file->fd) != 0 && ret == 0)
-        {
-          ret = -errno;
-        }
-
-      file->fd = -1;
-    }
-
-  if (file->fd >= 0)
-    {
-      (void)close(file->fd);
+      /* Read handles do not require fsync. */
+      ret = close(file->fd) == 0 ? 0 : -errno;
       file->fd = -1;
     }
 
@@ -872,52 +735,44 @@ int gpx_port_file_size(gpx_port_file_t *file, uint32_t *size_out)
 
 int gpx_port_file_write(gpx_port_file_t *file, const void *data, size_t len)
 {
-  const uint8_t *p = data;
   int ret;
 
-  if (file == NULL || data == NULL)
+  if (file == NULL || data == NULL || file->wbuf == NULL)
     {
       return -EINVAL;
     }
 
-  if (len == 0)
+  if (len > UINT32_MAX)
     {
-      return 0;
+      return -EFBIG;
     }
 
-  if (file->wbuf == NULL || file->wcap == 0)
+  /* Accept all of a batch or none. A partial admission followed by a flush
+   * error would duplicate its prefix when the recorder retries the batch. */
+  if (len > file->wcap - file->wlen)
     {
-      if (file->fd < 0)
+      ret = gpx_port_file_commit(file, true);
+      if (ret != 0)
         {
-          return -EINVAL;
+          return ret;
+        }
+    }
+
+  if (len > file->wcap)
+    {
+      uint8_t *buf = gpx_port_malloc(len);
+      if (buf == NULL)
+        {
+          return -ENOMEM;
         }
 
-      return gpx_port_sys_write_all(file->fd, data, len, NULL);
+      gpx_port_free(file->wbuf);
+      file->wbuf = buf;
+      file->wcap = (uint32_t)len;
     }
 
-  while (len > 0)
-    {
-      uint32_t room = file->wcap - file->wlen;
-      size_t n;
-
-      if (room == 0)
-        {
-          ret = gpx_port_file_commit(file, true);
-          if (ret != 0)
-            {
-              return ret;
-            }
-
-          room = file->wcap;
-        }
-
-      n = (len < (size_t)room) ? len : (size_t)room;
-      memcpy(file->wbuf + file->wlen, p, n);
-      file->wlen += (uint32_t)n;
-      p += n;
-      len -= n;
-    }
-
+  memcpy(file->wbuf + file->wlen, data, len);
+  file->wlen += (uint32_t)len;
   return 0;
 }
 
@@ -976,7 +831,7 @@ int gpx_port_file_flush(gpx_port_file_t *file)
       return -EINVAL;
     }
 
-  if (file->wbuf == NULL || file->wlen == 0)
+  if (file->wbuf == NULL || (file->wlen == 0 && file->fd < 0))
     {
       return 0;
     }

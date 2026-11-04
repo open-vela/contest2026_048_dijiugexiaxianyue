@@ -1,13 +1,13 @@
 # 构建、烧录、监视与机上探针
 
-## 1. 构建（`vendor/my_vendor/build_board.py`，或其 shell 包装 `vela` 工具）
+## 1. 构建（`vendor/HelmOne/build_board.py`，或其 shell 包装 `vela` 工具）
 
 ```bash
 # 日常（应用 / NuttX / 驱动改动）
-python3 vendor/my_vendor/build_board.py build
+python3 vendor/HelmOne/build_board.py build
 
 # 全量：main + factory + boot（+ fs）
-python3 vendor/my_vendor/build_board.py build-all
+python3 vendor/HelmOne/build_board.py build-all
 
 # 单件
 build-boot      # ftab.bin + bootloader.bin → boot_loader/bin/
@@ -38,12 +38,12 @@ menuconfig / savedefconfig
 
 ```bash
 # 终端 1：操作者 —— 原命令即可
-python3 vendor/my_vendor/docs/tools/vela_my_vendor_tools.py monitor
+python3 vendor/HelmOne/docs/tools/vela_my_vendor_tools.py monitor
 
 # 终端 2：AI / 脚本 —— 不带命令就是监听
-python3 vendor/my_vendor/docs/tools/serial_hub.py        # 转发枢纽（/tmp 下的"文件"其实是个程序）
-python3 vendor/my_vendor/docs/tools/pty_run.py           # 后台跑 monitor
-python3 vendor/my_vendor/docs/tools/probe_boot.py        # 启动链路探针
+python3 vendor/HelmOne/docs/tools/serial_hub.py        # 转发枢纽（/tmp 下的"文件"其实是个程序）
+python3 vendor/HelmOne/docs/tools/pty_run.py           # 后台跑 monitor
+python3 vendor/HelmOne/docs/tools/probe_boot.py        # 启动链路探针
 ```
 
 默认 **1 000 000** 波特，支持 NSH 与 bttool。若出现「进程里没有读串口的线程」，见 `docs/tools/vela_my_vendor_tools.md` §8.4 的现场处置。

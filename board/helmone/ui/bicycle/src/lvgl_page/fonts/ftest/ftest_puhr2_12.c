@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 12 px
  * Bpp: 2
- * Opts: --size 12 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name ftest_puhr2_12 -o /home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/fonts/ftest/ftest_puhr2_12.c --font /home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/fonts/Alibaba_PuHuiTi_2.0_55_Regular.ttf --autohint-strong --symbols  0123456789.:/-%+BbEhikmnptKYxso★字体试验推荐当前量产传感器已连接骑行记录暂无下一套上长按返回适合小菜单半透反最大对比线稿同族屏中等思源黑粗米谷歌普惠苹方特强导航坐标点常用亮度日光设置蓝牙开启关闭固件码表速时间里程均海拔照像素规准
+ * Opts: --size 12 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name ftest_puhr2_12 -o /home/jinsc/SDK/vela/openvela/vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/src/lvgl_page/fonts/ftest/ftest_puhr2_12.c --font /home/jinsc/SDK/vela/openvela/vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/fonts/Alibaba_PuHuiTi_2.0_55_Regular.ttf --autohint-strong --symbols  0123456789.:/-%+BbEhikmnptKYxso★字体试验推荐当前量产传感器已连接骑行记录暂无下一套上长按返回适合小菜单半透反最大对比线稿同族屏中等思源黑粗米谷歌普惠苹方特强导航坐标点常用亮度日光设置蓝牙开启关闭固件码表速时间里程均海拔照像素规准
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

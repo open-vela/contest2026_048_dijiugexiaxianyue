@@ -33,7 +33,7 @@ static void anima_invoke_finish(lv_pm_anima_data * data)
         cb(page, opts);
     }
 
-    LV_LOG("动画结束回调 ID -> %d, back=%d",
+    LV_LOG_INFO("动画结束回调 ID -> %d, back=%d",
            page ? page->id : -1,
            page ? page->flag.is_back : 0);
     lv_pm_nav_anim_end();

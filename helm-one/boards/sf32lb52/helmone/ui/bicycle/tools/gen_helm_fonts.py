@@ -61,6 +61,7 @@ SCAN_GLOBS = (
     os.path.join(BICYCLE_DIR, "src", "lvgl_page", "usb_transfer", "*.c"),
     os.path.join(BICYCLE_DIR, "src", "lvgl_page", "factory", "*.c"),
     os.path.join(BICYCLE_DIR, "src", "bicycle_status_bar.c"),
+    os.path.join(BICYCLE_DIR, "src", "bicycle_demo.c"),
     os.path.join(BICYCLE_DIR, "src", "bicycle_ui_ctl.c"),
     os.path.join(BICYCLE_DIR, "src", "bicycle_mtp_ui.c"),
     os.path.join(BICYCLE_DIR, "src", "vmap", "vmap_route.c"),

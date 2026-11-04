@@ -11,11 +11,18 @@
 ## How to use
 
 1. **先查权威值，再动手。** 阈值/上限/偏移只在两处为准：设备上的 `docs/system_states.md`（状态、阈值、文案口径）与 `docs/sd_partition.md`（卡分区）。不要凭常识写数字。
-2. **用 run_shell 取证，不要猜。** 常用探针：`ptab`（打印编译进固件的分区表）、`bootinfo`、`df -h`（分区容量）、`free`、`ps`。SD 相关再看日志里的 `sr=` / `why=` 字段。
+2. **用 run_shell 取证，不要猜。** 常用命令：`ptab`（打印编译进固件的分区表）、`bootinfo`、`df -h`（分区容量）、`free`、`ps`。SD 相关再看日志里的 `sr=` / `why=` 字段。
 3. **按配方处置故障。** 见下方「故障速查」；配方之外的情况，先 `read_file` 对应文档再动手。
 4. **改一处必须同步一处。** 改阈值先改 `docs/system_states.md`；改分区先改 `boot_loader/config/nsh/ptab.sdmmc.json` 并重新生成两份 `ptab_table.{c,h}`；改双端协议要同时改固件 `companion_proto.h` 与 App 的 `companion_proto.dart`。
-5. **不许绕过既有抽象。** 不改上游 `nuttx/`（板级差异走 `boards/sf32lb52/my_vendor/vela_override/`），不改生成产物，不改 `logs/` 下的 AI Coding 日志。
+5. **不许绕过既有抽象。** 不改上游 `nuttx/`（板级差异走 `boards/sf32lb52/helmone/vela_override/`），不改生成产物，不改 `logs/` 下的 AI Coding 日志。
 6. **收尾留痕。** 解决一个非平凡问题后，把根因与处置写进对应 `docs/*.md`。
+7. **串口 / monitor 保活（硬约束）。** 用户常在另一终端跑
+   `./vela_my_vendor_tools.py monitor -p /dev/ttyACM0`（或 `--follow`）。
+   烧录只用工具自带的 `release`/`acquire`；**禁止** `pkill`/`kill` 任何
+   `monitor`/`serial_hub`，**禁止** `monitor stop` / `{"op":"shutdown"}` /
+   删或抢断 `/tmp/vela-serial-*.lease`。
+   Agent 抓日志用 `monitor --follow --no-stdin`，不要另起会抢归属的直连
+   （`--no-broker`）进程。
 
 ## 权威值（速查）
 

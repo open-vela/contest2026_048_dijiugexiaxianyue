@@ -14,6 +14,7 @@
 #include "helm_idle.h"
 
 #include "helm_font.h"
+#include "helm_anim.h"
 #include "helm_palette.h"
 #include "helm_pwr.h"
 #include "helm_widget.h"
@@ -121,10 +122,39 @@ static lv_coord_t helm_idle_glyph_w(const lv_font_t *font, uint32_t letter,
     return z;
 }
 
+/**
+ * @brief 冒号相对数字的视觉中心差（px，正数 = 冒号偏低）。
+ * @details LVGL 按基线排字形：冒号只有下半截，直接排会偏下。按数字与冒号的
+ *          glyph ink 高/偏移算：dy = (h0 - hc)/2 + (ofs0 - ofsc)。
+ *          算不出来时返回 0（不偏移）。
+ */
+static lv_coord_t helm_idle_colon_dy(const lv_font_t *font)
+{
+    lv_font_glyph_dsc_t d0;
+    lv_font_glyph_dsc_t dc;
+
+    if (font == NULL
+        || !lv_font_get_glyph_dsc(font, &d0, (uint32_t)'0', 0)
+        || !lv_font_get_glyph_dsc(font, &dc, (uint32_t)':', 0)) {
+        return 0;
+    }
+
+    return (lv_coord_t)(((int32_t)d0.box_h - (int32_t)dc.box_h) / 2
+        + ((int32_t)d0.ofs_y - (int32_t)dc.ofs_y));
+}
+
+/*
+ * 静止屏是**全屏黑白电子钟**：半透半反屏在背光关掉后靠环境光看，所以底用固定白、
+ * 字必须用**固定黑** —— 不能跟主题走。夜间调色板会把 INK 翻成浅色，配白底就是
+ * "白字白底"，日期/时间/「静止」三样全看不见（用户 2026-09-27 报的
+ * "静止状态的日期 时间 还有静止提示 都消失了"）。
+ */
+#define HELM_IDLE_INK   0x000000u
+
 static lv_obj_t *helm_idle_cell(lv_obj_t *row, const lv_font_t *font,
                                lv_coord_t w, const char *txt)
 {
-    lv_obj_t *lab = helm_label(row, font, HELM_COLOR_INK, txt);
+    lv_obj_t *lab = helm_label(row, font, HELM_IDLE_INK, txt);
 
     lv_obj_set_width(lab, w);
     lv_label_set_long_mode(lab, LV_LABEL_LONG_MODE_CLIP);
@@ -138,10 +168,12 @@ static lv_obj_t *helm_idle_hms_build(lv_obj_t *parent, helm_idle_hms_t *out,
     lv_obj_t *row = lv_obj_create(parent);
     lv_coord_t dw;
     lv_coord_t cw;
+    lv_coord_t colon_dy;
     uint8_t i;
 
     dw = (lv_coord_t)(helm_idle_glyph_w(font, (uint32_t)'0', 10) + 2);
     cw = (lv_coord_t)(helm_idle_glyph_w(font, (uint32_t)':', 8) + 4);
+    colon_dy = helm_idle_colon_dy(font);
 
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -157,6 +189,7 @@ static lv_obj_t *helm_idle_hms_build(lv_obj_t *parent, helm_idle_hms_t *out,
             uint8_t ci = (i == 2u) ? 0u : 1u;
 
             out->colon[ci] = helm_idle_cell(row, font, cw, ":");
+            lv_obj_set_style_translate_y(out->colon[ci], -colon_dy, 0);
         }
 
         out->d[i] = helm_idle_cell(row, font, dw, "0");
@@ -320,7 +353,7 @@ static void helm_idle_overlay_show(void)
 
     still_blk = helm_idle_block(s_mask);
     {
-        lv_obj_t *cap_lab = helm_label(still_blk, cap, HELM_COLOR_INK, "静止");
+        lv_obj_t *cap_lab = helm_label(still_blk, cap, HELM_IDLE_INK, "静止");
 
         lv_obj_set_style_text_align(cap_lab, LV_TEXT_ALIGN_CENTER, 0);
     }
@@ -336,7 +369,7 @@ static void helm_idle_overlay_show(void)
     clock_blk = helm_idle_block(s_mask);
     lv_obj_set_style_pad_row(clock_blk, 10, 0);
     (void)helm_idle_hms_build(clock_blk, &s_clock, helm_font_speed(), false);
-    s_date_lab = helm_label(clock_blk, date_font, HELM_COLOR_INK, "");
+    s_date_lab = helm_label(clock_blk, date_font, HELM_IDLE_INK, "");
     lv_obj_set_style_text_align(s_date_lab, LV_TEXT_ALIGN_CENTER, 0);
 
     helm_idle_overlay_refresh();
@@ -439,6 +472,7 @@ void helm_idle_wake(void)
     helm_idle_tick_timer_disarm();
     sf32lb_dvfs_hold(SF32LB_DVFS_HOLD_AWAKE);
     s_sleep = false;
+    helm_anim_suspend(false);
     helm_idle_overlay_hide();
     helm_pwr_bl_fade_on();
     myvendor_gnss_idle_sleep(false);
@@ -452,6 +486,7 @@ static void helm_idle_enter(void)
     }
 
     s_sleep = true;
+    helm_anim_suspend(true);
     helm_idle_tick_timer_arm();
     lv_pm_notify_dismiss();
     helm_idle_overlay_show();

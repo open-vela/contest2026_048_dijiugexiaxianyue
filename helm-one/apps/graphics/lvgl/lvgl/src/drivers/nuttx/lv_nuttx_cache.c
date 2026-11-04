@@ -15,6 +15,10 @@
 #include "../../draw/lv_draw_buf_private.h"
 #include "../../core/lv_global.h"
 
+#if LV_USE_SIFLI_EPIC && defined(SF32LB52X)
+    #include "../../draw/sifli/epic/lv_sifli_epic_cache.h"
+#endif
+
 #ifdef __NuttX__
     #include <nuttx/cache.h>
 #else
@@ -106,7 +110,11 @@ static void invalidate_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * a
     lv_uintptr_t start;
     lv_uintptr_t end;
     draw_buf_to_region(draw_buf, area, &start, &end);
+#if LV_USE_SIFLI_EPIC && defined(SF32LB52X)
+    lv_epic_invalidate_cache_range((const void *)start, (uint32_t)(end - start));
+#else
     up_invalidate_dcache(start, end);
+#endif
 }
 
 static void flush_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * area)
@@ -114,7 +122,11 @@ static void flush_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * area)
     lv_uintptr_t start;
     lv_uintptr_t end;
     draw_buf_to_region(draw_buf, area, &start, &end);
+#if LV_USE_SIFLI_EPIC && defined(SF32LB52X)
+    lv_epic_clean_invalidate_cache_range((const void *)start, (uint32_t)(end - start));
+#else
     up_flush_dcache(start, end);
+#endif
 }
 
 #endif /* LV_USE_NUTTX */

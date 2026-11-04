@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/sf32lb52_bd_addr.c
+ * vendor/HelmOne/chips/sf32lb52/sf32lb52_bd_addr.c
  *
  * Chip-unique public BD_ADDR from eFuse UID. NAND/SD boards have no NOR
  * factory OTP MAC (CFG_SUPPORT_NON_OTP). Follow SiFli: UID v2 then v1.

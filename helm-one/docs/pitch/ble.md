@@ -5,6 +5,10 @@
 **CMake 目标：** `zblue`（`libzblue.a`）  
 **替换件：** [replace/external/zblue/zblue/subsys/bluetooth/host/id.c](replace/external/zblue/zblue/subsys/bluetooth/host/id.c)  
 **补丁：** [patches/zblue-id-scan-eacces.patch](patches/zblue-id-scan-eacces.patch)  
+**构建时机制（2026-09-24 起）：** `vela_override/zblue/patch_id_scan_addr.py`
+（CMake configure 阶段跑，写进 `cmake_out/<build>/myvendor_zblue/myvendor_id.c` 并按路径后缀顶掉上游那份 ⇒
+**上游 git 保持不动**）。上面那份 `.patch` 与它逐字节等价，校验与同步办法见
+[patches/README.md](patches/README.md) 顶部注记。  
 **对照 HEAD：** `external/zblue/zblue` @ `6f79fb2a0f83`，改前 blob `e2e8f4824dfc`
 
 ## 组件 id（换版本前先对这张表）
@@ -18,7 +22,7 @@
 
 ```bash
 git -C external/zblue/zblue rev-parse HEAD:subsys/bluetooth/host/id.c          # 应等于上表 blob
-git -C external/zblue/zblue apply --check ../../../vendor/my_vendor/docs/pitch/patches/zblue-id-scan-eacces.patch
+git -C external/zblue/zblue apply --check ../../../vendor/HelmOne/docs/pitch/patches/zblue-id-scan-eacces.patch
 ```
 
 HEAD 动了但 blob 没动 ⇒ 文件没被改过，照下面两段改；blob 也变了 ⇒ 先看上游这段怎么改的再重做。
@@ -88,7 +92,7 @@ OpenVela 根目录。
 **覆盖（与对照 HEAD 一致时）：**
 
 ```bash
-cp vendor/my_vendor/docs/pitch/replace/external/zblue/zblue/subsys/bluetooth/host/id.c \
+cp vendor/HelmOne/docs/pitch/replace/external/zblue/zblue/subsys/bluetooth/host/id.c \
    external/zblue/zblue/subsys/bluetooth/host/id.c
 ```
 
@@ -98,7 +102,7 @@ cp vendor/my_vendor/docs/pitch/replace/external/zblue/zblue/subsys/bluetooth/hos
 
 ```bash
 git -C external/zblue/zblue apply \
-  ../../../vendor/my_vendor/docs/pitch/patches/zblue-id-scan-eacces.patch
+  ../../../vendor/HelmOne/docs/pitch/patches/zblue-id-scan-eacces.patch
 ```
 
 `git apply --check` 可先看能否贴上。

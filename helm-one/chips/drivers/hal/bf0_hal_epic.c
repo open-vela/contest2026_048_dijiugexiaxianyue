@@ -3523,16 +3523,83 @@ static void EPIC_ConfigDither(EPIC_HandleTypeDef *hepic, uint32_t dither_mask, u
 }
 #endif /* EPIC_SUPPORT_DITHER */
 
+/* ---- 有界等待（用户 2026-09-26）------------------------------------------------
+ *
+ * 原来 EPIC 的完成等待是 `while (STATUS != 0x0);` —— **无超时、无上界、不 yield**。
+ * 硬件一旦不给 done（完成中断丢、总线异常、引擎卡住），调用线程就永久空转；
+ * 而本板所有 EPIC 调用都在 **UI 线程**（LVGL 绘制 / vmap 的 scroll+clear / 开机自检）
+ * ⇒ 表现为 idle/work/ui 三个心跳全停 ⇒ 看门狗停喂 ⇒ 复位。现场一次正是这个形态。
+ *
+ * 上界取 1000 万次轮询：一次合法的 EPIC 搬运（186 KB 实测 ~260 万周期 ≈ 11 ms）
+ * 远在界内，而 WDT 的阈值是 10 秒 —— 中间隔了两个数量级，不会误伤。
+ * 超时只做两件事：计数 + 返回；**如何降级由上层决定**（myvendor_epic_blit.c
+ * 见计数变化就返回失败，vmap_blit 用 CPU 重做那一块 ⇒ "永久卡死"变"一帧重画"）。
+ */
+/* 2026-11-04 追加：**守卫必须足够大**，否则合法的旋转烘焙会被误判超时。
+ *
+ * 实测口径：搬 186 KB ≈ 2.6M 周期 ≈ 11 ms；而 `[vrot]` 的旋转烘焙按
+ * **139 cycle/px** 计（SDK 官方表），496×472 = 234k px ≈ **32M 周期 ≈ 135 ms**。
+ * 曾经把守卫砍到 2M（≈34 ms）—— 结果一次合法旋转就被判超时，调用方继续发下一个
+ * EPIC 而引擎还在忙 ⇒ 级联硬挂死（现场：复位前最后一行是 `[vrot] why A`，
+ * 无 stop feed、无 coredump）。所以这里取 **60M 轮询**（≈0.5~1.0 s @240MHz），
+ * 比最大合法操作留 4 倍以上余量，又远小于 10~15 s 的看门狗窗口。
+ *
+ * 另外每 50k 轮询让出一次 CPU（NuttX 下 `sched_yield()`）：真的卡住时同一情形
+ * 从"整机复位"退化成"帧变慢但系统活着"，超时计数由上层探针报出来。 */
+#if defined(__NuttX__)
+#  include <sched.h>
+#  define EPIC_WAIT_YIELD()   sched_yield()
+#else
+#  define EPIC_WAIT_YIELD()   do { } while (0)
+#endif
+
+#define EPIC_WAIT_DONE_GUARD  60000000u
+/* 每多少次轮询让出一次 CPU（50k ≈ 0.85 ms @240MHz）。 */
+#define EPIC_WAIT_YIELD_EVERY 50000u
+volatile uint32_t g_epic_wait_timeouts;
+
 static void EPIC_WaitDone(EPIC_HandleTypeDef *hepic)
 {
 #if defined(SF32LB55X)||defined(SF32LB58X)
+    uint32_t guard = EPIC_WAIT_DONE_GUARD;
+    uint32_t yield_at = EPIC_WAIT_YIELD_EVERY;
+
     /*Wait previous blending done.*/
-    while (hepic->Instance->STATUS != 0x0);
+    while (hepic->Instance->STATUS != 0x0)
+    {
+        if (--guard == 0u)
+        {
+            g_epic_wait_timeouts++;
+            break;
+        }
+
+        if (--yield_at == 0u)
+        {
+            yield_at = EPIC_WAIT_YIELD_EVERY;
+            EPIC_WAIT_YIELD();
+        }
+    }
 
 #else
     uint32_t cur_cnt, prev_cnt = hepic->Instance->PERF_CNT;
+    uint32_t guard = EPIC_WAIT_DONE_GUARD;
+    uint32_t yield_at = EPIC_WAIT_YIELD_EVERY;
+
     /*Wait previous blending done.*/
-    while (hepic->Instance->STATUS != 0x0);
+    while (hepic->Instance->STATUS != 0x0)
+    {
+        if (--guard == 0u)
+        {
+            g_epic_wait_timeouts++;   /* 有界：见上面的说明 */
+            break;
+        }
+
+        if (--yield_at == 0u)
+        {
+            yield_at = EPIC_WAIT_YIELD_EVERY;
+            EPIC_WAIT_YIELD();
+        }
+    }
     cur_cnt = hepic->Instance->PERF_CNT;
 
     hepic->WaitCnt += cur_cnt - prev_cnt;

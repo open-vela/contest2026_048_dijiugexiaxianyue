@@ -7,6 +7,12 @@
 
 #include "helm_font_lab.h"
 
+/* 字体试验页默认关闭（CMake option MYVENDOR_FONT_LAB，默认 OFF）：
+ * 关闭时下面 31 套 ftest_* 位图试验字体（~149 KB flash）不参与链接，
+ * 只保留同签名空实现，调用方无需改。 */
+
+#if defined(MYVENDOR_FONT_LAB) && MYVENDOR_FONT_LAB
+
 #include "fonts/ftest/ftest_fonts.h"
 #include "helm_font.h"
 #include "helm_palette.h"
@@ -185,3 +191,28 @@ lv_obj_t * helm_font_lab_build(lv_obj_t * parent)
     helm_font_lab_refresh();
     return s_ui.panel;
 }
+
+#else  /* !(defined(MYVENDOR_FONT_LAB) && MYVENDOR_FONT_LAB) */
+
+/* 关闭时的同签名空实现：菜单入口本身已被 #if 掉，这里只是让调用方
+ * （helm_menu.c 的可见性/按键分支）继续能编译、且都是 no-op。 */
+
+void helm_font_lab_refresh(void)
+{
+}
+
+void helm_font_lab_next(void)
+{
+}
+
+void helm_font_lab_prev(void)
+{
+}
+
+lv_obj_t * helm_font_lab_build(lv_obj_t * parent)
+{
+    (void)parent;
+    return NULL;
+}
+
+#endif /* MYVENDOR_FONT_LAB */

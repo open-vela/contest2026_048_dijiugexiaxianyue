@@ -736,6 +736,12 @@ void myvendor_mtp_lfs_release(const char *who)
   pthread_mutex_unlock(&g_mtp_lock);
 }
 
+/** @brief 设备 UI 是否停在 MTP 传输页（= quiesce 里"与 MTP 有关"的那个成因）。 */
+bool myvendor_mtp_page_active(void)
+{
+  return xfer_usb_page_active();
+}
+
 /** @brief 自行车/vmap 是否必须推迟 LittleFS I/O。 */
 bool myvendor_mtp_lfs_quiesce(void)
 {

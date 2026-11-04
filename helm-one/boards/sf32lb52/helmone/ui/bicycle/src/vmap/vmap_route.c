@@ -4,6 +4,7 @@
  */
 
 #include "vmap_route.h"
+#include "vmap_style.h"   /* 夜间（outdoor）路线改亮绿 ⇒ 需要当前地图风格 */
 
 #include "vmap_alloc.h"
 #include "vmap_route_log.h"
@@ -32,6 +33,25 @@ static double g_last_snap_src_m;
 static double g_last_snap_dst_m;
 static atomic_uint g_plan_steps;
 static atomic_uint g_plan_progress_ticks;
+
+/*
+ * 最近段搜索的段号提示（性能）。
+ *
+ * 实测 `[vperf] cyc_nav` = 26~35 ms/帧，而那是**每帧**在全部航点上重跑一遍
+ * 双精度"点到线段"搜索（约 0.45 ms/点：69 点 ≈ 31 ms，点更多按线性涨）。
+ * 稳态下骑行者就在上一次分割点附近，所以缓存段号、只搜它前后各
+ * VMAP_ROUTE_SEG_WINDOW 段。
+ *
+ * **自校验**：窗口内最近距离若大于 VMAP_ROUTE_SEG_SNAP_M，说明人不在这个窗口
+ * 附近（重规划 / 换路 / 跳到别处），立刻退回全量搜索；几何变了（点数不同）
+ * 也退回全量。所以退不到"用错段"上 —— 最坏情况就是退化成原来的行为。
+ * 同一份几何同时只有一个 route 在用，故文件级静态即可。
+ */
+#define VMAP_ROUTE_SEG_WINDOW  24u
+#define VMAP_ROUTE_SEG_SNAP_M  40.0
+
+static uint32_t s_paint_seg_hint;
+static uint32_t s_paint_hint_pts;
 
 /**
  * @brief 规划线程让出 CPU（约 4 ms），给 UI 刷新和 idle/IWDT 心跳。
@@ -93,6 +113,7 @@ struct vmap_route {
     vmap_route_graph_t * graph;
     vmap_view_t * view;
     vmap_route_pt_t pts[VMAP_ROUTE_MAX_PTS];
+    float along_m[VMAP_ROUTE_MAX_PTS];
     uint32_t pt_count;
     double total_m;
     vmap_route_maneuver_t maneuvers[VMAP_ROUTE_MAX_MANEUVERS];
@@ -926,7 +947,7 @@ bool vmap_route_plan(vmap_route_t * route, double from_lon, double from_lat,
  * "到了却不判到达"（现场：偏航 43 m、终点 171 m 外）。投影到边上之后，路线末端
  * 就落在你点的位置附近（同一条路上，不会画出一条离开道路的直线）。
  * 只动末点、并按差值修正总长；投影不在段内（t 贴边）就不动。 */
-static void route_pull_end_to_request(vmap_route_pt_t * pts, uint32_t n,
+static bool route_pull_end_to_request(vmap_route_pt_t * pts, uint32_t n,
     double * total_m, double lon, double lat)
 {
     double t = 0.0;
@@ -935,13 +956,13 @@ static void route_pull_end_to_request(vmap_route_pt_t * pts, uint32_t n,
     vmap_route_pt_t last;
 
     if (!pts || !total_m || n < 2u) {
-        return;
+        return false;
     }
 
     (void)vmap_geo_point_to_seg_m(lon, lat, pts[n - 2u].lon, pts[n - 2u].lat,
         pts[n - 1u].lon, pts[n - 1u].lat, &t);
     if (t <= 0.001 || t >= 0.999) {
-        return;
+        return false;
     }
 
     seg_old = vmap_geo_haversine_m(pts[n - 2u].lon, pts[n - 2u].lat,
@@ -951,11 +972,52 @@ static void route_pull_end_to_request(vmap_route_pt_t * pts, uint32_t n,
     seg_new = vmap_geo_haversine_m(pts[n - 2u].lon, pts[n - 2u].lat, last.lon,
         last.lat);
     if (seg_new < 1.0 || seg_new >= seg_old) {
-        return;
+        return false;
     }
 
     pts[n - 1u] = last;
     *total_m += (seg_new - seg_old);
+    return true;
+}
+
+/**
+ * @brief 把路线**首点**投到请求起点所在的第一段边上（同一条路上）。
+ *
+ * @details 与 `route_pull_end_to_request()` 对称：起点偏出路中心几米时，不画
+ *          一条从请求点斜插到路口的直线，而是把首点落到第一段的投影上。
+ * @return 投影落在段内并成功改点返回 true；否则 false（调用方才考虑补连接段）。
+ */
+static bool route_pull_start_to_request(vmap_route_pt_t * pts, uint32_t n,
+    double * total_m, double lon, double lat)
+{
+    double t = 0.0;
+    double seg_old;
+    double seg_new;
+    vmap_route_pt_t first;
+
+    if (!pts || !total_m || n < 2u) {
+        return false;
+    }
+
+    (void)vmap_geo_point_to_seg_m(lon, lat, pts[0].lon, pts[0].lat,
+        pts[1].lon, pts[1].lat, &t);
+    if (t <= 0.001 || t >= 0.999) {
+        return false;
+    }
+
+    seg_old = vmap_geo_haversine_m(pts[0].lon, pts[0].lat,
+        pts[1].lon, pts[1].lat);
+    first.lon = pts[0].lon + (pts[1].lon - pts[0].lon) * t;
+    first.lat = pts[0].lat + (pts[1].lat - pts[0].lat) * t;
+    seg_new = vmap_geo_haversine_m(first.lon, first.lat,
+        pts[1].lon, pts[1].lat);
+    if (seg_new < 1.0 || seg_new >= seg_old) {
+        return false;
+    }
+
+    pts[0] = first;
+    *total_m += (seg_new - seg_old);
+    return true;
 }
 
 bool vmap_route_compute_pins(vmap_route_graph_t * graph,
@@ -1091,12 +1153,18 @@ bool vmap_route_compute_pins(vmap_route_graph_t * graph,
             from_lon, from_lat, pts, pt_count, total_m, maneuvers, maneuver_cap,
             maneuver_count);
 
-        /* 折线首尾补上**请求的起终点**：snap 只吸到最近的"图节点"，而这张图的节点很稀
-         * （边可长达 500 m+），于是路线会在离终点最多半条边长的地方就断掉 —— 屏幕上
-         * 就是"轨迹线缺一段/离路"（实测终点偏 167 m）。这里在首尾各接一小段到真实
-         * 起终点，让线走到该走的位置；与节点重合（<1 m）时不加。 */
+        /* 折线首尾先用**投影**落到请求点所在的那条路上：请求点偏出路中心几米时，
+         * 不再画一条斜插到路口的小直线（用户 2026-11-03 现场："路口出现不在
+         * 地图上的折弯"）。投影落在段内才动；投影不到（请求点在那段路之外、
+         * 图节点太稀）才退回原来的"补一段到请求点"，避免老问题"线离终点差一节"。 */
         if (ok && pts && pt_count && *pt_count >= 2u) {
-            if (src_snap_m > 1.0 && src_snap_m <= VMAP_ROUTE_SNAP_MAX_M
+            const bool src_pulled = route_pull_start_to_request(pts, *pt_count,
+                total_m, from_lon, from_lat);
+            const bool dst_pulled = route_pull_end_to_request(pts, *pt_count,
+                total_m, to_lon, to_lat);
+
+            if (!src_pulled && src_snap_m > 1.0
+                && src_snap_m <= VMAP_ROUTE_SNAP_MAX_M
                 && *pt_count + 1u <= VMAP_ROUTE_MAX_PTS) {
                 uint32_t k;
 
@@ -1109,7 +1177,8 @@ bool vmap_route_compute_pins(vmap_route_graph_t * graph,
                 (*pt_count)++;
                 *total_m += src_snap_m;
             }
-            if (dst_snap_m > 1.0 && dst_snap_m <= VMAP_ROUTE_SNAP_MAX_M
+            if (!dst_pulled && dst_snap_m > 1.0
+                && dst_snap_m <= VMAP_ROUTE_SNAP_MAX_M
                 && *pt_count + 1u <= VMAP_ROUTE_MAX_PTS) {
                 pts[*pt_count].lon = to_lon;
                 pts[*pt_count].lat = to_lat;
@@ -1119,8 +1188,6 @@ bool vmap_route_compute_pins(vmap_route_graph_t * graph,
             }
         }
         if (ok) {
-            /* 末点投到请求点所在的边上（见 route_pull_end_to_request） */
-            route_pull_end_to_request(pts, *pt_count, total_m, to_lon, to_lat);
             VMAP_NAV_OUT("compute: ok pts=%u man=%u len=%.0fm",
                 *pt_count,
                 maneuver_count ? *maneuver_count : 0u,
@@ -1184,6 +1251,12 @@ void vmap_route_apply(vmap_route_t * route, const vmap_route_pt_t * pts,
 
     memcpy(route->pts, pts, (size_t)pt_count * sizeof(route->pts[0]));
     route->pt_count = pt_count;
+    route->along_m[0] = 0.0f;
+    for (uint32_t i = 1u; i < pt_count; i++) {
+        route->along_m[i] = route->along_m[i - 1u]
+            + (float)vmap_geo_haversine_m(route->pts[i - 1u].lon,
+                route->pts[i - 1u].lat, route->pts[i].lon, route->pts[i].lat);
+    }
     route->total_m = total_m;
     route->active = true;
 
@@ -1241,9 +1314,10 @@ bool vmap_route_splice_forward(vmap_route_t * route, double lon, double lat,
 
     vmap_route_set_progress_pos(route, lon, lat);
 
-    for (i = 0; i <= route->progress_seg && i < route->pt_count; i++) {
-        merged[merged_n++] = route->pts[i];
-    }
+    /* ⚠ 不要把旧路线"已骑过"的几何并进来（2026-11-03 用户现场："下方的小尾巴"）：
+     * 合并后那一段落在骑手**身后**，而绘制侧的红色已骑段/灰色 history 目前都是空实现
+     * ⇒ 进度分割没盖住时它就整段按蓝线画出来，像是路线多了一条尾巴。
+     * 只保留骑手投影点（作为新路线的起点），后面直接接新路线。 */
     if (merged_n < VMAP_ROUTE_MAX_PTS) {
         merged[merged_n].lon = route->progress_lon;
         merged[merged_n].lat = route->progress_lat;
@@ -1310,6 +1384,7 @@ void vmap_route_set_progress_match(vmap_route_t * route, double lon, double lat,
         seg_t = 1.0;
     }
 
+    route->progress_pos_seen = true;
     route->anchor_lon = lon;
     route->anchor_lat = lat;
     route->progress_seg = seg;
@@ -1447,11 +1522,111 @@ static void route_append_geo(const vmap_view_t * view, vmap_point_t * out,
     (*n)++;
 }
 
+/* 运行方向标的间距与形状（屏幕像素；见 route_paint_geo_range 里的调用）。
+ * 定位用**沿路线里程**（每 VMAP_ROUTE_CHEVRON_STEP_M 米一个）而不是点序号：
+ * 稀疏 GPX / 路网规划路线的点距可能几十到几百米，按点序号会把 ^ 拉成很远一个，
+ * 重绘窗口里经常一个都落不到（用户现场：蓝线开头很长一截没有 ^）。里程基准与
+ * 绘制范围起点无关 ⇒ 重绘像素一致，天然幂等。 */
+#define VMAP_ROUTE_CHEVRON_STEP_M  250.0
+#define VMAP_ROUTE_CHEVRON_MAX     24
+#define VMAP_ROUTE_CHEVRON_ARM_PX  8
+#define VMAP_ROUTE_CHEVRON_DEG     44.0
+
+/** @brief 沿屏幕方向画一个黑色 "^"：两臂各偏 ±35°、长 5 px、线宽 2。 */
+/**
+ * @brief 方向指示（"^" 瓦片）的颜色：日光=**黑**（一直是这个），夜间=**橙**。
+ *
+ * @note 用户 2026-09-27 定：黑的 ^ 在夜间那份深色地图上完全看不见 ⇒ 夜间改橙 #FF6E12
+ *       （RGB565 0xFB62）；日光保持原来的黑（浅色底上黑最清楚，也不必和蓝色路线较劲）。
+ *       判据与路线取色同源（地图风格，night = 夜间）。
+ * @return RGB565。
+ */
+static uint16_t route_chevron_rgb(void)
+{
+    return (vmap_style_get_id() == VMAP_STYLE_NIGHT) ? (uint16_t)0xFB62u
+                                                      : (uint16_t)0x0000u;
+}
+
+static void route_draw_chevron(vmap_canvas_t * canvas, int32_t x, int32_t y,
+    double ang_rad)
+{
+    const double half = VMAP_ROUTE_CHEVRON_DEG * (3.14159265358979323846 / 180.0);
+    int s;
+
+    for (s = -1; s <= 1; s += 2) {
+        const double a = ang_rad + 3.14159265358979323846 + (double)s * half;
+        vmap_point_t arm[2];
+
+        arm[0].x = x;
+        arm[0].y = y;
+        arm[1].x = (int32_t)((double)x + cos(a) * VMAP_ROUTE_CHEVRON_ARM_PX + 0.5);
+        arm[1].y = (int32_t)((double)y + sin(a) * VMAP_ROUTE_CHEVRON_ARM_PX + 0.5);
+        /* 方向指示（"^"）：日光黑、夜间橙 —— 见 route_chevron_rgb() 的注释。 */
+        vmap_render_stroke_ribbon(canvas, arm, 2, 2, route_chevron_rgb());
+    }
+}
+
+/**
+ * @brief 导航线（未走过部分）的颜色：日光=蓝，夜间（深色地图）=**亮绿**。
+ *
+ * @note 用户 2026-09-27：夜间那份地图的水面也是蓝的，蓝色路线和水面糊在一起 ⇒ 夜间改亮绿。
+ *       判据用**地图风格**（night = 夜间深色地图，见 bicycle_pm_theme.c 的映射），
+ *       与其它取色同源；日光仍走 `VMAP_ROUTE_LINE_RGB565`。
+ * @return RGB565。
+ */
+static uint16_t route_line_rgb(void)
+{
+    /* #00E676（Material 亮绿）⇒ RGB565：r=0<<11 | g=(230>>2)<<5 | b=(118>>3) = 0x072E */
+    return (vmap_style_get_id() == VMAP_STYLE_NIGHT) ? (uint16_t)0x072Eu
+                                                      : VMAP_ROUTE_LINE_RGB565;
+}
+
+/* —— 路线/箭头的擦除记账 ——
+ * 覆盖层是烘进常驻画布的：瓦片重贴会盖掉线（该补画），但**几何跳变**（GPX 窗口续载、
+ * 跟车重锚、容器尺寸变化）会让旧位置的墨迹没人擦，留下残影（用户 2026-09-25 实测：
+ * "每进一次地图就多烘一份"）。做法与路名标注一致：记下这一帧画过的屏幕框与分割点，
+ * 下一次发现分割点**跳变**就把旧框并进脏区，让瓦片在那儿重贴一遍。
+ * 只在跳变时发生（不是每拍），所以代价可控。 */
+static lv_area_t s_route_box;
+static int32_t   s_route_split_x;
+static int32_t   s_route_split_y;
+static bool      s_route_box_valid;
+
+static void route_note_box(lv_area_t * box, int32_t x1, int32_t y1, int32_t x2,
+    int32_t y2)
+{
+    if (x1 > x2) {
+        const int32_t t = x1;
+
+        x1 = x2;
+        x2 = t;
+    }
+    if (y1 > y2) {
+        const int32_t t = y1;
+
+        y1 = y2;
+        y2 = t;
+    }
+    box->x1 = (box->x1 < x1) ? box->x1 : x1;
+    box->y1 = (box->y1 < y1) ? box->y1 : y1;
+    box->x2 = (box->x2 > x2) ? box->x2 : x2;
+    box->y2 = (box->y2 > y2) ? box->y2 : y2;
+}
+
 static void route_paint_geo_range(const vmap_view_t * view, vmap_canvas_t * canvas,
-    const vmap_route_pt_t * pts, uint32_t begin, uint32_t end,
-    double extra_lon, double extra_lat, bool extra_first, uint16_t rgb565)
+    const vmap_route_pt_t * pts, const float * along, uint32_t begin, uint32_t end,
+    double extra_lon, double extra_lat, double extra_along, bool extra_first,
+    uint16_t rgb565)
 {
     vmap_point_t px[256];
+    vmap_point_t chev[VMAP_ROUTE_CHEVRON_MAX];
+    double chev_ang[VMAP_ROUTE_CHEVRON_MAX];
+    int32_t chev_n = 0;
+    double prev_along = 0.0;
+    double next_mark = 0.0;
+    int32_t start_x = 0;
+    int32_t start_y = 0;
+    bool have_start = false;
     int32_t n = 0;
     uint32_t i;
 
@@ -1459,19 +1634,133 @@ static void route_paint_geo_range(const vmap_view_t * view, vmap_canvas_t * canv
         return;
     }
 
+    lv_area_t new_box = { INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN };
+    const bool chevrons = extra_first && along != NULL;
+
     if (extra_first) {
         route_append_geo(view, px, &n, (int32_t)(sizeof(px) / sizeof(px[0])),
             extra_lon, extra_lat, true);
+        if (n > 0) {
+            /* 分块落线会覆盖 px[0]；骑手投影点先单独留一份给跳变记账。 */
+            start_x = px[0].x;
+            start_y = px[0].y;
+            have_start = true;
+        }
+    }
+
+    if (chevrons) {
+        prev_along = extra_along;
+        next_mark = ceil(prev_along / VMAP_ROUTE_CHEVRON_STEP_M)
+            * VMAP_ROUTE_CHEVRON_STEP_M;
+        if (next_mark <= prev_along) {
+            next_mark += VMAP_ROUTE_CHEVRON_STEP_M;
+        }
+    } else if (along != NULL && begin > 0u) {
+        prev_along = (double)along[begin - 1u];
     }
 
     for (i = begin; i < end; i++) {
         const bool last = (i + 1u == end);
+        const int32_t before = n;
 
         route_append_geo(view, px, &n, (int32_t)(sizeof(px) / sizeof(px[0])),
             pts[i].lon, pts[i].lat, last);
+
+        if (!have_start && n > before) {
+            /* 骑手投影点被范围检查拒绝时的兜底：用第一个真正落线的点当分割点，
+             * 同时把里程基准挪到它身上，避免不可见区段的 ^ 挤到第一段上。 */
+            start_x = px[n - 1].x;
+            start_y = px[n - 1].y;
+            have_start = true;
+            if (chevrons && along != NULL) {
+                prev_along = (double)along[i];
+                next_mark = ceil(prev_along / VMAP_ROUTE_CHEVRON_STEP_M)
+                    * VMAP_ROUTE_CHEVRON_STEP_M;
+                if (next_mark <= prev_along) {
+                    next_mark += VMAP_ROUTE_CHEVRON_STEP_M;
+                }
+            }
+        }
+
+        if (n > before && n >= 2) {
+            const int32_t k = n - 1;
+            const double dx = (double)(px[k].x - px[k - 1].x);
+            const double dy = (double)(px[k].y - px[k - 1].y);
+            const double seg_m = (along != NULL) ? (double)along[i] - prev_along
+                                                 : 0.0;
+
+            /* ^ 按沿路线里程取（不是点序号）：稀疏 GPX / 路网路线点距变化很大，
+             * 点序号会把 ^ 拉成几百米一个；里程基准与绘制起点无关，重绘幂等。 */
+            if (chevrons && along != NULL) {
+                while (chev_n < VMAP_ROUTE_CHEVRON_MAX
+                    && next_mark <= (double)along[i]) {
+                    double t = (seg_m > 0.0)
+                        ? (next_mark - prev_along) / seg_m : 1.0;
+
+                    if (t < 0.0) {
+                        t = 0.0;
+                    } else if (t > 1.0) {
+                        t = 1.0;
+                    }
+                    chev[chev_n].x = px[k - 1].x + (int32_t)lround(dx * t);
+                    chev[chev_n].y = px[k - 1].y + (int32_t)lround(dy * t);
+                    chev_ang[chev_n] = atan2(dy, dx);
+                    chev_n++;
+                    next_mark += VMAP_ROUTE_CHEVRON_STEP_M;
+                }
+            }
+            if (along != NULL) {
+                prev_along = (double)along[i];
+            }
+            route_note_box(&new_box, px[k - 1].x, px[k - 1].y, px[k].x, px[k].y);
+
+            /* px 满之前先落一遍线，末点留作下一块的首点：route_append_geo 在
+             * 满容量时会覆盖末点，旧 ^ 会悬在已被替换的线段上。 */
+            if (n >= (int32_t)(sizeof(px) / sizeof(px[0])) && i + 1u < end) {
+                route_stroke_px(canvas, px, n, rgb565);
+                px[0] = px[n - 1];
+                n = 1;
+            }
+        }
     }
 
     route_stroke_px(canvas, px, n, rgb565);
+
+    /* ^ 画在蓝线之后：黑/橙两臂压在蓝线上才看得清（原来先画线后画 ^，
+     * 线把 ^ 的中心盖掉了）。 */
+    for (i = 0; i < (uint32_t)chev_n; i++) {
+        route_draw_chevron(canvas, chev[i].x, chev[i].y, chev_ang[i]);
+        route_note_box(&new_box, chev[i].x - VMAP_ROUTE_CHEVRON_ARM_PX,
+            chev[i].y - VMAP_ROUTE_CHEVRON_ARM_PX,
+            chev[i].x + VMAP_ROUTE_CHEVRON_ARM_PX,
+            chev[i].y + VMAP_ROUTE_CHEVRON_ARM_PX);
+    }
+
+    if (extra_first && have_start && new_box.x2 >= new_box.x1) {
+        /* 分割点跳变判定：以路线起点（骑手位置投影）为准，阈值取半个屏宽 ——
+         * 小于它的移动都属于跟车滚动，滚动脏条已经覆盖。 */
+        const int32_t sx = start_x;
+        const int32_t sy = start_y;
+        int32_t jx = sx - s_route_split_x;
+        int32_t jy = sy - s_route_split_y;
+
+        if (jx < 0) {
+            jx = -jx;
+        }
+        if (jy < 0) {
+            jy = -jy;
+        }
+        if (s_route_box_valid && (jx > 120 || jy > 120)) {
+            vmap_view_invalidate_canvas_area(view, s_route_box.x1, s_route_box.y1,
+                s_route_box.x2, s_route_box.y2);
+        }
+        if (new_box.x2 >= new_box.x1) {
+            s_route_box = new_box;
+            s_route_box_valid = true;
+        }
+        s_route_split_x = sx;
+        s_route_split_y = sy;
+    }
 }
 
 static void route_history_append_pt(vmap_route_t * route, double lon, double lat)
@@ -2022,8 +2311,8 @@ void vmap_route_paint_to_canvas(vmap_route_t * route, vmap_canvas_t * canvas,
     }
 
     if (route->review) {
-        route_paint_geo_range(view, canvas, pts, 0, n, 0.0, 0.0, false,
-            VMAP_ROUTE_RIDDEN_RGB565);
+        route_paint_geo_range(view, canvas, pts, route->along_m, 0, n,
+            0.0, 0.0, 0.0, false, VMAP_ROUTE_RIDDEN_RGB565);
         route_paint_marker(view, canvas, pts[0].lon, pts[0].lat,
             (uint16_t)0xFFFFu, (uint16_t)0x07C0u, 6, 4);
         route_paint_marker(view, canvas, pts[n - 1u].lon, pts[n - 1u].lat,
@@ -2048,8 +2337,22 @@ void vmap_route_paint_to_canvas(vmap_route_t * route, vmap_canvas_t * canvas,
         double best_d = 1e18;
         double plon = route->progress_lon;
         double plat = route->progress_lat;
+        uint32_t lo = 0u;
+        uint32_t hi = n - 2u;
+        bool windowed = false;
 
-        for (uint32_t i = 0; i + 1u < n; i++) {
+        if (n == s_paint_hint_pts && s_paint_seg_hint <= n - 2u) {
+            const uint32_t w = VMAP_ROUTE_SEG_WINDOW;
+
+            lo = (s_paint_seg_hint > w) ? (s_paint_seg_hint - w) : 0u;
+            hi = s_paint_seg_hint + w;
+            if (hi > n - 2u) {
+                hi = n - 2u;
+            }
+            windowed = true;
+        }
+
+        for (uint32_t i = lo; i <= hi; i++) {
             double t = 0.0;
             const double d = vmap_geo_point_to_seg_m(plon, plat,
                 pts[i].lon, pts[i].lat, pts[i + 1u].lon, pts[i + 1u].lat, &t);
@@ -2060,6 +2363,25 @@ void vmap_route_paint_to_canvas(vmap_route_t * route, vmap_canvas_t * canvas,
                 seg = i;
             }
         }
+
+        if (windowed && best_d > VMAP_ROUTE_SEG_SNAP_M) {
+            /* 窗口里没有可信的近段 ⇒ 全量重搜：换窗口 / 重规划 / 跳点都在这兜住，
+             * 最坏退化成优化前的行为。 */
+            for (uint32_t i = 0; i + 1u < n; i++) {
+                double t = 0.0;
+                const double d = vmap_geo_point_to_seg_m(plon, plat,
+                    pts[i].lon, pts[i].lat, pts[i + 1u].lon, pts[i + 1u].lat, &t);
+
+                if (d < best_d) {
+                    best_d = d;
+                    best_t = t;
+                    seg = i;
+                }
+            }
+        }
+
+        s_paint_seg_hint = seg;
+        s_paint_hint_pts = n;
 
         /* 诊断（限频 ~2 s）：把分割结果打出来，一眼看出是"没进度点"还是"分割算错" */
         {
@@ -2075,17 +2397,21 @@ void vmap_route_paint_to_canvas(vmap_route_t * route, vmap_canvas_t * canvas,
         }
 
         if (seg + 1u < n) {
+            const double progress_along = (double)route->along_m[seg]
+                + best_t * (double)(route->along_m[seg + 1u]
+                    - route->along_m[seg]);
+
             /* 投影点贴在本段中心附近时，把"本段"也整段刷灰，避免留下蓝色小尾巴 */
             if (best_t >= 0.5) {
             }
-            route_paint_geo_range(view, canvas, pts, seg + 1u, n,
-                plon, plat, true, VMAP_ROUTE_LINE_RGB565);
+            route_paint_geo_range(view, canvas, pts, route->along_m, seg + 1u, n,
+                plon, plat, progress_along, true, route_line_rgb());
             goto paint_pins;   /* 别直接 return：点位在函数末尾画 */
         }
     }
 
-    route_paint_geo_range(view, canvas, pts, 0, n, 0.0, 0.0, false,
-        VMAP_ROUTE_LINE_RGB565);
+    route_paint_geo_range(view, canvas, pts, route->along_m, 0, n,
+        0.0, 0.0, 0.0, false, route_line_rgb());
 
 paint_pins:
     /* 点位一律画在**最后**：线条在点下面（用户要求）。 */

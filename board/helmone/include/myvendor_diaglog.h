@@ -1,8 +1,7 @@
-/****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/my_vendor/include/myvendor_diaglog.h
- *
- * 日志落盘：RAM 环缓冲 + 定期写入 /mnt/kv/diag/（**自己的目录**，与崩溃转储
- * /mnt/kv/coredump 分开；命名沿用 coredump 那套，前缀 d）。
+/**
+ * @file myvendor_diaglog.h
+ * @brief 日志落盘：RAM 环缓冲 + 定期写入 /mnt/kv/diag/（**自己的目录**，与崩溃转储
+ *        /mnt/kv/coredump 分开；命名沿用 coredump 那套，前缀 d）。
  *
  * 实现方式是注册一个 **syslog channel**，只往 RAM 环里搬字节、不做任何 I/O，
  * 因此：
@@ -16,11 +15,13 @@
  * 落盘策略（按规格）：
  *   - **每次开机一个文件**；同一次开机跨天则**按天再开一个**；
  *   - 目录里**最多 10 个**，超出按时间删最旧（与 coredump 同一套做法）；
+ *     运行期还会周期性补清一次（myvendor_diaglog_prune()），并把 `seq` 与日志
+ *     之外的东西一律当垃圾清掉；
  *   - 死机时由 coredump 那条路把环里尚未落盘的内容一起写出去
  *     （见 myvendor_diaglog_snapshot()）。
  *
  * SPDX-License-Identifier: Apache-2.0
- ****************************************************************************/
+ */
 
 #ifndef __MYVENDOR_DIAGLOG_H
 #define __MYVENDOR_DIAGLOG_H
@@ -65,6 +66,20 @@ int myvendor_diaglog_flush(void);
  * @return 环内待写字节数（0 表示已落盘干净）。
  */
 size_t myvendor_diaglog_pending(void);
+
+/**
+ * @brief 运行期周期性清理入口（线程上下文；内部限频，默认 10 分钟）。
+ *
+ * @details 为什么需要它（2026-09-25 用户反馈"diag 文件一直累加"）：清理原先只在
+ *          **开机**与**按天滚动**时跑 —— 只要设备不重启、不跨天，目录就只涨不落；
+ *          而且旧实现失败时静默 break，堆到把 `/mnt/kv` 撑满也无人知晓。
+ *          本入口由 diag 线程每拍调用，自身限频，超量时按**最小序号/最老戳**删到
+ *          `DIAGLOG_KEEP` 个，失败一律 WARNING 出声（与 `[coredump] prune stuck` 同形）。
+ *          顺带兼容早期命名 `n*`（本目录曾沿用 coredump 的前缀）。
+ *
+ * @return 0（清理失败不影响调用方）。
+ */
+int myvendor_diaglog_prune(void);
 
 /**
  * @brief 取一份环内文本快照（纯内存拷贝，无 I/O）。

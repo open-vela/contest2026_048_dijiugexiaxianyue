@@ -40,17 +40,6 @@ PREVIEW = os.path.join(HERE, "boot_logo_preview_80.png")
 PREVIEW_PX = os.path.join(HERE, "boot_logo_preview_80x4.png")
 
 
-def _safe_out(path: str) -> str:
-    """输出路径下限保护：拒绝含 `..` 的路径并落到绝对路径。
-
-    这些工具会写生成物（splash / logo 的 .c），路径虽来自本文件的常量，
-    但作为"接受路径参数"的下限保护保留 —— 也避免安全扫描把这类写入判成路径穿越。
-    """
-    if ".." in path.split(os.sep):
-        raise SystemExit(f"拒绝写到含 .. 的路径: {path}")
-    return os.path.abspath(path)
-
-
 def _split_rgba(im: Image.Image):
     im = im.convert("RGBA")
     w, h = im.size
@@ -196,7 +185,6 @@ def c_bytes(data: bytes, per_line: int = 16) -> str:
 
 
 def write_splash(path: str, rgb565: bytes, w: int, h: int) -> None:
-    path = _safe_out(path)
     body = f"""/**
  * @file boot_splash_img.c
  * @brief {w}x{h} RGB565 splash (black-composited). From 三幅.png (LANCZOS).
@@ -226,7 +214,6 @@ const sgl_pixmap_t pic1_pixmap = {{
 
 
 def write_lvgl(path: str, blob: bytes, w: int, h: int) -> None:
-    path = _safe_out(path)
     body = f"""/**
  * @file img_src_boot_logo.c
  * @brief {w}x{h} RGB565A8 splash. Same art as 2SFBL pic1 RGB565.

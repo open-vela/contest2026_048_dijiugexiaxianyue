@@ -25,16 +25,16 @@
 
 ```bash
 git -C apps rev-parse HEAD:graphics/lvgl/CMakeLists.txt HEAD:graphics/lvgl/Makefile      # 应等于上表两个 blob
-git -C apps apply --check ../vendor/my_vendor/docs/pitch/patches/apps-lvgl-myvendor-stack.patch
+git -C apps apply --check ../vendor/HelmOne/docs/pitch/patches/apps-lvgl-myvendor-stack.patch
 git -C apps/graphics/lvgl/lvgl rev-parse HEAD:Kconfig                                    # 应为 0188e9d4…
-git -C apps/graphics/lvgl/lvgl apply --check ../vendor/my_vendor/docs/pitch/patches/apps-lvgl-kconfig.patch
+git -C apps/graphics/lvgl/lvgl apply --check ../vendor/HelmOne/docs/pitch/patches/apps-lvgl-kconfig.patch
 ```
 
 ### 文件③ `Kconfig` 为什么必须打（2026-09-19 实测踩过）
 
 本板的 `CONFIG_LV_*` 全部来自 `apps/graphics/lvgl/Kconfig` 里那行
 `osource "$APPSDIR/graphics/lvgl/lvgl/Kconfig"` —— 也就是说 **config 生成读的是官方（上游）LVGL 树的 Kconfig**，
-哪怕真正参与编译的源码在 `vendor/my_vendor/apps/graphics/lvgl/`。上游那版是旧 LVGL 的，缺
+哪怕真正参与编译的源码在 `vendor/HelmOne/apps/graphics/lvgl/`。上游那版是旧 LVGL 的，缺
 `LV_SUNDAY_STR`/`LV_MONDAY_STR` 等符号，于是 config 里没有它们，而 vendor 的 9.5 源码在
 `widgets/calendar/lv_calendar.c` 里要用：
 
@@ -59,7 +59,7 @@ HEAD 动了但 blob 没动 ⇒ 两个脚本没被改过，照下面的前后对�
 本板 `CONFIG_MYVENDOR_LVGL_STACK=y`。真正的 LVGL 9.5 + NuttX 移植 + EPIC 在：
 
 ```
-vendor/my_vendor/apps/graphics/lvgl/
+vendor/HelmOne/apps/graphics/lvgl/
 ```
 
 由板级 CMake 拉进构建：
@@ -69,7 +69,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../../apps/graphics/lvgl
                myvendor_lvgl)
 ```
 
-（`boards/sf32lb52/my_vendor/CMakeLists.txt`）
+（`boards/sf32lb52/helmone/CMakeLists.txt`）
 
 与此同时，OpenVela 仍会处理 **官方** `apps/graphics/lvgl/CMakeLists.txt`。那边在 `CONFIG_GRAPHICS_LVGL` 下会 `nuttx_add_library(lvgl)`。两个脚本都会定义同一个 `lvgl` target → CMake 配置失败。
 
@@ -114,7 +114,7 @@ endif()
   endif()
 ```
 
-`NUTTX_CHIP_ABS_DIR` 在本板是 `vendor/my_vendor/chips/sf32lb52`，`../drivers` 即 chip 驱动树。
+`NUTTX_CHIP_ABS_DIR` 在本板是 `vendor/HelmOne/chips/sf32lb52`，`../drivers` 即 chip 驱动树。
 
 ### 3. `Makefile`：同样的 EPIC 头
 
@@ -203,9 +203,9 @@ OpenVela 根目录。
 **覆盖：**
 
 ```bash
-cp vendor/my_vendor/docs/pitch/replace/apps/graphics/lvgl/CMakeLists.txt \
+cp vendor/HelmOne/docs/pitch/replace/apps/graphics/lvgl/CMakeLists.txt \
    apps/graphics/lvgl/CMakeLists.txt
-cp vendor/my_vendor/docs/pitch/replace/apps/graphics/lvgl/Makefile \
+cp vendor/HelmOne/docs/pitch/replace/apps/graphics/lvgl/Makefile \
    apps/graphics/lvgl/Makefile
 ```
 
@@ -213,7 +213,7 @@ cp vendor/my_vendor/docs/pitch/replace/apps/graphics/lvgl/Makefile \
 
 ```bash
 git -C apps apply \
-  ../vendor/my_vendor/docs/pitch/patches/apps-lvgl-myvendor-stack.patch
+  ../vendor/HelmOne/docs/pitch/patches/apps-lvgl-myvendor-stack.patch
 ```
 
 补丁相对 `apps/` 仓库根，路径是 `graphics/lvgl/...`。
@@ -246,4 +246,4 @@ CMake 配置日志里不应再出现重复 target `lvgl`。应能看到 vendor �
 |------|------|
 | 把官方 `apps/graphics/lvgl/lvgl/` 整树换成 vendor 的 9.5 | 脏工作区，官方脚本已 `return()`，编译用不到 |
 | 改官方 `apps/graphics/lvgl/Kconfig` 关掉 GRAPHICS_LVGL | 本板仍可能依赖部分 LV 符号；用 `MYVENDOR_LVGL_STACK` 门控即可 |
-| 把 EPIC 头写进 `nuttx` 或 chip 以外的公共树 | 头文件已在 `vendor/my_vendor/chips/sf32lb52/../drivers` |
+| 把 EPIC 头写进 `nuttx` 或 chip 以外的公共树 | 头文件已在 `vendor/HelmOne/chips/sf32lb52/../drivers` |

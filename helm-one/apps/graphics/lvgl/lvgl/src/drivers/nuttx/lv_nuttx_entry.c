@@ -303,10 +303,27 @@ static uint32_t millis(void)
 }
 
 #if LV_USE_LOG
+/**
+ * @brief LVGL 日志出口 → `syslog()`（由 `lv_nuttx_init()` 注册的 print 回调）。
+ *
+ * @details 只做两件事：加 `[LVGL] ` 标签（便于按模块过滤）、把 LVGL 档位映射成
+ *          syslog 档位。板级策略是"界面层只走 LVGL 日志、不直接调 syslog"，
+ *          所以这里是 UI 日志唯一的系统出口。
+ *
+ * @note 2026-09-25：板级只改上游一处不合理映射 —— `LV_LOG_LEVEL_USER` 原来是
+ *       **LOG_CRIT**（上游取值），而界面框架原先用 `LV_LOG()`（走 USER 档）打进度
+ *       ⇒ 整屏 `[ CRIT]` 红色。
+ *
+ *       ⚠ 这张表**不是**压日志的杠杆（别在这里做过滤）：它能决定"报出去的级别"，
+ *       但 USER/`LV_LOG()` 的编译与否则由 `LV_LOG_LEVEL` 决定（见 lv_log.h），
+ *       而且字符串照样进镜像。要"不要这些日志 + 字符串也别进镜像"，
+ *       正确做法是**我们自己代码不用 `LV_LOG_USER()`/`LV_LOG()`，改用标准档位**
+ *       （INFO/WARN/ERROR），让 `CONFIG_LV_LOG_LEVEL`（本板 = WARN）按档位整段编译掉。
+ */
 static void syslog_print(lv_log_level_t level, const char * buf)
 {
     static const int priority[LV_LOG_LEVEL_NUM] = {
-        LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERR, LOG_CRIT
+        LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERR, LOG_INFO
     };
 
     syslog(priority[level], "[LVGL] %s", buf);

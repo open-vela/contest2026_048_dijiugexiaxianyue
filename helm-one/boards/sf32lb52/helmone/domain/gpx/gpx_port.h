@@ -235,6 +235,7 @@ int gpx_port_file_open_append(gpx_port_file_t *file, const char *path);
  * @param file  文件句柄
  * @return 0 成功，负 errno 失败
  */
+/* Write failure retains cache/fd: retry close; do not overwrite the handle. */
 int gpx_port_file_close(gpx_port_file_t *file);
 
 /**

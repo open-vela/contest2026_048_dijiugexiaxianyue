@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/myvendor_idle_stat.c
+ * vendor/HelmOne/chips/sf32lb52/myvendor_idle_stat.c
  *
  * True idle: DWT cycles accumulated across WFI in up_idle().
  * On-demand measurement via test idle (no background syslog).

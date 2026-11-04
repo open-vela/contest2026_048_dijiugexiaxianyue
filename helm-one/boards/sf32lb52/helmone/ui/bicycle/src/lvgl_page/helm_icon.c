@@ -24,6 +24,8 @@ typedef struct {
     int32_t oy;
     int32_t w;
     int32_t stroke;
+    /** 绘制透明度（取自对象的 style opa；见 helm_aa_draw 的注释）。 */
+    lv_opa_t opa;
 } helm_pen_t;
 
 static int32_t helm_sx(const helm_pen_t * p, int x)
@@ -43,7 +45,7 @@ static void helm_pen_line(const helm_pen_t * p, int x1, int y1, int x2, int y2)
     lv_draw_line_dsc_init(&d);
     d.color = p->color;
     d.width = p->stroke;
-    d.opa = LV_OPA_COVER;
+    d.opa = p->opa;
     d.round_start = 0;
     d.round_end = 0;
     d.p1.x = helm_sx(p, x1);
@@ -74,7 +76,7 @@ static void helm_pen_circle(const helm_pen_t * p, int cx, int cy, int r)
     lv_draw_arc_dsc_init(&d);
     d.color = p->color;
     d.width = p->stroke;
-    d.opa = LV_OPA_COVER;
+    d.opa = p->opa;
     d.center.x = helm_sx(p, cx);
     d.center.y = helm_sy(p, cy);
     d.radius = (uint16_t)((r * p->w + 12) / 24);
@@ -95,7 +97,7 @@ static void helm_pen_arc(const helm_pen_t * p, int cx, int cy, int r,
     lv_draw_arc_dsc_init(&d);
     d.color = p->color;
     d.width = p->stroke;
-    d.opa = LV_OPA_COVER;
+    d.opa = p->opa;
     d.center.x = helm_sx(p, cx);
     d.center.y = helm_sy(p, cy);
     d.radius = (uint16_t)((r * p->w + 12) / 24);
@@ -219,13 +221,17 @@ static uint8_t helm_aa_px(const uint8_t * map, int x, int y)
 }
 
 static void helm_aa_draw(lv_layer_t * layer, int32_t ox, int32_t oy, int scale,
-                         const uint8_t * map, lv_color_t color)
+                         const uint8_t * map, lv_color_t color, lv_opa_t opa)
 {
     lv_draw_rect_dsc_t d;
     int y;
 
     lv_draw_rect_dsc_init(&d);
     d.bg_color = color;
+    /* ⚠ 透明度必须由**调用方**传进来：图标是自绘的，`lv_obj_set_style_opa(obj)` 对这个
+     * 自绘路径不生效（对象本身没有自己的绘制内容可被叠加）⇒ 状态栏"透明显隐"的闪烁要靠这里
+     * （用户 2026-09-27：要求闪烁用透明度、不要隐藏，因为隐藏会让 flex 把邻居挤动）。 */
+    d.bg_opa = opa;
     d.border_width = 0;
     d.radius = 0;
     for (y = 0; y < HELM_DOT_N; y++) {
@@ -246,7 +252,10 @@ static void helm_aa_draw(lv_layer_t * layer, int32_t ox, int32_t oy, int scale,
                 x++;
             }
 
-            d.bg_opa = s_aa_opa[v];
+            /* ⚠ 这里是**逐像素**写 alpha（AA 覆盖度）——所以上面传进来的 `opa` 必须在这里
+             * **相乘**，否则会被整段盖掉（状态栏"透明显隐"的闪烁就是这么失效的：
+             * 用户 2026-09-27 实测"变成黄色但没闪烁"）。opa=COVER 时与原来逐像素等价。 */
+            d.bg_opa = (lv_opa_t)(((unsigned)s_aa_opa[v] * (unsigned)opa) / 255u);
             a.x1 = ox + x0 * scale;
             a.y1 = oy + y * scale;
             a.x2 = ox + x * scale - 1;
@@ -585,13 +594,15 @@ static void helm_icon_draw(lv_event_t * e)
                 dw = HELM_DOT_N * scale;
                 ox = coords.x1 + (w - dw) / 2;
                 oy = coords.y1 + (h - dw) / 2;
-                helm_aa_draw(layer, ox, oy, scale, map, color);
+                helm_aa_draw(layer, ox, oy, scale, map, color,
+                             lv_obj_get_style_opa(obj, 0));
                 return;
             }
         }
     }
 
     pen.layer = layer;
+    pen.opa = lv_obj_get_style_opa(obj, 0);
     pen.color = lv_obj_get_style_text_color(obj, 0);
     pen.w = w < h ? w : h;
     pen.ox = coords.x1 + (w - pen.w) / 2;
@@ -631,6 +642,12 @@ void helm_icon_set(lv_obj_t * obj, helm_ico_id_t id)
 void helm_icon_set_color(lv_obj_t * obj, lv_color_t color)
 {
     if (obj == NULL) {
+        return;
+    }
+
+    /* 同色直接返回：图标是自绘字形（helm_icon_draw 每次重画），
+     * 重复设色 = 重复重画整个矢量字形，白花时间。 */
+    if (lv_color_eq(lv_obj_get_style_text_color(obj, 0), color)) {
         return;
     }
 

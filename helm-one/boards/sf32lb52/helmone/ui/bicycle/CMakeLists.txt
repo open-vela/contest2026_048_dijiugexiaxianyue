@@ -6,6 +6,12 @@
 # Bicycle for SF32LB52 + /dev/lcd0 — pure C UI (lv_pm + vmap + MTP overlay).
 # ##############################################################################
 
+# 字体试验页（设置 → 测试 → 字体试验）：31 个 ftest_*.c 位图试验字体 +
+# helm_font_lab.c 的页面实现。默认 OFF，只为量产量身字体时打开（如
+# `cmake -DMYVENDOR_FONT_LAB=ON`）。关闭时 helm_font_lab.c 编空实现、
+# 菜单入口不显示，ftest 字体不进镜像。
+option(MYVENDOR_FONT_LAB "Build the 字体试验 page with ftest bitmap fonts" OFF)
+
 if(CONFIG_MYVENDOR_BICYCLE)
   set(BICYCLE_PROGNAME bicycle)
   set(BICYCLE_STACKSIZE ${CONFIG_MYVENDOR_BICYCLE_STACKSIZE})
@@ -24,6 +30,11 @@ if(CONFIG_MYVENDOR_BICYCLE)
     "CONFIG_RESOURCE_DIR_PATH=\"${BICYCLE_RESOURCE_DIR}\"")
   add_compile_definitions(CONFIG_RESOURCE_FS_LETTER="")
   add_compile_definitions(MYVENDOR_BICYCLE_NATIVE_FONT=1)
+  if(MYVENDOR_FONT_LAB)
+    add_compile_definitions(MYVENDOR_FONT_LAB=1)
+  else()
+    add_compile_definitions(MYVENDOR_FONT_LAB=0)
+  endif()
   add_compile_definitions(BICYCLE_STABILITY_PROBE=0 BICYCLE_TS_OVERLAY=0)
   add_compile_definitions(
     "CONFIG_VMAP_DIR_PATH=\"/mnt/fat/map\"")
@@ -62,9 +73,13 @@ if(CONFIG_MYVENDOR_BICYCLE)
     ${BICYCLE_DIR}/src/lvgl_page/helm_idle.c
     ${BICYCLE_DIR}/src/lvgl_page/helm_toolbox.c
     ${BICYCLE_DIR}/src/lvgl_page/helm_font.c
+    ${BICYCLE_DIR}/src/lvgl_page/helm_palette.c
     ${BICYCLE_DIR}/src/lvgl_page/helm_font_lab.c
+    # Material 图标字体（状态栏 14px）：码点/名称映射（字形在 fonts/ 段）。
+    ${BICYCLE_DIR}/src/lvgl_page/helm_icons.c
     ${BICYCLE_DIR}/src/lvgl_page/helm_icon.c
     ${BICYCLE_DIR}/src/lvgl_page/helm_widget.c
+    ${BICYCLE_DIR}/src/lvgl_page/helm_anim.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_ui_12.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_ui_15.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_ui_22.c
@@ -74,9 +89,15 @@ if(CONFIG_MYVENDOR_BICYCLE)
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_ui_64.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_num_28.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_num_32.c
+    ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_num_40.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_num_56.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_num_64.c
     ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_fa_16.c
+    # Material 图标字形：14px（备用）/ **16px（状态栏原生）** / 20px / 26px（备用）。
+    ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_icons_14.c
+    ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_icons_16.c
+    ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_icons_20.c
+    ${BICYCLE_DIR}/src/lvgl_page/fonts/helm_icons_26.c
     ${BICYCLE_DIR}/src/lvgl_page/live_map/map_page.c
     ${BICYCLE_DIR}/src/lvgl_page/usb_transfer/usb_transfer_page.c
     ${BICYCLE_DIR}/src/lvgl_page/startup/startup_page.c
@@ -90,6 +111,7 @@ if(CONFIG_MYVENDOR_BICYCLE)
     ${BICYCLE_DIR}/src/bicycle_runtime.c
     ${BICYCLE_DIR}/src/bicycle_ride_gpx.c
     ${BICYCLE_DIR}/src/bicycle_env.c
+    ${BICYCLE_DIR}/src/bicycle_demo.c   # 演示模式：四步循环（导航 / 跳点 / 换主题）
     ${BICYCLE_DIR}/src/bicycle_gpx_sim.c
     ${BICYCLE_DIR}/src/vmap/vmap_alloc.c
     ${BICYCLE_DIR}/src/vmap/vmap_vpk_heap.c
@@ -97,6 +119,7 @@ if(CONFIG_MYVENDOR_BICYCLE)
     ${BICYCLE_DIR}/src/vmap/vmap_label.c
     ${BICYCLE_DIR}/src/vmap/vmap_track_arena.c
     ${BICYCLE_DIR}/src/vmap/vmap_track.c
+    ${BICYCLE_DIR}/src/vmap/vmap_blit.c
     ${BICYCLE_DIR}/src/vmap/vmap_view.c
     ${BICYCLE_DIR}/src/vmap/vmap_render.c
     ${BICYCLE_DIR}/src/vmap/vmap_style.c
@@ -143,9 +166,11 @@ if(CONFIG_MYVENDOR_BICYCLE)
     ${GPX_DIR}/gpx_record.c
     ${GPX_DIR}/gpx_reader.c
     ${GPX_DIR}/gpx_decode.c)
-  file(GLOB FTEST_SRCS CONFIGURE_DEPENDS
-    ${BICYCLE_DIR}/src/lvgl_page/fonts/ftest/ftest_*.c)
-  list(APPEND CSRCS ${FTEST_SRCS})
+  if(MYVENDOR_FONT_LAB)
+    file(GLOB FTEST_SRCS CONFIGURE_DEPENDS
+      ${BICYCLE_DIR}/src/lvgl_page/fonts/ftest/ftest_*.c)
+    list(APPEND CSRCS ${FTEST_SRCS})
+  endif()
 
   if(CONFIG_MYVENDOR_BICYCLE_INVAL_PROBE)
     list(APPEND CSRCS ${BICYCLE_DIR}/src/bicycle_inval_probe.c)
@@ -184,7 +209,9 @@ if(CONFIG_MYVENDOR_BICYCLE)
     NAME bicycle_nsh
     PRIORITY 100
     INCLUDE_DIRECTORIES ${INCDIR}
-    STACKSIZE 4096
+    # 8192：与 `ctl` 同一类（NSH 侧命令面 + 进 UI/nav 代码路径）。
+    # 4096 那次教训见 nsh/CMakeLists.txt 顶部的"栈大小口径"一节。
+    STACKSIZE 8192
     SRCS
       ${BICYCLE_DIR}/src/bicycle_nsh_main.c
       ${BICYCLE_DIR}/src/bicycle_nsh_ctl.c

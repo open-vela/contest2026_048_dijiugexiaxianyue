@@ -1,6 +1,6 @@
 /**
  * @file startup_page.c
- * @brief 开机 splash：黑屏播完开机音 → 白屏后再滚入事项。
+ * @brief 开机 splash：首帧就是主题底色（日白/夜黑），播完开机音后滚入事项。
  *
  * 事项与关机同款「左边 · 右边」：
  *   骑行记录 · 恢复中 / 已恢复|已检查|无记录
@@ -17,6 +17,7 @@
 #include "bicycle_page_ids.h"
 #include "bicycle_ride_gpx.h"
 #include "helm_font.h"
+#include "helm_palette.h"
 #include "helm_splash.h"
 #include "live_map/map_page.h"
 #include "lv_pm_anima.h"
@@ -77,8 +78,8 @@ typedef struct {
     char chore_key[16];        /**< 当前事项左侧文案。 */
     bool exiting;              /**< 已开始 fade/pop。 */
     bool map_opened;           /**< 已 `boot_begin_load`。 */
-    bool bg_started;           /**< 黑→白结束，chrome 已露出。 */
-    bool sound_wait;           /**< 黑屏等开机提示音播完。 */
+    bool bg_started;           /**< 底色 settle 结束，chrome/chore 已启动。 */
+    bool sound_wait;           /**< 等开机提示音播完再进 settle。 */
 } startup_page_t;
 
 static startup_page_t * s_startup;
@@ -161,6 +162,16 @@ static void startup_start_poll(startup_page_t * ui)
     ui->poll_timer = lv_timer_create(startup_poll_cb, STARTUP_POLL_MS, ui);
 }
 
+/** @brief splash 的**最终**底色灰阶（跟主题）。
+ *  @details 用户 2026-09-26 晚："开关机界面也[要]受主题变化影响" ⇒ 日光是原来的
+ *           白底黑字（255），夜间走黑底白字（0）。`helm_splash_set_gray()` 的约定：
+ *           传进去的是**背景**灰阶，文字/进度条自动取反（`ink = 255 - g`）。
+ *           logo 是固定位图（平均亮度 146，黑底上也看得见），不跟着换。 */
+static uint8_t startup_theme_gray(void)
+{
+    return helm_pal_night() ? 0u : 255u;
+}
+
 static void startup_bg_exec(void * var, int32_t v)
 {
     startup_page_t * ui = (startup_page_t *)var;
@@ -178,7 +189,10 @@ static void startup_bg_exec(void * var, int32_t v)
         v = STARTUP_BG_STEPS;
     }
     step = (uint8_t)v;
-    g = (uint8_t)((step * 255u) / STARTUP_BG_STEPS);
+    /* 动画的起点=终点=STARTUP_BG_STEPS（见 `startup_start_bg_anim`）：这里算出来
+     * 恒等于 `startup_theme_gray()`，只负责把底色钉在主题色上；不会再把首帧已经
+     * 铺好的底色从 0（黑）爬升/拉回。 */
+    g = (uint8_t)((step * (uint32_t)startup_theme_gray()) / STARTUP_BG_STEPS);
     startup_apply_bg(ui, g);
 }
 
@@ -190,13 +204,31 @@ static void startup_bg_ready(lv_anim_t * a)
         return;
     }
 
-    startup_apply_bg(ui, 255);
+    startup_apply_bg(ui, startup_theme_gray());
     ui->bg_started = true;
     ui->appear_tick = lv_tick_get();
     helm_splash_set_chrome_hidden(&ui->splash, false);
     helm_splash_bar_set(&ui->splash, 0);
     startup_arm_chore(ui, STARTUP_CHORE_SALVAGE);
     startup_start_poll(ui);
+}
+
+/** @brief 换主题后重铺 splash 底色（跟主题那件事的"变化"那一半）。
+ *  @details 开机时主题是**先 KV 读回、后渐变**，读回可能早于也可能晚于
+ *           `startup_bg_ready()` ⇒ 得有个"主题变了再铺一次"的入口。
+ *           **不能等 `bg_started`**：底色在首帧前就已按主题铺好、不再依赖那段
+ *           settle 动画；主题若在 settle 完成前变（`bg_started` 仍 false）也必须
+ *           立刻重铺，否则 splash 会一直停在旧底色。
+ *           由 `helm_theme_poll_apply()` 在循环顶调用（安全点，同 ①②③）。 */
+void startup_page_theme_refresh(void)
+{
+    startup_page_t * ui = s_startup;
+
+    if (!ui || !ui->root || ui->exiting) {
+        return;                    /* 没在放 splash：页面已退出/未建 */
+    }
+
+    startup_apply_bg(ui, startup_theme_gray());
 }
 
 static void startup_play_show_anim(startup_page_t * ui)
@@ -220,7 +252,10 @@ static void startup_start_bg_anim(startup_page_t * ui)
     startup_stop_bg_anim(ui);
     lv_anim_init(&a);
     lv_anim_set_var(&a, ui);
-    lv_anim_set_values(&a, 0, STARTUP_BG_STEPS);
+    /* 起点=终点：底色在 will_appear / sync_boot 已按主题铺好，这段不再做
+     * 0→白（或 0→黑）的爬升；360 ms 只作为"chrome 露出前的 settle"时长，
+     * `startup_bg_ready` 的时序（appear_tick / chore 启动）保持不变。 */
+    lv_anim_set_values(&a, STARTUP_BG_STEPS, STARTUP_BG_STEPS);
     lv_anim_set_time(&a, STARTUP_BG_MS);
     lv_anim_set_delay(&a, 0);
     lv_anim_set_path_cb(&a, lv_anim_path_linear);
@@ -352,7 +387,7 @@ static bool startup_chore_pump(startup_page_t * ui)
                                 myvendor_system_font_preloaded() ? "已加载" :
                                 "未找到",
                                 false);
-                    LV_LOG_USER("startup: font ready, loading map");
+                    LV_LOG_INFO("startup: font ready, loading map");
                     return true;
                 }
 
@@ -382,7 +417,7 @@ static bool startup_chore_pump(startup_page_t * ui)
 
         startup_bar_goal(ui, 100);
         startup_row(ui, "已加载", false);
-        LV_LOG_USER("startup: files ready, map render deferred");
+        LV_LOG_INFO("startup: files ready, map render deferred");
         return true;
 
     default:
@@ -467,7 +502,7 @@ static void startup_poll_cb(lv_timer_t * tmr)
         }
     }
 
-    /* 黑屏：开机音播完再黑→白。白屏后才跑 GPX/字体/地图。 */
+    /* 底色已按主题铺好：开机音播完再进 settle，chrome 露出后才跑 GPX/字体/地图。 */
     if (!ui->bg_started) {
         if (ui->sound_wait) {
             if (!myvendor_sound_idle()) {
@@ -587,7 +622,8 @@ static startup_page_t * startup_ui_create(lv_obj_t * root)
     lv_obj_set_style_opa(root, LV_OPA_COVER, 0);
 
     helm_splash_build(&ui->splash, root);
-    helm_splash_set_gray(&ui->splash, 0);
+    /* 首帧就是主题底色（日=白 255 / 夜=黑 0），不再先铺黑等动画。 */
+    startup_apply_bg(ui, startup_theme_gray());
     helm_splash_set_chrome_hidden(&ui->splash, true);
     ui->bar_goal = 0xff;
 
@@ -647,7 +683,9 @@ static void startup_will_appear(void * pm_page)
     helm_splash_set_chrome_hidden(&ui->splash, true);
     helm_splash_bar_set(&ui->splash, 0);
     startup_lock_black_style(page->page);
-    startup_apply_bg(ui, 0);
+    /* 先锁黑防主题米色，再按主题铺回 splash 底色（日=白 / 夜=黑）；
+     * 之后 APPEAR_DONE 的 sync_boot 也按同一颜色重铺。 */
+    startup_apply_bg(ui, startup_theme_gray());
     startup_play_show_anim(ui);
     myvendor_sound_boot();
     startup_stop_bg_anim(ui);
@@ -742,7 +780,11 @@ void startup_page_finish(void)
 }
 
 /**
- * @brief 主题 apply 之后锁回黑底，避免第一帧刷出米色。
+ * @brief 主题 apply 之后把 splash 底色锁回主题色，避免第一帧刷出主题页面色。
+ * @details `bicycle_c_main` 在打开 boot 序列后、允许 invalidation 前调用；
+ *          STARTUP 的 APPEAR_DONE 也会调一次（此时 `lv_pm_theme_apply()` 刚把
+ *          页根刷成主题的 page_bg）。splash 自己的底色是日=白 255 / 夜=黑 0，
+ *          不能锁成纯黑，否则日光下首帧就是黑底硬切。
  */
 void startup_page_sync_boot(void)
 {
@@ -754,7 +796,7 @@ void startup_page_sync_boot(void)
 
     startup_lock_black_style(ui->root);
     ui->bg_applied = -1;
-    startup_apply_bg(ui, 0);
+    startup_apply_bg(ui, startup_theme_gray());
     helm_splash_set_chrome_hidden(&ui->splash, true);
     helm_splash_bar_set(&ui->splash, 0);
 }

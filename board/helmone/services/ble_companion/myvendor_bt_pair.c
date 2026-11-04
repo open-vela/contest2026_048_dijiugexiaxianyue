@@ -28,6 +28,8 @@
 
 #include <stdbool.h>
 #include <stdarg.h>
+#include <stdint.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -52,6 +54,10 @@ static bool g_auto_accept = true;
 /** @brief auth 回调是否已注册（注销后 zblue 回到"无回调 = 自动接受"的行为）。 */
 static bool g_auth_registered;
 
+/* 前向声明：pair_confirm 在窗口判定函数定义之前就要用它。 */
+bool myvendor_pair_window_active(void);
+static bool myvendor_pair_reject_new_when_full(struct bt_conn *conn);
+
 /**
  * @brief SMP 配对确认回调：打印对端与决定，并同意（Just Works）。
  *
@@ -63,8 +69,37 @@ static void pair_confirm(struct bt_conn *conn, unsigned int passkey)
   char addr[BT_ADDR_LE_STR_LEN];
 
   bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-  printf("pair: confirm %s passkey=%u -> %s\n", addr, passkey,
-         g_auto_accept ? "accept" : "reject");
+
+  /* **窗口外拒绝对新配对**：已绑定手机回连只走 LTK 加密，不会进 pairing_confirm；
+   * 能走到这里的是"新配对请求"。以前窗口外也 auto-accept + 30 s 宽限，结果
+   * 随便一台手机扫到就能弹配对（用户 2026-09-21：开了 IRK 仍能在非配对时段
+   * 被扫到并请求配对）。 */
+  if (!myvendor_pair_window_active())
+    {
+      printf("pair: confirm %s passkey=%u -> reject (no window)\n",
+             addr, passkey);
+      (void)bt_conn_auth_cancel(conn);
+      return;
+    }
+
+  /* 已满 3 台且是新地址：拒绝对新配对（先解绑再配）。已在名单里允许刷新。 */
+  if (myvendor_pair_reject_new_when_full(conn))
+    {
+      printf("pair: confirm %s passkey=%u -> reject (slots full)\n",
+             addr, passkey);
+      (void)bt_conn_auth_cancel(conn);
+      return;
+    }
+
+  if (!g_auto_accept)
+    {
+      printf("pair: confirm %s passkey=%u -> reject (accept off)\n",
+             addr, passkey);
+      (void)bt_conn_auth_cancel(conn);
+      return;
+    }
+
+  printf("pair: confirm %s passkey=%u -> accept\n", addr, passkey);
   bt_conn_auth_pairing_confirm(conn);
 }
 
@@ -380,6 +415,7 @@ static int pair_cmd_connect(int idx)
 static int pair_cmd_accept(bool on);
 void myvendor_pair_note_bond(const bt_address_t *addr, bool bonded);
 static void pair_hex_to_bytes(const char *hex, uint8_t *out, unsigned n);
+static void pair_reject_cooldown_clear(const char *hex12);
 
 /* ── 准入 + 手机身份记录（2026-09-20，用户拍板"没配对就不该接受连接"）──────────
  *
@@ -387,38 +423,47 @@ static void pair_hex_to_bytes(const char *hex, uint8_t *out, unsigned n);
  * 服务 UUID 的中心都能连上并**写**控制/导航/FS 通道（现场实测：手机上 app 已关、
  * 配对已删，仍有一条 `sec=1 bonded=0` 的连接在读写）。现在两道：
  *
- *   ① 连接准入：只有"配对窗口内"或"就是本机记录的那台手机"才放行，其余先给
- *      `PAIR_ADMIT_GRACE_MS` 宽限（系统配对 createBond 也要先建链跑 SMP），到点
- *      仍未绑定就 `bt_conn_disconnect(AUTH_FAIL)`；所有特征/CCCD 都是 ENCRYPT
- *      权限兜底（未加密的 ATT 操作一律被拒 ⇒ 手机因此走隐式配对）。
- *   ② 广播三档（决策在 ble_companion.c 的 `companion_start_advertising()`）：
- *      配对窗口内 = 快广播（200 ms）可发现；有手机记录 = 可发现但闲时间隔拉到
- *      1280 ms（少抢射频）；**没记录 + 窗口外 = 完全不广播**。
- *      定向广播 `ADV_DIRECT_IND` 2026-09-20 已退役：手机配对后改用轮换 RPA 连接，
- *      TargetA 固定的定向广播会被手机忽略（现场"只有配对那次能连"）。详见
- *      `myvendor_pair_directed_peer()` 的注释。
+ *   ① 连接准入：窗口内放行；窗口外仅身份地址匹配的已绑定手机。有记录但地址对不上
+ *      （RPA 回连 **或** 旧手机 A 占坑）给 **3 s** 宽限等 L2；未加密则踢并 **60 s
+ *      同地址冷却**（防 A 秒连饿死 B）。**没记录立刻拒**。新配对由 `pair_confirm`
+ *      + `bondable_le` 在窗口外拒绝。定向可用时由射频先挡；不可用/冷却时靠此主机侧兜底。
+ *   ② 广播分档（决策在 ble_companion.c 的 `companion_start_advertising()`）：
+ *      配对窗口内 = 快广播 + 本地名 + bondable；有手机记录窗口外 = 有新鲜 RPA
+ *      且不在冷却时定向 `ADV_DIRECT_IND`（own=PUBLIC，TargetA=手机当前 RPA），
+ *      否则无名快广播 200 ms；**没记录 + 窗口外 = 完全不广播**。
+ *      RPA 缓存（10 min）/定向窗口（60 s）/失败回退（无定向 + 10 min 冷却）见
+ *      `docs/ble/directed_reconnect.md`；`ADV_DIRECT_IND` + 身份地址或
+ *      own=RANDOM 都不工作（2026-10-18 实机 A/V1/V2/V3）。
  *
  * **IRK / 绑定只服务手机这条线**（用户 2026-09-20 明确）：传感器（HR/CSC/CPS）一律
  * **按地址连** —— 它们不是我们配对的设备，没有密钥、也没有身份地址可解析。所以本
  * 文件里所有"加密 / 绑定 / 记录"的判断都要用 `ble_sensor_owns_addr()` 把传感器链路
  * 排除掉，别把 IRK 那套套到外设上。
  *
- * 记录文件 `/mnt/kv/bt_phone.tsv`（一行 `ADDR<TAB>TYPE`）：
- *   · 谁写：`myvendor_pair_note_bond()`（bond 回调 / 控制帧路径）与
- *     `myvendor_pair_peer_poll()`（`security_changed` 事件对账，**主力**）；
- *   · 谁删：解绑（`myvendor_pair_unbind_poll()` 里 `bt_unpair` + 删记录）；
- *   · 手机侧"忽略设备"**不会**通知设备，所以 tsv 可能过期：这时靠配对窗口
- *     （设备 UI / `ctl pair open [秒]`）重新配对，窗口内是快广播可发现。
+ * 记录文件 `/mnt/kv/bt_phone.tsv`（最多 `PAIR_PHONE_MAX` 行，每行 `ADDR<TAB>TYPE`）：
+ *   · 谁写：`myvendor_pair_note_bond()` / `myvendor_pair_peer_poll()`（**追加**，不覆盖别的手机）；
+ *   · 谁删：解绑（按槽或全部 `bt_unpair` + 改 tsv）；
+ *   · 手机侧"忽略设备"**不会**通知设备；换绑靠配对窗口再加一台（满 3 台需先解绑）。
+ * 产品（2026-09-22）：IRK 名额 3，允许多台已绑定手机回连，避免"只留 B、A 抢坑饿死"。
  */
 #define PAIR_PHONE_TSV     "/mnt/kv/bt_phone.tsv"
+#ifndef CONFIG_BT_MAX_PAIRED
+#  define PAIR_PHONE_MAX   3u
+#else
+#  define PAIR_PHONE_MAX   ((unsigned)CONFIG_BT_MAX_PAIRED)
+#endif
 /** `ctl pair open` / BLE 控制帧不带秒数时的窗口长度。
  *  **开机不再自动开窗**（用户 2026-09-20）：只有 UI / NSH / app 显式操作才开。 */
 #define PAIR_WINDOW_DEFAULT_S 60u
-/* 未配对连接的宽限：系统配对（Android createBond）也要先建一条 LE 链路，
- * 建链后还要跑 SMP —— 立刻掐会导致"永远配不上"。宽限内所有特征都是
- * ENCRYPT 权限 ⇒ 拿不到任何数据；到点还没绑定就断开。
- * 30 s 是"等用户在系统弹框上点确认"用的（createBond 之后系统要弹框）。 */
-#define PAIR_ADMIT_GRACE_MS 30000u
+/* RPA 回连宽限：有手机记录但连接地址对不上身份时，放行链路等 LTK 升到 L2。
+ * 宽限内特征全是 ENCRYPT ⇒ 拿不到数据。到点未加密就踢。
+ *
+ * **不要再拉回 30 s**：旧手机 A 地址也对不上记录时会吃同一段 grace；一放行就停 ADV。
+ * 3 s + 拒连冷却打断秒连环。多手机记录（最多 3）时，名单内身份直接放行。 */
+#define PAIR_ADMIT_GRACE_MS       3000u
+/** 拒连后同地址冷却：打断旧手机秒连占坑。 */
+#define PAIR_REJECT_COOLDOWN_MS   60000u
+#define PAIR_REJECT_COOLDOWN_SLOTS 2u
 
 /** @brief 配对窗口的截止时刻（mono_ms 基准）；0 = 没开窗。受 `g_window_lock` 保护。 */
 static uint32_t g_pair_window_until_ms;
@@ -442,6 +487,15 @@ bool myvendor_pair_window_take_restart(void)
   bool r;
 
   pthread_mutex_lock(&g_window_lock);
+  /* 自然到期也要重播广播 / 关 bondable：以前只看 take 标志，倒计时到 0 后
+   * ADV 仍停在窗口内的快广播档，bondable 也还开着。 */
+  if (g_pair_window_until_ms != 0u &&
+      (int32_t)(g_pair_window_until_ms - myvendor_mono_ms()) <= 0)
+    {
+      g_pair_window_until_ms = 0u;
+      g_window_restart_req   = true;
+      printf("pair: window expired\n");
+    }
   r = g_window_restart_req;
   g_window_restart_req = false;
   pthread_mutex_unlock(&g_window_lock);
@@ -519,6 +573,10 @@ void myvendor_pair_window_open(unsigned secs)
   g_pair_window_until_ms = myvendor_mono_ms() + secs * 1000u;
   g_window_restart_req   = true;
   pthread_mutex_unlock(&g_window_lock);
+
+  /* 开窗清拒连冷却：否则上一轮 grace 踢过的手机窗内仍被挡，系统只报 PIN 错。 */
+  pair_reject_cooldown_clear(NULL);
+
   printf("pair: window open %us\n", secs);
 }
 
@@ -540,49 +598,450 @@ static void pair_hex_to_bytes(const char *hex, uint8_t *out, unsigned n)
     }
 }
 
-/* 读 `/mnt/kv/bt_phone.tsv` → 归一化地址前 12 个字符（6 字节）+ 地址类型。 */
-static bool pair_phone_identity(char *out12, size_t out12_len, uint8_t *out_type)
+/* 读 `/mnt/kv/bt_phone.tsv`（最多 PAIR_PHONE_MAX 行）。 */
+struct pair_phone_rec
 {
-  char      line[96];
-  char      raw[40];
-  char      norm[40];
-  unsigned  type = 1;
-  FILE     *f = fopen(PAIR_PHONE_TSV, "r");
+  char    hex[13];
+  uint8_t type;
+};
 
+static unsigned pair_phone_load(struct pair_phone_rec *out, unsigned max)
+{
+  char  line[96];
+  char  raw[40];
+  char  norm[40];
+  FILE *f;
+  unsigned n = 0;
+
+  if (out == NULL || max == 0u)
+    {
+      return 0u;
+    }
+
+  f = fopen(PAIR_PHONE_TSV, "r");
   if (f == NULL)
     {
-      return false;
+      return 0u;
     }
-  if (fgets(line, sizeof(line), f) == NULL)
+
+  while (n < max && fgets(line, sizeof(line), f) != NULL)
     {
-      fclose(f);
-      return false;
+      unsigned type = 1;
+
+      if (line[0] == '\0' || line[0] == '\n' || line[0] == '\r')
+        {
+          continue;
+        }
+
+      if (sscanf(line, "%39s %u", raw, &type) < 1)
+        {
+          continue;
+        }
+
+      pair_norm_addr(raw, norm, sizeof(norm));
+      if (strlen(norm) < 12u)
+        {
+          continue;
+        }
+
+      norm[12] = '\0';
+      memcpy(out[n].hex, norm, 13u);
+      out[n].type = (uint8_t)(type & 0xffu);
+      n++;
     }
+
   fclose(f);
+  return n;
+}
 
-  if (sscanf(line, "%39s %u", raw, &type) != 2)
+static void pair_phone_save(const struct pair_phone_rec *rec, unsigned n)
+{
+  FILE *f;
+  unsigned i;
+
+  if (n == 0u)
     {
-      return false;
+      (void)remove(PAIR_PHONE_TSV);
+      return;
     }
 
-  pair_norm_addr(raw, norm, sizeof(norm));
+  f = fopen(PAIR_PHONE_TSV, "w");
+  if (f == NULL)
+    {
+      printf("pair: phone record write failed\n");
+      return;
+    }
+
+  for (i = 0; i < n; i++)
+    {
+      fprintf(f, "%s\t%u\n", rec[i].hex, (unsigned)rec[i].type);
+    }
+
+  fclose(f);
+}
+
+/* ── 用密钥池修剪名单（2026-09-23）────────────────────────────────────────
+ *
+ *  `bt_phone.tsv` 里会混进**配对那次连接的 RPA**：连接建立时 `conn->le.dst`
+ *  就定死了，而那一刻密钥池里还没有 IRK ⇒ 主机侧解析不了 ⇒ 两个写入者
+ *  （框架的 bond 回调 / `myvendor_pair_peer_poll()`）都只能记下 RPA。
+ *  身份地址要等**下一次回连**才会被记上 ⇒ 同一台手机占两个名额。
+ *
+ *  现场（固件 `202609231925`）：
+ *    ctl pair list  → 78:D8:40:4B:F5:20 (public) sec=2 bonded=1   ← 框架侧是对的
+ *    ctl pair phone → [0] 66F65E5417BF type=1                     ← 废 RPA
+ *                     [1] 78D8404BF520 type=0                     ← 身份地址
+ *                     phones 2/3                                  ← 白占一个名额
+ *
+ *  RPA 会轮换、**永远匹配不上**任何后续连接，对 `pair_phone_contains()` 零贡献，
+ *  唯一害处就是占名额（`PAIR_PHONE_MAX` 满了就得靠 FIFO 淘汰兜）。
+ *
+ *  判据用 `bt_foreach_bond_mc()` —— 这正是框架
+ *  `bt_sal_le_get_bonded_devices()` 用的同一份数据，`struct bt_bond_info.addr`
+ *  按构造就是**身份地址**。
+ *
+ *  ⚠ **只能在"密钥池已恢复、且还没有对端能连上"的窗口里调**：遍历密钥池必须
+ *  与 BT 线程的增删互斥（`ctl pair list` 就曾在 CTL 线程踩到半更新的链表而
+ *  MemFault）。落点 = `companion_restore_keys()`，与
+ *  `myvendor_keys_kv_load_all()` 同一窗口（开广播之前，见其注释）。
+ *
+ *  ⚠ 密钥池为空时**绝不修剪** —— 那说明还没恢复完，会把整张表清掉。
+ *  所以先看池里到底有几条，为 0 就原样返回、留给下一次调用。 */
+
+static char     g_key_pool[PAIR_PHONE_MAX][13];
+static unsigned g_key_pool_n;
+static bool     g_prune_done;
+
+/** 记录**攒多久才落盘**（用户 2026-09-23：「为什么在不稳定的时候落盘，
+ *  不能落盘靠后吗」—— 对，落盘就该靠后）。
+ *
+ *  配对刚开始那会儿状态是不稳定的：密钥池里会**短暂存在一条以 RPA 为地址的
+ *  键记录**，之后才归并到身份地址；而 `conn->le.dst` 在连接建立时就定死了、
+ *  不会再变。于是 `myvendor_pair_peer_poll()` 会先用 RPA 报一次、约 0.7 s 后
+ *  再用身份地址报一次。
+ *
+ *  ⇒ 两次都**只更新同一份内存待写值**（后到的身份地址直接覆盖掉 RPA），
+ *  等 `PAIR_SETTLE_MS` 到点、池也稳了，再**一次性落盘**并当场用"在不在池里"
+ *  判据把关。这样：
+ *    · 废 RPA **根本不会写进文件**（不是"写了再清"）；
+ *    · 名单**不会出现 3/3 的瞬时峰值** ⇒ 不会误触 FIFO 淘汰（那有可能挤掉
+ *      另一台手机的身份地址 —— 2 台手机时余量只有一个坑）；
+ *    · 附带好处：一次配对只写一次 flash，不是两次。
+ *
+ *  2 s 的依据：实测 RPA 上报 → 身份地址上报约 **0.7 s**，`bt_keys kv: saved`
+ *  从 0 条到 1 条约 **0.4 s**，取 2 s 留足余量。 */
+#define PAIR_SETTLE_MS 2000u
+
+/** 队列建立了这么久还挑不出"在密钥池里的地址"就放弃（防止永久挂着）。
+ *  60 s 远大于实测的池稳定时间（~0.4 s），正常路径永远走不到这里。 */
+#define PAIR_PEND_MAX_MS 60000u
+
+/** 攒住**最近两个**不同地址，落盘时挑"在密钥池里的那个"。
+ *
+ *  ⚠ 为什么不是"只留最后一个"（第一版就是这么写的，`202609232018` 实测踩了）：
+ *  我假设"RPA 先到、身份地址后到"。**首次配对**确实如此；但**回连**时手机可能
+ *  先报身份地址、再报一个 RPA（两条连接交替），于是"后到覆盖先到"把身份地址
+ *  盖掉，落盘判据又把 RPA 丢掉 ⇒ **一条都没写**（现场日志：
+ *  `secured peer 78D8404BF520` 之后跟了 8 次 `secured peer 7F53B7ED5CBB`，
+ *  最后 `drop 7F53B7ED5CBB`，名单始终为空）。
+ *
+ *  留两个槽就同时覆盖两种情形：
+ *    · 首次配对 [RPA, 身份]  → 落盘时池里是身份 ⇒ 选身份 ✓
+ *    · 回连交替 [身份, RPA]  → 落盘时池里是身份 ⇒ 选身份 ✓ */
+#define PAIR_PEND_SLOTS 2u
+static char     g_pend_hex[PAIR_PEND_SLOTS][13];
+static uint8_t  g_pend_type[PAIR_PEND_SLOTS];
+static unsigned g_pend_n;              /* 0..PAIR_PEND_SLOTS，[0] 最老 */
+static uint32_t g_pend_due_ms;         /* 第一次入队起算，入队不清零重算 */
+static uint32_t g_pend_start_ms;       /**< 队列建立时刻；超 `PAIR_PEND_MAX_MS`
+                                        *   仍挑不出身份地址就放弃（免得永久挂着）。 */
+
+static void pair_key_pool_cb(const struct bt_bond_info *info, void *user_data)
+{
+  char   s[BT_ADDR_LE_STR_LEN];
+  char   norm[40];
+
+  (void)user_data;
+
+  if (info == NULL || g_key_pool_n >= PAIR_PHONE_MAX)
+    {
+      return;
+    }
+
+  bt_addr_le_to_str(&info->addr, s, sizeof(s));
+  pair_norm_addr(s, norm, sizeof(norm));
   if (strlen(norm) < 12u)
     {
-      return false;
+      return;
     }
-  norm[12] = '\0';
 
-  if (out12_len < 13u)
+  norm[12] = '\0';
+  memcpy(g_key_pool[g_key_pool_n], norm, 13u);
+  g_key_pool_n++;
+}
+
+/** @brief 重新遍历密钥池，刷新 `g_key_pool[]`。返回池里条数。 */
+static unsigned pair_key_pool_refresh(void)
+{
+  g_key_pool_n = 0;
+  bt_foreach_bond_mc(0, BT_ID_DEFAULT, pair_key_pool_cb, NULL);
+  return g_key_pool_n;
+}
+
+/* 曾有一个 `pair_addr_in_key_pool()` 用来在写入前拦 RPA —— **已删除**：
+ * 配对窗口里密钥池会短暂以 RPA 为地址持有那条键记录，判据会返回 true 而放行，
+ * 拦不住（实测 `202609231956`）。现在只保留"池稳定后修剪"这一条路。 */
+
+/** @brief 立刻按密钥池修剪一次 `bt_phone.tsv`。幂等；池空时不动。
+ *
+ *  ⚠ **只能"池已稳定"的时候调。** 配对过程中密钥池里会**短暂存在一条以 RPA
+ *  为地址的键记录**，配对完成后才归到身份地址 —— 那时"地址在不在池里"判不出
+ *  真假（实测 `202609231956`：写 RPA 那一刻该判据返回 true，RPA 照样被写进
+ *  名单，于是又出现一台手机两条记录）。
+ *
+ *  ⇒ 所以运行时不"在写入前拦"，而是"**写完等几秒、池稳定后再修剪**"
+ *  （见 `myvendor_pair_prune_poll()` 与 `PAIR_PRUNE_DELAY_MS`）。 */
+static void pair_prune_now(void)
+{
+  struct pair_phone_rec rec[PAIR_PHONE_MAX];
+  struct pair_phone_rec keep[PAIR_PHONE_MAX];
+  unsigned n;
+  unsigned i;
+  unsigned k;
+  unsigned w = 0;
+
+  if (pair_key_pool_refresh() == 0u)
+    {
+      return;                 /* 密钥池空 —— 别清表，留给下一次 */
+    }
+
+  n = pair_phone_load(rec, PAIR_PHONE_MAX);
+  if (n == 0u)
+    {
+      return;
+    }
+
+  for (i = 0; i < n; i++)
+    {
+      bool in_pool = false;
+
+      for (k = 0; k < g_key_pool_n; k++)
+        {
+          if (strncmp(rec[i].hex, g_key_pool[k], 12u) == 0)
+            {
+              in_pool = true;
+              break;
+            }
+        }
+
+      if (in_pool)
+        {
+          keep[w] = rec[i];
+          w++;
+        }
+      else
+        {
+          printf("pair: prune %s type=%u (不在密钥池里 —— 陈旧 RPA?)\n",
+                 rec[i].hex, (unsigned)rec[i].type);
+        }
+    }
+
+  if (w != n)
+    {
+      pair_phone_save(keep, w);
+      printf("pair: phone record pruned %u -> %u\n", n, w);
+    }
+}
+
+/** @brief 开机修剪入口（`companion_restore_keys()` 里调；只跑一次）。 */
+void myvendor_pair_prune_against_keys(void)
+{
+  if (g_prune_done)
+    {
+      return;
+    }
+
+  if (pair_key_pool_refresh() == 0u)
+    {
+      return;                 /* 密钥池还没恢复完 —— 下次再试，别清表 */
+    }
+
+  g_prune_done = true;
+  pair_prune_now();
+}
+
+static bool pair_pending_commit(void);   /* 定义在下面（延迟落盘的执行体） */
+
+/** @brief **延迟落盘**入口（companion 线程每拍调）。
+ *
+ *  到 `PAIR_SETTLE_MS` 就把攒下的那条记录按"在不在密钥池里"把关后落盘
+ *  —— 那会儿配对已完成、密钥池已把 RPA 归并到身份地址，判据是可靠的。
+ *
+ *  自证伪：若日志里出现 `pair: drop <身份地址> (不在密钥池…)`（丢掉的是**真正
+ *  在用的**那台手机），说明 2 s 不够、池还没稳定 ⇒ 调大 `PAIR_SETTLE_MS`。
+ */
+void myvendor_pair_settle_poll(void)
+{
+  if (g_pend_n == 0u ||
+      (int32_t)(g_pend_due_ms - myvendor_mono_ms()) > 0)
+    {
+      return;
+    }
+
+  /* 没落盘就把到期时间**拉到当前** ⇒ 下一拍立刻重试（常见原因是"池还没把身份
+   * 地址归并好"）。无限重试的上界由 `PAIR_PEND_MAX_MS` 兜住。 */
+  if (!pair_pending_commit())
+    {
+      g_pend_due_ms = myvendor_mono_ms();
+    }
+}
+
+/** @brief 兼容旧调用：取**第一台**手机身份。 */
+static bool pair_phone_identity(char *out12, size_t out12_len, uint8_t *out_type)
+{
+  struct pair_phone_rec rec[PAIR_PHONE_MAX];
+  unsigned n = pair_phone_load(rec, PAIR_PHONE_MAX);
+
+  if (n == 0u || out12_len < 13u)
     {
       return false;
     }
-  memcpy(out12, norm, 13u);       /* 含结尾 0 */
 
+  memcpy(out12, rec[0].hex, 13u);
   if (out_type != NULL)
     {
-      *out_type = (uint8_t)(type & 0xffu);
+      *out_type = rec[0].type;
     }
+
   return true;
+}
+
+static bool pair_phone_contains(const char *hex12, uint8_t *out_type)
+{
+  struct pair_phone_rec rec[PAIR_PHONE_MAX];
+  unsigned n;
+  unsigned i;
+
+  if (hex12 == NULL)
+    {
+      return false;
+    }
+
+  n = pair_phone_load(rec, PAIR_PHONE_MAX);
+  for (i = 0; i < n; i++)
+    {
+      if (strncmp(rec[i].hex, hex12, 12u) == 0)
+        {
+          if (out_type != NULL)
+            {
+              *out_type = rec[i].type;
+            }
+
+          return true;
+        }
+    }
+
+  return false;
+}
+
+/* Only call from the companion thread: pair_phone_contains() reads flash. */
+bool myvendor_pair_has_phone_identity(const bt_address_t *addr,
+                                      uint8_t type)
+{
+  char s[BT_ADDR_STR_LENGTH];
+  char hex[40];
+  uint8_t recorded_type;
+
+  if (addr == NULL)
+    {
+      return false;
+    }
+
+  bt_addr_ba2str(addr, s);
+  pair_norm_addr(s, hex, sizeof(hex));
+  if (strlen(hex) < 12u || !pair_phone_contains(hex, &recorded_type))
+    {
+      return false;
+    }
+
+  /* Zephyr may return the resolved identity with the _ID address type. */
+  return (recorded_type & 1u) == (type & 1u);
+}
+
+unsigned myvendor_pair_phone_count(void)
+{
+  struct pair_phone_rec rec[PAIR_PHONE_MAX];
+
+  return pair_phone_load(rec, PAIR_PHONE_MAX);
+}
+
+bool myvendor_pair_phone_at(unsigned idx, char *out12, size_t out12_len,
+                            uint8_t *out_type)
+{
+  struct pair_phone_rec rec[PAIR_PHONE_MAX];
+  unsigned n = pair_phone_load(rec, PAIR_PHONE_MAX);
+
+  if (idx >= n || out12 == NULL || out12_len < 13u)
+    {
+      return false;
+    }
+
+  memcpy(out12, rec[idx].hex, 13u);
+  if (out_type != NULL)
+    {
+      *out_type = rec[idx].type;
+    }
+
+  return true;
+}
+
+static bool myvendor_pair_reject_new_when_full(struct bt_conn *conn)
+{
+  char s[BT_ADDR_LE_STR_LEN];
+  char norm[40];
+
+  if (conn == NULL)
+    {
+      return false;
+    }
+
+  bt_addr_le_to_str(bt_conn_get_dst(conn), s, sizeof(s));
+  pair_norm_addr(s, norm, sizeof(norm));
+  if (strlen(norm) >= 12u)
+    {
+      norm[12] = '\0';
+    }
+
+  if (pair_phone_contains(norm, NULL))
+    {
+      return false;
+    }
+
+  return myvendor_pair_phone_count() >= PAIR_PHONE_MAX;
+}
+
+/** @brief 新地址且名单已满则拒绝（给 SAL `on_pair_display` 用）。 */
+bool myvendor_pair_reject_new_addr(const char *addr_str)
+{
+  char norm[40];
+
+  if (addr_str == NULL || addr_str[0] == '\0')
+    {
+      return false;
+    }
+
+  pair_norm_addr(addr_str, norm, sizeof(norm));
+  if (strlen(norm) >= 12u)
+    {
+      norm[12] = '\0';
+    }
+
+  if (pair_phone_contains(norm, NULL))
+    {
+      return false;
+    }
+
+  return myvendor_pair_phone_count() >= PAIR_PHONE_MAX;
 }
 
 /* ── 在 LE 连接里按（归一化）地址找 conn ─────────────────────────────────────
@@ -660,37 +1119,209 @@ static char    g_secure_peer[13];
 static uint8_t g_secure_peer_type;
 static bool    g_secure_peer_pending;
 
-/** @brief 落盘一条手机记录（写前比对；没变就不碰 flash）。
+/** @brief 落盘手机记录：**追加**到最多 PAIR_PHONE_MAX 台，不覆盖已有别的手机。
  *
- * 两个调用点：`myvendor_pair_note_bond()`（bond 回调 / 控制帧）和
- * `myvendor_pair_peer_poll()`（security_changed 对账）。**都要先关窗**：配上了剩下的
- * 秒数不该继续允许"再配一次"。 */
+ * 已在名单里 → 只更新 type（若变了）；名单满且是新地址 → 拒绝（需先解绑）。
+ * 新地址成功写入时关配对窗口。 */
+static void pair_record_write_now(const char *norm, uint8_t type)
+{
+  struct pair_phone_rec rec[PAIR_PHONE_MAX];
+  unsigned n;
+  unsigned i;
+
+  if (norm == NULL || strlen(norm) < 12u)
+    {
+      return;
+    }
+
+  /** ⚠ **不要在写入前用"地址在不在密钥池里"来拦。**
+   *
+   *  我按这个判据做过一版（`202609231956`），**它在配对窗口里是错的**：
+   *  配对过程中密钥池会**短暂存在一条以 RPA 为地址的键记录**，配对完成后才
+   *  归并到身份地址 —— 于是"写 RPA 那一刻"该判据返回 **true**，RPA 照样被写
+   *  进名单，一台手机又是两条（实测复现）。
+   *
+   *  当时我拿 `pair: consent 78:D8:40:4B:F5:20` 的位置推断"身份地址已经在池
+   *  里"，推错了 —— 那条 printf 与 `bt_keys kv:` 的 syslog 是**两路输出**，
+   *  行序不可信。
+   *
+   *  ⇒ 改法：**照写，写完排一次延迟修剪**（下几行），等池稳定下来再按"不在
+   *  池里就清"处理（那条判据在池稳定时一直是准的，开机修剪就是证据）。
+   *  宁可有几百毫秒的双记录窗口，也不要拿一条会误判的判据把**身份地址**挡掉
+   *  —— 那会让手机下次回连必须开配对窗，代价大得多。 */
+
+  n = pair_phone_load(rec, PAIR_PHONE_MAX);
+  for (i = 0; i < n; i++)
+    {
+      if (strncmp(rec[i].hex, norm, 12u) == 0)
+        {
+          if (rec[i].type == type)
+            {
+              return;             /* 已是它，不刷 flash */
+            }
+
+          rec[i].type = type;
+          pair_phone_save(rec, n);
+          printf("pair: phone record %s type=%u (update)\n",
+                 norm, (unsigned)type);
+          return;
+        }
+    }
+
+  /** 名单满：**挤掉最老的一条**，而不是丢掉新来的这台。
+   *
+   *  以前是"满就丢"，配合"记录里存的是轮换 RPA"这条老毛病，现场就变成
+   *  `bt_phone.tsv` 3/3 满是三条再也对不上的废地址，**真要用的手机永远进不来**：
+   *  它每次回连都落进 `myvendor_pair_admit` 的短 grace，升不上 L2 就被踢 + 冷却
+   *  60 s（见 SOAK3 基线 §3）。名单是"准入白名单"，不是"绑定表"——**绑定表在
+   *  zblue 的密钥池里**（`CONFIG_BT_MAX_PAIRED=3`，与 `PAIR_PHONE_MAX` 同值），
+   *  能走到这里的前提就是"链路已升到 L2"，而 L2 只可能来自我们发出去过的 LTK
+   *  ⇒ **能进本函数的对端必然是已配对设备**，让它挤掉一条陈旧记录是安全的。
+   *
+   *  这样旧固件留下的废 RPA 记录会被真手机逐次挤干净（不需要人去 `ctl pair forget`）。
+   */
+  if (n >= PAIR_PHONE_MAX)
+    {
+      unsigned k;
+
+      printf("pair: phone slots full (%u) — evict oldest %s for %s\n",
+             (unsigned)PAIR_PHONE_MAX, rec[0].hex, norm);
+      for (k = 1u; k < n; k++)
+        {
+          rec[k - 1u] = rec[k];
+        }
+
+      n = PAIR_PHONE_MAX - 1u;
+    }
+
+  memcpy(rec[n].hex, norm, 12u);
+  rec[n].hex[12] = '\0';
+  rec[n].type = type;
+  n++;
+  pair_phone_save(rec, n);
+  /* **关窗放在这里**（真的落盘之后）：语义上"配对完成"只在记录确实写进去之后
+   * 才成立。放到上面那个会被每拍调用的排队函数里会把窗口反复关掉。 */
+  myvendor_pair_window_close();
+  printf("pair: phone record %s type=%u (%u/%u)\n",
+         norm, (unsigned)type, n, (unsigned)PAIR_PHONE_MAX);
+}
+
+/**
+ * @brief 记一条对端 —— **攒在内存里，等状态稳定了再落盘**。
+ *
+ *  这是"落盘靠后"的入口（用户 2026-09-23 的建议），取代了早先的
+ *  "先写、5 s 后再修剪"。配对刚开始时 `myvendor_pair_peer_poll()` 会先用
+ *  **本次连接的 RPA** 报一次（密钥池里那一刻只有一条以 RPA 为地址的临时键），
+ *  约 0.7 s 后才用身份地址再报一次。
+ *
+ *  两次都只更新 `g_pend_*`（**后到覆盖先到**）：身份地址自然把 RPA 顶掉，
+ *  到点后由 `myvendor_pair_settle_poll()` 用"在不在密钥池里"把关再落盘。
+ *  于是废 RPA **根本不进文件**，名单也不会出现 3/3 的瞬时峰值
+ *  （⇒ 不会误触 FIFO 淘汰、挤掉另一台手机）。
+ *
+ *  ⚠ **关窗是语义动作、与磁盘无关，所以立刻做**，不跟着推迟 —— 否则
+ *  配对窗会白多开 2 s（窗口期传感器要让位射频）。
+ *
+ *  @param norm 归一化地址（12 位十六进制，不带分隔符）。
+ *  @param type 0 = public / 1 = random（仅用于显示与 `ctl pair phone`）。
+ */
 static void pair_record_write(const char *norm, uint8_t type)
 {
-  char    have[13];
-  uint8_t have_type = 0;
-  FILE   *f;
+  unsigned i;
 
-  myvendor_pair_window_close();
-
-  /* **内容没变就别写盘**：/mnt/kv 是 flash，而这条记录会被每次控制帧和每秒的对账
-   * 摸一遍 —— 现场 2026-09-20 手机一连上就 `pair: phone record …` 刷屏，等于拿
-   * flash 寿命换一行日志。地址或类型真的变了才落盘。 */
-  if (pair_phone_identity(have, sizeof(have), &have_type) &&
-      strncmp(have, norm, 12u) == 0 && have_type == type)
+  if (norm == NULL || strlen(norm) < 12u)
     {
       return;
     }
 
-  f = fopen(PAIR_PHONE_TSV, "w");
-  if (f == NULL)
+  /* 已在这个地址上（`peer_poll` 每拍都会来报一次）⇒ 什么都不做。
+   * ⚠ **不要在这里重设 `g_pend_due_ms`**：第一版就是每拍重设，于是到期时间被
+   * 无限推后、永远不落盘（现场连打 8 次 `secured peer -> record`）。 */
+  for (i = 0; i < g_pend_n; i++)
     {
-      printf("pair: phone record write failed\n");
-      return;
+      if (strncmp(g_pend_hex[i], norm, 12u) == 0)
+        {
+          return;
+        }
     }
-  fprintf(f, "%s\t%u\n", norm, (unsigned)type);
-  fclose(f);
-  printf("pair: phone record %s type=%u\n", norm, (unsigned)type);
+
+  if (g_pend_n >= PAIR_PEND_SLOTS)
+    {
+      /* 满了：挤掉最老的，给新来的腾位。 */
+      memmove(g_pend_hex[0], g_pend_hex[1], sizeof(g_pend_hex[0]));
+      g_pend_type[0] = g_pend_type[1];
+      g_pend_n       = PAIR_PEND_SLOTS - 1u;
+    }
+
+  if (g_pend_n == 0u)
+    {
+      /* 队列由空变非空：**这时才起算**（新地址中途进来不延长窗口）。 */
+      g_pend_due_ms   = myvendor_mono_ms() + PAIR_SETTLE_MS;
+      g_pend_start_ms = myvendor_mono_ms();
+    }
+
+  memcpy(g_pend_hex[g_pend_n], norm, 12u);
+  g_pend_hex[g_pend_n][12] = '\0';
+  g_pend_type[g_pend_n]    = type;
+  g_pend_n++;
+
+  /* **不在这里关窗**：本函数会被 `peer_poll` 每拍调用，第一版把
+   * `myvendor_pair_window_close()` 放这儿，结果窗口被自己反复关掉
+   * （`pair window -> adv restart` 连打 8 次 → 随后
+   * `adv off (unpaired, no window)` ⇒ 手机再也搜不到设备）。
+   * 关窗改到**真的落盘之后**（`pair_record_write_now()` 里）。 */
+}
+
+/** @brief 到点把攒下的那条落盘：**在池里才写**，否则丢掉。
+ *
+ *  `pair_key_pool_refresh()` 拿到的就是身份地址列表（`bt_foreach_bond_mc()`，
+ *  与框架 `bt_sal_le_get_bonded_devices()` 同一份数据）。此刻配对已完成、
+ *  池已稳定，"在不在池里"这条判据是可靠的 —— 开机修剪一直准，就是因为它跑的
+ *  时候池是稳定的。
+ *
+ *  @return true = 真的落盘了。
+ */
+static bool pair_pending_commit(void)
+{
+  unsigned s;
+  unsigned i;
+
+  if (pair_key_pool_refresh() == 0u)
+    {
+      /* 池还没起来：**保留队列**，下次再试（不清）。 */
+      return false;
+    }
+
+  for (s = g_pend_n; s > 0u; s--)
+    {
+      for (i = 0; i < g_key_pool_n; i++)
+        {
+          if (strncmp(g_key_pool[i], g_pend_hex[s - 1u], 12u) == 0)
+            {
+              char    hex[13];
+              uint8_t type = g_pend_type[s - 1u];
+
+              memcpy(hex, g_pend_hex[s - 1u], sizeof(hex));
+              g_pend_n = 0u;
+              pair_record_write_now(hex, type);   /* 内含关窗 + 落盘 */
+              pair_prune_now();                   /* 顺手清历史遗留废条目 */
+              return true;
+            }
+        }
+    }
+
+  /* 两个都不是池里的身份地址 —— 可能是"本次连接的 RPA"，也可能只是池还没把
+   * 身份地址归并好。**不立刻丢**：留着，下一次 `peer_poll` 报身份地址时会补进
+   * 队列。但要有个上界，免得永久挂着。 */
+  if ((int32_t)(myvendor_mono_ms() - g_pend_start_ms) >= (int32_t)PAIR_PEND_MAX_MS)
+    {
+      printf("pair: drop %u 个待写地址（超时仍不在密钥池 —— 不是身份地址）\n",
+             g_pend_n);
+      g_pend_n = 0u;
+      return false;
+    }
+
+  return false;
 }
 
 /**
@@ -759,33 +1390,61 @@ void myvendor_pair_note_bond(const bt_address_t *addr, bool bonded)
 
   if (!bonded)
     {
-      char    have[13];
-      char    peer_s[BT_ADDR_STR_LENGTH];
-      char    want[40];
-      uint8_t want_type = 0;
+      struct pair_phone_rec rec[PAIR_PHONE_MAX];
+      unsigned n;
+      unsigned i;
+      unsigned w;
+      char     peer_s[BT_ADDR_STR_LENGTH];
+      char     want[40];
 
-      /* 只在"确实就是这条记录"时清：BOND_STATE_NONE 也会在**别的设备**配对失败
-       * 时发出来（那台陌生设备失败不该把手机这条记录抹掉）。addr == NULL =
-       * `ctl pair forget` 的强制清除路径。 */
-      if (addr != NULL)
+      /* addr == NULL：`ctl pair forget` 清全部。否则只删名单里那一台。 */
+      if (addr == NULL)
         {
-          bt_addr_ba2str(addr, peer_s);
-          pair_norm_addr(peer_s, want, sizeof(want));
-          if (strlen(want) >= 12u)
+          n = pair_phone_load(rec, PAIR_PHONE_MAX);
+          for (i = 0; i < n; i++)
             {
-              want[12] = '\0';
+              /* 密钥在 unbind_poll / forget 路径另清；这里只清 tsv。 */
             }
-          if (!pair_phone_identity(have, sizeof(have), &want_type) ||
-              strncmp(have, want, 12u) != 0)
+
+          if (remove(PAIR_PHONE_TSV) == 0)
             {
-              return;
+              printf("pair: phone record cleared (all)\n");
             }
+
+          return;
         }
 
-      if (remove(PAIR_PHONE_TSV) == 0)
+      bt_addr_ba2str(addr, peer_s);
+      pair_norm_addr(peer_s, want, sizeof(want));
+      if (strlen(want) >= 12u)
         {
-          printf("pair: phone record cleared\n");
+          want[12] = '\0';
         }
+
+      n = pair_phone_load(rec, PAIR_PHONE_MAX);
+      w = 0;
+      for (i = 0; i < n; i++)
+        {
+          if (strncmp(rec[i].hex, want, 12u) == 0)
+            {
+              continue;           /* 删掉这一台 */
+            }
+
+          if (w != i)
+            {
+              rec[w] = rec[i];
+            }
+
+          w++;
+        }
+
+      if (w == n)
+        {
+          return;                 /* 名单里没有它，别误伤 */
+        }
+
+      pair_phone_save(rec, w);
+      printf("pair: phone record removed %s (%u left)\n", want, w);
       return;
     }
 
@@ -868,9 +1527,7 @@ bool myvendor_pair_phone_link_up(void)
  */
 void myvendor_pair_peer_poll(void)
 {
-  char    have[13];
   char    want[40];
-  uint8_t type = 0;
   uint8_t peer_type;
   bool    pending;
 
@@ -895,14 +1552,37 @@ void myvendor_pair_peer_poll(void)
       return;
     }
 
-  if (pair_phone_identity(have, sizeof(have), &type) &&
-      strncmp(have, want, 12u) == 0)
+  if (pair_phone_contains(want, NULL))
     {
-      return;                     /* 已经是它了 */
+      pair_reject_cooldown_clear(want);
+      return;                     /* 已在最多 3 台名单里 */
     }
 
-  printf("pair: secured peer %s -> record\n", want);
+  /** 写入条件：配对窗口内 **或** 这条记录本身已证明是"已绑定手机"。
+   *
+   *  为什么可以不要窗口：本函数的输入全部来自"链路已加密"——
+   *  `le_note_peer_if_secure()` 要求 `bt_conn_get_security(conn) >= BT_SECURITY_L2`，
+   *  控制帧那几条路也只在 ENCRYPT 特征上才收得到；而**能升到 L2 只可能持有我们
+   *  发出去的 LTK** ⇒ 对端必然已经配对过。窗口本来只是"新手机入名单"的闸门，
+   *  对已绑定的手机再多一道闸门只有一个后果：记录里没有它 ⇒ 每次回连都要赌
+   *  3 s 宽限（`PAIR_ADMIT_GRACE_MS`），升不上去就被踢 + 冷却 60 s。
+   *
+   *  现场 2026-09-23（`console.log` 07:24 会话）：记录里已经有身份地址
+   *  `78D8404BF520 type=0`，但窗口一关就是成片
+   *  `pair: secured peer … ignored (not in list, no window)`；同一条链路还会以
+   *  RPA 形式出现（`3C382482454F`，IRK 解析没成功时）⇒ 用户看到的"每次识别的
+   *  手机 MAC 都不一样 / app 关闭就无法再次连接"就是这条。窗口只在
+   *  `ctl pair open` 时开，所以现场被迫反复开窗续命。
+   *
+   *  安全性不变档：陌生设备没有 LTK，升不到 L2，走不到这里；窗口内配对新手机
+   *  那条路照旧（`myvendor_pair_note_bond()` 也照旧）。
+   *
+   *  自证伪：若日志里出现"未配对过的陌生设备地址进了名单"，说明 L2 并非只在
+   *  已绑定链路上成立 ⇒ 那时应改成"只有 IRK 解析出的身份地址（type=0）才写"。 */
+  printf("pair: secured peer %s -> record%s\n", want,
+         myvendor_pair_window_active() ? "" : " (bonded, no window)");
   pair_record_write(want, peer_type);
+  pair_reject_cooldown_clear(want);
 }
 
 /** @brief 有没有"已绑定手机"记录（配对窗口/定向广播/准入都用它）。 */
@@ -914,13 +1594,14 @@ bool myvendor_pair_has_phone_record(void)
   return pair_phone_identity(hex, sizeof(hex), &type);
 }
 
-/** @brief 定向广播的目标（已绑定手机 + 不在配对窗口内）；返回 false = 走普通广播。
+/** @brief 绑定记录里的身份地址查询（**不再作为定向 TargetA**）。
  *
- * **2026-09-20 起调用点已摘掉**：手机配对后会改用轮换 RPA 连接（HCI `atype=1`，
- * 地址每会话都变），定向广播只能打给一个固定 TargetA ⇒ 手机直接忽略、CONNECT_IND
- * 15 s 超时（用户现象："只有配对那次能连，之后连接被拒绝"）。有记录时改成
- * **可发现 + 可连接**（准入与 ENCRYPT 权限兜底，见 ble_companion.c 的三档注释）。
- * 留着这套是为了将来真遇到"公开地址且稳定"的对端（例如某些 iOS 场景）能直接启用。
+ * 2026-10-18 实机 A 方案：TargetA=身份地址时手机 90 s 不连，回退无定向后
+ * 0.36 s 连上 —— 本板控制器不会把身份地址自动解析成手机当前 RPA。
+ * 产品路径已改为：`ble_companion.c` 从 `bt_conn_get_info().le.remote`
+ * 缓存原始 RPA，定向时 target 用该 RPA，own=PUBLIC。
+ * 本函数保留：身份字节序/窗口判断仍正确，仅供需要“身份地址”的调用点参考；
+ * **不要再把它返回的地址直接填进 `params.peer_addr` 做定向广播**。
  */
 bool myvendor_pair_directed_peer(bt_address_t *out, uint8_t *out_type)
 {
@@ -959,18 +1640,267 @@ bool myvendor_pair_directed_peer(bt_address_t *out, uint8_t *out_type)
  * @brief 连接准入：窗口内 / 已记录手机 → 放行；否则断开（AUTH_FAIL）。
  *
  * 由 ble_companion 的 GATT connect 回调在"标记 connected"**之前**调用 ——
- * 被拒时调用方不要把它当连上（断开是异步的，连接对象随后会被栈回收）。
+ * 被拒时调用方不要把它当连上（断开是异步的，连接对象随后会被栈回收），
+ * 也**不要**停 ADV（`companion_stop_advertising` 在 admit 成功之后）。
+ *
+ * **旧手机占坑（换绑后）**：设备已解绑 A、绑了 B；A 系统里仍有旧绑定先连上。
+ * 地址 ≠ 记录 → 以前给 30 s grace 并停 ADV，B 饿死。现：短 grace + 拒连冷却。
+ * 定向 ADV 可用时由射频先挡 A（TargetA=手机当前 RPA）；不可用/冷却时靠本函数主机侧兜底。
  */
 static uint32_t g_admit_deadline_ms;   /* 0 = 没有待处理的未配对连接 */
 static char     g_admit_peer[13];
 static bool     g_unbind_req;          /* ctl/UI 侧请求解绑，交给 companion 线程执行 */
+static unsigned g_unbind_slot;         /* UINT_MAX=全部；否则 0..PAIR_PHONE_MAX-1 */
+
+static void pair_unpair_hex(const char *hex, uint8_t type)
+{
+  bt_addr_le_t addr;
+  unsigned     i;
+  unsigned     bytes[6];
+
+  pair_hex_to_bytes(hex, (uint8_t *)bytes, 6u);
+  memset(&addr, 0, sizeof(addr));
+  for (i = 0; i < 6u; i++)
+    {
+      addr.a.val[i] = ((const uint8_t *)bytes)[5u - i];
+    }
+
+  addr.type = type;
+  printf("pair: unbind %s (type=%u)\n", hex, (unsigned)type);
+  (void)bt_unpair(BT_ID_DEFAULT, &addr);
+}
+
+/** @brief 请求解除绑定（全部）。**只置标志**，执行见 poll。 */
+void myvendor_pair_unbind_request(void)
+{
+  g_unbind_slot = UINT_MAX;
+  g_unbind_req = true;
+}
+
+/** @brief 请求解除第 idx 台（0-based）。越界则当全部清。 */
+void myvendor_pair_unbind_request_slot(unsigned idx)
+{
+  g_unbind_slot = idx;
+  g_unbind_req = true;
+}
+
+/** @brief 是否还有排队的"配对动作"（解绑请求 / 宽限中的准入）。
+ *
+ *  给 companion 主循环在**跳过**这两个 poll 时打好原因用（见
+ *  `ble_companion.c` 的调用点：控制器不应答时不做同步 HCI）。
+ *
+ *  @return true = 有排队中的动作。
+ *
+ *  @note 可从 companion 线程调用；两个标志都只在 companion 线程改。
+ */
+bool myvendor_pair_pending(void)
+{
+  return g_unbind_req || g_admit_deadline_ms != 0u;
+}
+
+/** @brief 执行解绑（companion 线程每拍调）。`bt_unpair` 只能在蓝牙自己的线程里调。
+ *
+ *  ⚠ **调用方必须先确认适配器可用**：本函数走 `bt_unpair()`，而解析列表真的
+ *  写进控制器之后，那条路会经 `bt_keys_clear() → bt_id_del() →
+ *  addr_res_enable()` 发**同步 HCI**；控制器静默时会把 companion 主循环钉死。
+ *  见 `ble_companion.c` 的调用点与 `myvendor_pair_pending()`。 */
+void myvendor_pair_unbind_poll(void)
+{
+  struct pair_phone_rec rec[PAIR_PHONE_MAX];
+  unsigned n;
+  unsigned i;
+
+  if (!g_unbind_req)
+    {
+      return;
+    }
+
+  g_unbind_req = false;
+  myvendor_pair_window_close();
+
+  n = pair_phone_load(rec, PAIR_PHONE_MAX);
+  if (n == 0u)
+    {
+      printf("pair: unbind: no phone record\n");
+      return;
+    }
+
+  if (g_unbind_slot == UINT_MAX || g_unbind_slot >= n)
+    {
+      for (i = 0; i < n; i++)
+        {
+          pair_unpair_hex(rec[i].hex, rec[i].type);
+        }
+
+      (void)remove(PAIR_PHONE_TSV);
+      printf("pair: phone record cleared (all %u)\n", n);
+      return;
+    }
+
+  pair_unpair_hex(rec[g_unbind_slot].hex, rec[g_unbind_slot].type);
+  for (i = g_unbind_slot + 1u; i < n; i++)
+    {
+      rec[i - 1u] = rec[i];
+    }
+
+  pair_phone_save(rec, n - 1u);
+  printf("pair: phone record removed slot %u (%u left)\n",
+         g_unbind_slot, n - 1u);
+}
+
+/** 拒连冷却：踢掉后同 12-hex 地址一段时间立刻拒，打断秒连占坑。 */
+struct pair_reject_slot
+{
+  char     hex[13];
+  uint32_t until_ms;              /* 0 = 空槽 */
+};
+
+static struct pair_reject_slot g_reject_cool[PAIR_REJECT_COOLDOWN_SLOTS];
+
+static void pair_reject_cooldown_clear(const char *hex12)
+{
+  unsigned i;
+
+  /* hex12 == NULL：清空全部冷却槽（配对窗口打开时用）。 */
+  if (hex12 == NULL || hex12[0] == '\0')
+    {
+      if (hex12 == NULL)
+        {
+          for (i = 0; i < PAIR_REJECT_COOLDOWN_SLOTS; i++)
+            {
+              g_reject_cool[i].until_ms = 0u;
+              g_reject_cool[i].hex[0] = '\0';
+            }
+        }
+
+      return;
+    }
+
+  for (i = 0; i < PAIR_REJECT_COOLDOWN_SLOTS; i++)
+    {
+      if (g_reject_cool[i].until_ms != 0u &&
+          strncmp(g_reject_cool[i].hex, hex12, 12u) == 0)
+        {
+          g_reject_cool[i].until_ms = 0u;
+          g_reject_cool[i].hex[0] = '\0';
+        }
+    }
+}
+
+static void pair_reject_cooldown_arm(const char *hex12)
+{
+  unsigned i;
+  unsigned victim = 0;
+  uint32_t now;
+  uint32_t oldest_left;
+
+  if (hex12 == NULL || strlen(hex12) < 12u)
+    {
+      return;
+    }
+
+  now = myvendor_mono_ms();
+
+  /* 已有同地址槽：刷新截止。 */
+  for (i = 0; i < PAIR_REJECT_COOLDOWN_SLOTS; i++)
+    {
+      if (g_reject_cool[i].until_ms != 0u &&
+          strncmp(g_reject_cool[i].hex, hex12, 12u) == 0)
+        {
+          g_reject_cool[i].until_ms = now + PAIR_REJECT_COOLDOWN_MS;
+          return;
+        }
+    }
+
+  /* 空槽优先；否则挤掉剩余冷却最短的。 */
+  oldest_left = UINT32_MAX;
+  for (i = 0; i < PAIR_REJECT_COOLDOWN_SLOTS; i++)
+    {
+      int32_t left;
+
+      if (g_reject_cool[i].until_ms == 0u)
+        {
+          victim = i;
+          break;
+        }
+
+      left = (int32_t)(g_reject_cool[i].until_ms - now);
+      if (left < 0)
+        {
+          victim = i;
+          break;
+        }
+
+      if ((uint32_t)left < oldest_left)
+        {
+          oldest_left = (uint32_t)left;
+          victim = i;
+        }
+    }
+
+  snprintf(g_reject_cool[victim].hex, sizeof(g_reject_cool[victim].hex),
+           "%s", hex12);
+  g_reject_cool[victim].hex[12] = '\0';
+  g_reject_cool[victim].until_ms = now + PAIR_REJECT_COOLDOWN_MS;
+  printf("pair: reject cooldown %s %us\n",
+         g_reject_cool[victim].hex,
+         (unsigned)(PAIR_REJECT_COOLDOWN_MS / 1000u));
+}
+
+static bool pair_reject_cooldown_hit(const char *hex12)
+{
+  unsigned i;
+  uint32_t now;
+
+  if (hex12 == NULL || hex12[0] == '\0')
+    {
+      return false;
+    }
+
+  now = myvendor_mono_ms();
+  for (i = 0; i < PAIR_REJECT_COOLDOWN_SLOTS; i++)
+    {
+      if (g_reject_cool[i].until_ms == 0u)
+        {
+          continue;
+        }
+
+      if ((int32_t)(g_reject_cool[i].until_ms - now) <= 0)
+        {
+          g_reject_cool[i].until_ms = 0u;
+          g_reject_cool[i].hex[0] = '\0';
+          continue;
+        }
+
+      if (strncmp(g_reject_cool[i].hex, hex12, 12u) == 0)
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
+static void pair_admit_kick(const char *hex12, const char *why)
+{
+  struct bt_conn *conn;
+
+  printf("pair: reject %s (%s)\n", hex12, why);
+  conn = pair_conn_find(hex12, NULL);
+  if (conn != NULL)
+    {
+      (void)bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+      bt_conn_unref(conn);
+    }
+
+  pair_reject_cooldown_arm(hex12);
+  g_admit_deadline_ms = 0u;
+}
 
 bool myvendor_pair_admit(const bt_address_t *addr)
 {
-  char    s[BT_ADDR_STR_LENGTH];
-  char    want[40];
-  char    have[13];
-  uint8_t type = 0;
+  char s[BT_ADDR_STR_LENGTH];
+  char want[40];
 
   if (myvendor_pair_window_active())
     {
@@ -984,75 +1914,40 @@ bool myvendor_pair_admit(const bt_address_t *addr)
       want[12] = '\0';
     }
 
-  if (pair_phone_identity(have, sizeof(have), &type) &&
-      strncmp(have, want, 12u) == 0)
+  /* 冷却期内：立刻拒，不进 grace、调用方不标 connected、不停 ADV。 */
+  if (pair_reject_cooldown_hit(want))
     {
-      return true;                /* 就是那台已绑定手机 */
+      pair_admit_kick(want, "cooldown");
+      return false;
     }
 
-  /* **未配对：不再立刻断**（那样手机根本没机会配对：系统配对要先建链路，建链后
-   * 还要跑 SMP）。给一段宽限，超时仍未绑定才断开 —— 见 myvendor_pair_admit_poll()。
-   * 宽限内数据安全由**特征权限**兜底（全部改成 ENCRYPT：未加密的 ATT 操作一律
-   * 被拒，手机因此走隐式配对）。 */
-  snprintf(g_admit_peer, sizeof(g_admit_peer), "%s", want);
-  g_admit_deadline_ms = myvendor_mono_ms() + PAIR_ADMIT_GRACE_MS;
-  printf("pair: unpaired %s -> grace %us (pair now)\n", want,
-         (unsigned)(PAIR_ADMIT_GRACE_MS / 1000u));
-  return true;
+  /* 名单内任一台（最多 3）：直接放行。 */
+  if (pair_phone_contains(want, NULL))
+    {
+      pair_reject_cooldown_clear(want);
+      return true;
+    }
+
+  /* **有手机记录但地址对不上**：可能是名单内手机的 RPA，也可能是陌生人。
+   * 短 grace 等 L2；升不上去 → admit_poll 踢 + 冷却。 */
+  if (myvendor_pair_phone_count() > 0u)
+    {
+      snprintf(g_admit_peer, sizeof(g_admit_peer), "%s", want);
+      g_admit_deadline_ms = myvendor_mono_ms() + PAIR_ADMIT_GRACE_MS;
+      printf("pair: %s not in list -> grace %us (await L2 for bonded RPA)\n",
+             want, (unsigned)(PAIR_ADMIT_GRACE_MS / 1000u));
+      return true;
+    }
+
+  /* **没记录 + 窗口外**：立刻拒。 */
+  pair_admit_kick(want, "no window, no record");
+  return false;
 }
 
-/** @brief 请求解除绑定（清密钥池 + 清手机记录）。**只置标志**，执行见 poll。 */
-void myvendor_pair_unbind_request(void)
-{
-  g_unbind_req = true;
-}
-
-/** @brief 执行解绑（companion 线程每拍调）。`bt_unpair` 只能在蓝牙自己的线程里调。 */
-void myvendor_pair_unbind_poll(void)
-{
-  char            hex[13];
-  uint8_t         type = 0;
-  bt_addr_le_t    addr;
-  unsigned        i;
-  unsigned        bytes[6];
-
-  if (!g_unbind_req)
-    {
-      return;
-    }
-  g_unbind_req = false;
-
-  /* 解绑 = 不再需要"允许配对"这个许可：把可能还开着的窗口收掉。 */
-  myvendor_pair_window_close();
-
-  if (!pair_phone_identity(hex, sizeof(hex), &type))
-    {
-      printf("pair: unbind: no phone record\n");
-      return;
-    }
-
-  /* tsv 里是显示顺序；zblue 的 bt_addr_le_t 是低位在前 → 倒着填。 */
-  pair_hex_to_bytes(hex, (uint8_t *)bytes, 6u);
-  memset(&addr, 0, sizeof(addr));
-  for (i = 0; i < 6u; i++)
-    {
-      addr.a.val[i] = ((const uint8_t *)bytes)[5u - i];
-    }
-  addr.type = type;
-
-  printf("pair: unbind %s (type=%u)\n", hex, (unsigned)type);
-  (void)bt_unpair(BT_ID_DEFAULT, &addr);
-
-  /* 记录也清掉（控制器不一定回 bond-deleted 事件）。 */
-  myvendor_pair_note_bond(NULL, false);
-}
-
-/** @brief 宽限到期仍未绑定 → 断开。由 companion 线程每拍调（框架不能从 ctl 线程碰）。 */
+/** @brief 宽限到期仍未加密 → 断开 + 冷却。由 companion 线程每拍调。 */
 void myvendor_pair_admit_poll(void)
 {
   struct bt_conn *conn;
-  char            have[13];
-  uint8_t         type = 0;
 
   if (g_admit_deadline_ms == 0u ||
       (int32_t)(g_admit_deadline_ms - myvendor_mono_ms()) > 0)
@@ -1062,21 +1957,27 @@ void myvendor_pair_admit_poll(void)
 
   g_admit_deadline_ms = 0u;
 
-  /* 宽限期间配好了？记录里出现这个地址就算通过（bond 回调写记录）。 */
-  if (pair_phone_identity(have, sizeof(have), &type) &&
-      strncmp(have, g_admit_peer, 12u) == 0)
+  conn = pair_conn_find(g_admit_peer, NULL);
+  if (conn == NULL)
     {
-      printf("pair: %s paired in grace\n", g_admit_peer);
+      /* 对端已自行断开：仍冷却该地址，防旧手机立刻再占坑。 */
+      pair_reject_cooldown_arm(g_admit_peer);
       return;
     }
 
-  conn = pair_conn_find(g_admit_peer, NULL);
-  if (conn != NULL)
+  /* 已绑定手机 RPA 回连：宽限内 LTK 升到 L2。清冷却，别误伤真 B。 */
+  if (bt_conn_get_security(conn) >= BT_SECURITY_L2)
     {
-      printf("pair: reject unpaired %s (grace over)\n", g_admit_peer);
-      (void)bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+      printf("pair: %s secured in grace (bonded reconnect)\n", g_admit_peer);
+      pair_reject_cooldown_clear(g_admit_peer);
       bt_conn_unref(conn);
+      return;
     }
+
+  /* 未加密：旧手机 / 陌生人。踢掉后 gatts 断链 → companion_phone_gone →
+   * adv_restart（grace 路径曾标过 connected 并停过 ADV）。 */
+  bt_conn_unref(conn);
+  pair_admit_kick(g_admit_peer, "grace over, not encrypted");
 }
 
 
@@ -1304,7 +2205,7 @@ int myvendor_bt_pair_cmd(int argc, char ** argv)
 
   if (argc < 1)
     {
-      printf("usage: ctl pair list | connect <idx|addr> | accept on|off | open [秒] | phone | unbind | forget\n");
+      printf("usage: ctl pair list | connect <idx|addr> | accept on|off | open [秒] | phone | unbind [idx] | forget\n");
       return 1;
     }
 
@@ -1340,25 +2241,51 @@ int myvendor_bt_pair_cmd(int argc, char ** argv)
 
   if (strcmp(argv[0], "phone") == 0)
     {
-      char    hex[13];
-      uint8_t type = 0;
+      struct pair_phone_rec rec[PAIR_PHONE_MAX];
+      unsigned n = pair_phone_load(rec, PAIR_PHONE_MAX);
+      unsigned i;
 
-      if (pair_phone_identity(hex, sizeof(hex), &type))
-        {
-          printf("pair: phone %s type=%u window=%d\n", hex, (unsigned)type,
-                 myvendor_pair_window_active() ? 1 : 0);
-        }
-      else
+      if (n == 0u)
         {
           printf("pair: phone record absent (window=%d)\n",
                  myvendor_pair_window_active() ? 1 : 0);
         }
+      else
+        {
+          printf("pair: phones %u/%u window=%d\n", n,
+                 (unsigned)PAIR_PHONE_MAX,
+                 myvendor_pair_window_active() ? 1 : 0);
+          for (i = 0; i < n; i++)
+            {
+              printf("  [%u] %s type=%u\n", i, rec[i].hex,
+                     (unsigned)rec[i].type);
+            }
+        }
+
       return 0;
     }
 
   if (strcmp(argv[0], "unbind") == 0)
     {
-      /* 真解绑（清密钥池）+ 清记录；实际执行在 companion 线程（框架约束）。 */
+      /* 真解绑（清密钥池）+ 清记录；实际执行在 companion 线程（框架约束）。
+       * 带 idx 时只解绑该槽，保留其余已绑定手机（定向目标切换/R5 测试）。 */
+      if (argc >= 2)
+        {
+          char *end = NULL;
+          unsigned long idx = strtoul(argv[1], &end, 0);
+
+          if (end == argv[1] || (end != NULL && *end != '\0') ||
+              idx >= PAIR_PHONE_MAX)
+            {
+              printf("pair: unbind <idx 0..%u>\n",
+                     (unsigned)PAIR_PHONE_MAX - 1u);
+              return -EINVAL;
+            }
+
+          myvendor_pair_unbind_request_slot((unsigned)idx);
+          return 0;
+        }
+
       myvendor_pair_unbind_request();
       return 0;
     }
@@ -1387,7 +2314,7 @@ int myvendor_bt_pair_cmd(int argc, char ** argv)
       return pair_cmd_accept(strcmp(argv[1], "on") == 0);
     }
 
-  printf("usage: ctl pair list | connect <idx|addr> | accept on|off | open [秒] | phone | unbind | forget\n");
+  printf("usage: ctl pair list | connect <idx|addr> | accept on|off | open [秒] | phone | unbind [idx] | forget\n");
   return 1;
 }
 

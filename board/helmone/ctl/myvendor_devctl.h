@@ -31,6 +31,11 @@ extern "C" {
 #define MYVENDOR_DEVCTL_CALLS_KEY   "persist.ui.notif_calls"      /**< 仅来电 0/1。 */
 #define MYVENDOR_DEVCTL_SOUND_KEY   "persist.ui.sound"            /**< 蜂鸣器提示音 0/1。 */
 #define MYVENDOR_DEVCTL_AUTOPAUSE_KEY "persist.ui.autopause"      /**< 骑行自动暂停 0/1。 */
+/** @brief 地图航向朝上（箭头恒指上）0/1。
+ *
+ * 1 = 地图随航向旋转、路名用独立正立文本（不烘进底图）；
+ * 0 = 保持原样（正北朝上、路名烘进地图图片，性能更好）。默认 0。 */
+#define MYVENDOR_DEVCTL_MAP_UP_KEY "persist.ui.map_heading_up"
 #define MYVENDOR_DEVCTL_LAST_RIDE_M_KEY "persist.ride.last_m"     /**< 上次保存骑行里程，米。 */
 #define MYVENDOR_DEVCTL_LAST_LON_E7_KEY "persist.ride.last_lon_e7" /**< 上次骑行终点经度 ×1e7。 */
 #define MYVENDOR_DEVCTL_LAST_LAT_E7_KEY "persist.ride.last_lat_e7" /**< 上次骑行终点纬度 ×1e7。 */
@@ -40,7 +45,34 @@ extern "C" {
 #define MYVENDOR_DEVCTL_TZ_KEY     "persist.ui.tz_min"            /**< 时区，相对 UTC 的分钟。 */
 #define MYVENDOR_DEVCTL_BAT_FULL_KEY "persist.battery.full_mv"     /**< 满电校准：100% 对应毫伏。 */
 #define MYVENDOR_DEVCTL_PWR_KEY     "persist.boot.pwr"            /**< 1=2SFBL 不判 PWR 键，直接跳转。 */
+/** 启动槽位：`fw` = SD 上 `/mnt/kv/fw/` 目录里的 `*.bin`（产品路径，bootloader 按版本取最新）；
+ *  `main` = **本机被 `flash` 写进去的 main 分区**；`factory` = 工厂槽。
+ *
+ *  2SFBL 的选择顺序是 `persist.boot.target` → `/fw` → `main` → `factory`，
+ *  所以这里写了什么、**下一次开机**就走什么 —— 改完不复位不生效。
+ *  （现场踩过：`flash` 明明成功、`build_date` 却不变，就是因为它还在走 `fw`。）
+ */
+#define MYVENDOR_DEVCTL_BOOT_TARGET_KEY "persist.boot.target"
+/** 槽位名长度上限（含结尾 NUL）；`fw`/`main`/`factory` 都远小于它。 */
+#define MYVENDOR_DEVCTL_BOOT_TARGET_MAX 16
 #define MYVENDOR_DEVCTL_LOG_KEY     "persist.log.mask"            /**< syslog 屏蔽位，见 ctl log。 */
+/** framework 的 BT_LOG* 档位，见 `ctl btlog`。
+ *
+ *  这个 key 是**框架自己定的**：`service/utils/log_server.c` 的
+ *  `PERSIST_BT_FRAMEWORK_LOG_LEVEL`，它用 `property_monitor` 监听这个 key
+ *  来热加载等级。所以这里必须写字面量同一个串 —— 改成别的名字，
+ *  `ctl btlog` 就变成"写了个没人读的值"。 */
+#define MYVENDOR_CTL_BTLOG_KEY      "persist.bluetooth.log.level"
+/** 「充电时也按负载动态调频」模式（`ctl dvfs charge on|off`），见 `sf32lb_dvfs.h`。
+ *  默认 0 = 关（原策略：充电把 HCLK 钉在 240）。 */
+#define MYVENDOR_DEVCTL_DVFS_CHARGE_DYN_KEY "persist.dvfs.charge_dyn"
+/** diag 周期计数器报表的模块开关掩码（`ctl cnt`），位序见 `myvendor_diag.c`
+ *  的 `g_cnt_mods[]`。**KV 里没有这条 key ⇒ 全开**（所有位 1）。 */
+#define MYVENDOR_DEVCTL_DIAG_CNT_KEY "persist.diag.cnt_mask"
+
+/** @brief 读/写"周期计数器报表"开关掩码（`ctl cnt`）；改动落 KV。 */
+uint32_t myvendor_devctl_diag_cnt_mask_get(void);
+int myvendor_devctl_diag_cnt_mask_set(uint32_t mask);
 
 #define MYVENDOR_DEVCTL_BL_DEFAULT  16u  /**< KV 缺失：PWM 16 = UI 20%。 */
 #define MYVENDOR_DEVCTL_TZ_DEFAULT 480  /**< 默认 UTC+8。 */
@@ -173,16 +205,29 @@ int myvendor_devctl_sensor_scan_stop(void);
 int myvendor_devctl_pair_open(uint32_t secs);
 
 /**
- * @brief 解除与本机的绑定（清密钥池 + 清"已绑定手机"记录）。
+ * @brief 解除与手机的绑定（默认全部）。
  */
 int myvendor_devctl_pair_unbind(void);
 
 /**
- * @brief 读"已绑定手机"记录（`/mnt/kv/bt_phone.tsv`，一行 `ADDR<TAB>TYPE`）。
- *
- * 设备 UI 的「手机App」页用它决定显示"提示配对"还是"已配对 + 设备状态"。
- * @param addr 非空时填入记录里的地址（形如 `78D8404BF520`）。
- * @return 1 = 已配对；0 = 没记录（或文件读不了）。
+ * @brief 解除第 idx 台已绑定手机（0-based）。
+ */
+int myvendor_devctl_pair_unbind_at(unsigned idx);
+
+/**
+ * @brief 读"已绑定手机"记录数（最多 3）。
+ */
+unsigned myvendor_devctl_pair_phone_count(void);
+
+/**
+ * @brief 读第 idx 台手机地址（0-based，形如 `78D8404BF520`）。
+ * @return 1 = 有；0 = 无此槽。
+ */
+int myvendor_devctl_pair_phone_at(unsigned idx, char *addr, size_t len);
+
+/**
+ * @brief 读第一台已绑定手机（兼容旧 UI）。
+ * @return 1 = 已配对；0 = 没记录。
  */
 int myvendor_devctl_pair_phone(char *addr, size_t len);
 
@@ -294,6 +339,11 @@ int myvendor_devctl_autopause_set(bool on);
  */
 bool myvendor_devctl_autopause_get(void);
 
+/** @brief 设置"地图航向朝上"并落盘。0 = 正北 + 文字烘进底图（默认）。 */
+int myvendor_devctl_map_heading_up_set(bool on);
+/** @brief "地图航向朝上"是否为开。 */
+bool myvendor_devctl_map_heading_up_get(void);
+
 /**
  * @brief 记下上次成功保存的骑行里程（米），写入 KV。开机待机页用。
  */
@@ -392,6 +442,20 @@ int myvendor_devctl_log_mask_set(uint8_t mask, uint8_t *old);
  * 所以两者一致。
  */
 uint8_t myvendor_devctl_log_mask_get(void);
+
+/**
+ * @brief 设置「充电时也按负载动态调频」模式，并落 KVDB。
+ *
+ * @details 先改运行期（`sf32lb_dvfs_charge_dyn_set()`）再落盘 —— 与 log mask
+ *          同一个理由：写盘失败也要保留本次生效的行为，反过来会让调用方看到
+ *          "设了却没生效"。
+ * @param on true = 开。
+ * @return 0 成功；负值为落盘失败（**运行期已经生效**）。
+ */
+int myvendor_devctl_dvfs_charge_dyn_set(bool on);
+
+/** @brief 读取「充电时也按负载动态调频」模式当前值。 */
+bool myvendor_devctl_dvfs_charge_dyn_get(void);
 
 /**
  * @brief 读取全部常用点；与 NSH `ctl fav` 使用同一文件。
@@ -515,6 +579,30 @@ int myvendor_devctl_pwr_set(bool on);
 
 /** @brief persist.boot.pwr 是否为开（缺文件视为关）。 */
 bool myvendor_devctl_pwr_get(void);
+
+/**
+ * @brief 读启动槽位（`persist.boot.target`）。
+ *
+ * @param[out] out 目标缓冲，至少 @ref MYVENDOR_DEVCTL_BOOT_TARGET_MAX 字节。
+ * @param[in]  n   缓冲长度。
+ * @return true = 读到；false = 没设过（交给 2SFBL 走默认顺序 `/fw` → `main`
+ *         → `factory`）或参数非法。
+ *
+ * @note 只读 KV 文件，任意线程可调。返回的槽位名**不保证是已知值** ——
+ *       文件可以被 `ctl boot` 之外的途径改，所以显示时原样打出来即可。
+ */
+bool myvendor_devctl_boot_target_get(char *out, size_t n);
+
+/**
+ * @brief 写启动槽位（只在**下一次开机**生效，本函数不复位）。
+ *
+ * @param[in] target 槽位名：`fw` / `main` / `factory`（大小写不敏感）。
+ * @return 0 成功；负值为 errno（写盘失败）。
+ *
+ * @note 会先校验是不是已知槽位 —— 写错名字的后果是 2SFBL 认不出、退回
+ *       默认顺序，用户会以为"改了没生效"，所以宁可在这里拒掉。
+ */
+int myvendor_devctl_boot_target_set(const char *target);
 
 #ifdef __cplusplus
 }

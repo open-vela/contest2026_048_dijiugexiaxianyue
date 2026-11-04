@@ -344,6 +344,16 @@ void companion_bridge_sensor_ui_set(const struct companion_sensor_ui *ui);
  */
 void companion_bridge_sensor_ui_get(struct companion_sensor_ui *out);
 
+/**
+ * @brief 某个传感器槽位是否**已绑定**（有保存下来的对端地址）。
+ * @param kind 0 HR / 1 CSC / 2 CPS；越界返回 false。
+ * @return true = 有绑定记录。**连不连上都算 true**（停车断链、信号丢失不影响），
+ *         只有"重新配网/删除绑定"才会翻回 false。
+ * @note 比 @ref companion_bridge_sensor_ui_get 便宜得多：只取一个布尔，不整份
+ *       快照（UI 每拍都要问一次，而 ui 快照里有整张扫描表）。
+ */
+bool companion_bridge_sensor_slot_bound(uint8_t kind);
+
 #define COMPANION_NOTIF_INBOX_MAX      8u
 #define COMPANION_NOTIF_QUEUE_MAX      4u
 #define COMPANION_NOTIF_ICON_PATH_MAX  128u
@@ -368,6 +378,16 @@ void companion_bridge_policy_set_notif(bool on);
  * @brief 当前是否接受手机通知。
  */
 bool companion_bridge_policy_notif(void);
+
+/**
+ * @brief 通知过滤计数（板级，2026-09-24）：`rx` 收到总数 / `merged` 同键合并
+ *        （常驻通知的更新）/ `throttled` 因弹窗限流而未弹 / `evicted` inbox 满丢条目。
+ *
+ * 见 .c 里 `companion_bridge_notif_post()` 的注释：设备端用 `type + title`
+ * 近似"同一条通知"，常驻通知只更新内容、不重弹 modal。
+ */
+void companion_bridge_notif_stats(uint32_t *rx, uint32_t *merged,
+                                  uint32_t *throttled, uint32_t *evicted);
 
 /**
  * @brief 产品策略：仅收录来电。
@@ -454,6 +474,12 @@ void companion_bridge_sensor_cmd_set_pair_secs(uint32_t secs);
 
 /** @brief 取配对窗口秒数（companion 侧消费命令时读）。 */
 uint32_t companion_bridge_test_pair_secs(void);
+
+/** @brief PAIR_UNBIND 槽：0xff=全部，否则 0..2。 */
+void companion_bridge_sensor_cmd_set_pair_unbind_slot(uint8_t slot);
+
+/** @brief 取 PAIR_UNBIND 槽。 */
+uint8_t companion_bridge_test_pair_unbind_slot(void);
 
 /** @brief 配对/连接快照（companion 线程填，ctl 侧读）。 */
 void companion_bridge_pair_report_set(const char *text);

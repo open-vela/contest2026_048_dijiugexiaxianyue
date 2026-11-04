@@ -3,7 +3,7 @@
   "sdk_board": "sf32lb52-nano_a128r16",
   "sdk_flash_table": "example/flash_table/sf32lb52x_common_v2",
   "boot_loader_project": "project/butterflmicro/ram_v2",
-  "nuttx_output": "cmake_out/my_vendor_nsh",
+  "nuttx_output": "cmake_out/helmone_nsh",
   "boot_images_subdir": "nsh",
   "images": {
     "ftab": {

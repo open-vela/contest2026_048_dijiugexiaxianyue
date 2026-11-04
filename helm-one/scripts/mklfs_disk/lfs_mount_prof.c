@@ -8,7 +8,7 @@
  *
  * Build (from openvela root):
  *   gcc -O2 -I nuttx/fs/littlefs/littlefs \
- *       vendor/my_vendor/scripts/mklfs_disk/lfs_mount_prof.c \
+ *       vendor/HelmOne/scripts/mklfs_disk/lfs_mount_prof.c \
  *       nuttx/fs/littlefs/littlefs/lfs.c \
  *       nuttx/fs/littlefs/littlefs/lfs_util.c -o /tmp/lfs_mount_prof
  */

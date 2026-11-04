@@ -240,6 +240,19 @@ static inline void * /* LV_ATTRIBUTE_FAST_MEM */ drawbuf_next_row(const void * b
  **********************/
 
 /**
+ * One masked pixel: leave it alone, store the color, or mix.
+ * A macro because -Os doesn't inline helpers, and this runs on every pixel.
+ */
+#define RGB565_MASK_FILL_PX(dest_px, mask_val)                                  \
+    do {                                                                        \
+        uint32_t a_ = (mask_val);                                               \
+        if(a_) {                                                                \
+            if(a_ >= LV_OPA_MAX) (dest_px) = color16;                           \
+            else LV_COLOR_MIX_16_TO_16_PREPARED(dest_px, fg_prep, dest_px, a_); \
+        }                                                                       \
+    } while(0)
+
+/**
  * Fill an area with a color.
  * Supports normal fill, fill with opacity, fill with mask, and fill with mask and opacity.
  * dest_buf and color have native color depth. (RGB565, RGB888, XRGB8888)
@@ -276,6 +289,10 @@ void LV_ATTRIBUTE_FAST_MEM lv_draw_sw_blend_color_to_rgb565(lv_draw_sw_blend_fil
     LV_UNUSED(mask_stride);
     LV_UNUSED(dest_stride);
     LV_UNUSED(dest_buf_u16);
+
+    /*The fill color is the same for the whole area, so expand it once*/
+    uint32_t fg_prep = LV_COLOR_MIX_16_PREPARE(color16);
+    LV_UNUSED(fg_prep);
 
     /*Simple fill*/
     if(mask == NULL && opa >= LV_OPA_MAX) {
@@ -359,30 +376,57 @@ void LV_ATTRIBUTE_FAST_MEM lv_draw_sw_blend_color_to_rgb565(lv_draw_sw_blend_fil
     /*Masked with full opacity*/
     else if(mask && opa >= LV_OPA_MAX) {
         if(LV_RESULT_INVALID == LV_DRAW_SW_COLOR_BLEND_TO_RGB565_WITH_MASK(dsc)) {
-            for(y = 0; y < h; y++) {
-                x = 0;
-                if((lv_uintptr_t)(mask) & 0x1) {
-                    dest_buf_u16[x] = lv_color_16_16_mix(color16, dest_buf_u16[x], mask[x]);
-                    x++;
-                }
-
-                for(; x <= w - 2; x += 2) {
-                    uint16_t mask16 = *((uint16_t *)&mask[x]);
-                    if(mask16 == 0xFFFF) {
-                        dest_buf_u16[x + 0] = color16;
-                        dest_buf_u16[x + 1] = color16;
+            /*Masks are mostly 0 or 255, so both are decided before the mix. Narrow rows go
+             *per pixel; wide ones have long runs, worth testing four mask bytes at once.*/
+            if(w < 32) {
+                for(y = 0; y < h; y++) {
+                    /*Counting up to zero from -w saves a compare per pixel*/
+                    const lv_opa_t * mask_row = mask + w;
+                    uint16_t * dest_row = dest_buf_u16 + w;
+                    int32_t i = -w;
+                    if(w & 0x1) {
+                        RGB565_MASK_FILL_PX(dest_row[i], mask_row[i]);
+                        i++;
                     }
-                    else if(mask16 != 0) {
-                        dest_buf_u16[x + 0] = lv_color_16_16_mix(color16, dest_buf_u16[x + 0], mask[x + 0]);
-                        dest_buf_u16[x + 1] = lv_color_16_16_mix(color16, dest_buf_u16[x + 1], mask[x + 1]);
+                    while(i) {
+                        RGB565_MASK_FILL_PX(dest_row[i], mask_row[i]);
+                        RGB565_MASK_FILL_PX(dest_row[i + 1], mask_row[i + 1]);
+                        i += 2;
                     }
+                    dest_buf_u16 = drawbuf_next_row(dest_buf_u16, dest_stride);
+                    mask += mask_stride;
                 }
-
-                for(; x < w ; x++) {
-                    dest_buf_u16[x] = lv_color_16_16_mix(color16, dest_buf_u16[x], mask[x]);
+            }
+            else {
+                for(y = 0; y < h; y++) {
+                    /*Align the mask so that the word reads below are aligned too*/
+                    for(x = 0; x < w && ((lv_uintptr_t)(mask + x) & 0x3); x++) {
+                        RGB565_MASK_FILL_PX(dest_buf_u16[x], mask[x]);
+                    }
+                    for(; x <= w - 4; x += 4) {
+                        uint32_t mask32;
+                        mask32 = ((const lv_draw_sw_word_t *)(mask + x))->u32;
+                        if(mask32 == 0) continue;   /*Four transparent pixels*/
+                        if(mask32 == 0xFFFFFFFF) {  /*Four opaque pixels*/
+                            dest_buf_u16[x + 0] = color16;
+                            dest_buf_u16[x + 1] = color16;
+                            dest_buf_u16[x + 2] = color16;
+                            dest_buf_u16[x + 3] = color16;
+                            continue;
+                        }
+                        /*Read the bytes again rather than split `mask32`, so the byte
+                         *order doesn't matter*/
+                        RGB565_MASK_FILL_PX(dest_buf_u16[x + 0], mask[x + 0]);
+                        RGB565_MASK_FILL_PX(dest_buf_u16[x + 1], mask[x + 1]);
+                        RGB565_MASK_FILL_PX(dest_buf_u16[x + 2], mask[x + 2]);
+                        RGB565_MASK_FILL_PX(dest_buf_u16[x + 3], mask[x + 3]);
+                    }
+                    for(; x < w; x++) {
+                        RGB565_MASK_FILL_PX(dest_buf_u16[x], mask[x]);
+                    }
+                    dest_buf_u16 = drawbuf_next_row(dest_buf_u16, dest_stride);
+                    mask += mask_stride;
                 }
-                dest_buf_u16 = drawbuf_next_row(dest_buf_u16, dest_stride);
-                mask += mask_stride;
             }
         }
     }
@@ -391,7 +435,10 @@ void LV_ATTRIBUTE_FAST_MEM lv_draw_sw_blend_color_to_rgb565(lv_draw_sw_blend_fil
         if(LV_RESULT_INVALID == LV_DRAW_SW_COLOR_BLEND_TO_RGB565_MIX_MASK_OPA(dsc)) {
             for(y = 0; y < h; y++) {
                 for(x = 0; x < w; x++) {
-                    dest_buf_u16[x] = lv_color_16_16_mix(color16, dest_buf_u16[x], LV_OPA_MIX2(mask[x], opa));
+                    /*The product can't reach 255, so there is no opaque shortcut here*/
+                    uint32_t a = LV_OPA_MIX2(mask[x], opa);
+                    if(a == 0) continue;
+                    LV_COLOR_MIX_16_TO_16_PREPARED(dest_buf_u16[x], fg_prep, dest_buf_u16[x], a);
                 }
                 dest_buf_u16 = drawbuf_next_row(dest_buf_u16, dest_stride);
                 mask += mask_stride;
@@ -399,6 +446,8 @@ void LV_ATTRIBUTE_FAST_MEM lv_draw_sw_blend_color_to_rgb565(lv_draw_sw_blend_fil
         }
     }
 }
+
+#undef RGB565_MASK_FILL_PX
 
 void LV_ATTRIBUTE_FAST_MEM lv_draw_sw_blend_image_to_rgb565(lv_draw_sw_blend_image_dsc_t * dsc)
 {

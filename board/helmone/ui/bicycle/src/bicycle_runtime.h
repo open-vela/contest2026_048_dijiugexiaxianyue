@@ -32,6 +32,14 @@ typedef struct {
     bool gnss_has_altitude;
     float gain_m;
     float loss_m;
+    /** @name 会话内海拔极值（只在记录中统计，与 gain/loss 同一口径）。
+     *  @note `alt_range_valid` 为假时**不要**把 0 当有效值用（0 m 是合法海拔）。
+     *  @{
+     */
+    float altitude_max_m;
+    float altitude_min_m;
+    bool alt_range_valid;
+    /** @} */
     float grade_pct;
     bool gnss_valid;
     bool gnss_alive;
@@ -234,6 +242,13 @@ void bicycle_runtime_sync_companion_sensors(void);
  */
 void bicycle_runtime_update_env(float altitude_m, bool has_altitude,
     float grade_pct, float dalt_m);
+
+/**
+ * @brief 计入一段净高度变化（正=爬升、负=下降）；只在录制中生效。
+ *
+ * 供 env 的段结账与骑行结束的 flush（`bicycle_env_flush_gain`）共用。
+ */
+void bicycle_runtime_add_dalt(float dalt_m);
 
 /**
  * @brief 取当前定位：路线/GPX 模拟优先，否则板载 GNSS，再否则手机 GNSS。

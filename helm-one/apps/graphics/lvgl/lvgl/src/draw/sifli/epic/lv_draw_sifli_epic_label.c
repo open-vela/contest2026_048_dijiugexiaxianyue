@@ -43,6 +43,13 @@ static void draw_fill_part(lv_draw_task_t * task, lv_draw_fill_dsc_t * fill_draw
  *   GLOBAL FUNCTIONS
  **********************/
 
+/* Cycle-level timing instrumentation (see lv_draw_sifli_epic.c). */
+extern uint32_t lv_sifli_epic_dbg_cyc(void);
+extern uint32_t lv_sifli_epic_dbg_font_cyc;
+extern uint32_t lv_sifli_epic_dbg_blend_cyc;
+extern uint32_t lv_sifli_epic_dbg_label_cyc;
+extern uint32_t lv_sifli_epic_dbg_glyphs;
+
 void lv_draw_sifli_epic_label(lv_draw_task_t * task)
 {
     const lv_draw_label_dsc_t * dsc = (const lv_draw_label_dsc_t *)task->draw_dsc;
@@ -51,9 +58,11 @@ void lv_draw_sifli_epic_label(lv_draw_task_t * task)
         return;
     }
 
+    uint32_t t0 = lv_sifli_epic_dbg_cyc();
     lv_epic_cont_blend_reset();
     lv_draw_label_iterate_characters(task, dsc, &task->area, draw_letter_cb);
     lv_epic_cont_blend_reset();
+    lv_sifli_epic_dbg_label_cyc += lv_sifli_epic_dbg_cyc() - t0;
 }
 
 /**********************
@@ -123,7 +132,11 @@ static void draw_bitmap_glyph(lv_draw_task_t * task, lv_draw_glyph_dsc_t * glyph
         return;
     }
 
+    uint32_t t_glyph = lv_sifli_epic_dbg_cyc();
+    lv_sifli_epic_dbg_glyphs++;
+
     glyph_draw_dsc->glyph_data = lv_font_get_glyph_bitmap(glyph_draw_dsc->g, glyph_draw_dsc->_draw_buf);
+    lv_sifli_epic_dbg_font_cyc += lv_sifli_epic_dbg_cyc() - t_glyph;
     if(glyph_draw_dsc->glyph_data == NULL) {
         return;
     }
@@ -160,7 +173,9 @@ static void draw_bitmap_glyph(lv_draw_task_t * task, lv_draw_glyph_dsc_t * glyph
     input_layers[1].ax_mode = ALPHA_BLEND_RGBCOLOR;
     input_layers[1].data_size = (uint32_t)glyph_buf->header.stride * glyph_buf->header.h;
 
+    uint32_t t_blend = lv_sifli_epic_dbg_cyc();
     (void)lv_epic_cont_blend(input_layers, 2, &output_layer);
+    lv_sifli_epic_dbg_blend_cyc += lv_sifli_epic_dbg_cyc() - t_blend;
 }
 
 static void draw_glyph_as_image(lv_draw_task_t * task, lv_draw_glyph_dsc_t * glyph_draw_dsc)

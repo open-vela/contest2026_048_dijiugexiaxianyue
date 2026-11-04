@@ -1,5 +1,5 @@
 #
-# vendor/HelmOne/apps/graphics/lvgl/Kconfig
+# vendor/my_vendor/apps/graphics/lvgl/Kconfig
 #
 # LVGL build is owned by my_vendor (CONFIG_MYVENDOR_LVGL_STACK).
 # Do not enable CONFIG_GRAPHICS_LVGL in apps/graphics/lvgl at the same time.

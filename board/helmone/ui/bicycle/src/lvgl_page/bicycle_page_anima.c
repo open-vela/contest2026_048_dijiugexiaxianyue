@@ -52,9 +52,20 @@ static const bicycle_page_anima_row_t s_page_anima[BICYCLE_PM_ID_COUNT] = {
         .back_bar_en = false,
     },
     [BICYCLE_PM_ID_MENU] = {
-        .anima_cb = &lv_pm_fade_anima,
+        /* ⚠ **两个方向都由本行决定**（用户 2026-09-26 晚："主界面进入菜单和菜单返回
+         * 主界面，不加动画了"）：
+         *   进 = 菜单 ENTER（`lv_pm_open_page_msg`）+ 主界面 EXIT 用的是"打开页的
+         *        options"（`lv_pm_core.c` 里 `&open_page->open_options`）⇒ 也是本行；
+         *   回 = 菜单 EXIT 用本行（no_anima）；但 `lv_pm_close_page_msg()` **还会给
+         *        露出来的主界面播一次它自己的 ENTER**（`lv_pm_core.c` 里对
+         *        `prev_page` 的 `lv_pm_anima_play(..., LV_PM_ANIMA_ENTER, ...)`），
+         *        那条用的是 MAP 行 —— 所以"回程"还必须在 `map_will_appear()` 里按
+         *        "是谁盖住的"换成 `apply_silent()`（WP-FADE/R1，见 map_page.c）。
+         * 这样两个方向都瞬变，而且**不牵动主界面自己的过渡**（开机揭场、从 USB/
+         * 工厂页回来仍走 `[BICYCLE_PM_ID_MAP]` 那行的淡入）。 */
+        .anima_cb = &lv_pm_no_anima,
         .direction = 0,
-        .time_ms = 180,
+        .time_ms = 0,
         .cache_enable = false,
         .top_bar_en = true,
         .back_bar_en = false,

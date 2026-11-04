@@ -4,6 +4,18 @@
 > 改的是 zblue 自己的主机栈文件，`repo sync` 之后必须重新应用。
 >
 > 对应补丁：[patches/zblue-scan-stop-null-ctx.patch](patches/zblue-scan-stop-null-ctx.patch)
+>
+> **构建时的落地机制（2026-09-24 起）**：`vela_override/zblue/patch_scan_stop_null.py`。
+> CMake 在 configure 阶段跑它，把改动写进构建副本
+> `cmake_out/helmone_nsh/myvendor_zblue/myvendor_scan.c`，并按路径后缀顶掉上游那份
+> —— 于是**上游 git 保持不动**（`git status` 干净，不再有就地改的 `M`）。
+> 本目录的 `.patch` 是同一改动的另一份表达（`repo sync` 后手工应用用），两份必须一致：
+> 改了脚本就重新导出 `python3 zcode/gen_zblue_pitch_patch.py scan`（只打印，不落盘），
+> 再对构建副本做一次 `git apply` + `diff` 验证。
+>
+> 为什么是脚本而不是继续就地改：打过 pitch 补丁的树再走一次构建脚本会锚点不中，
+> 脚本会**拒绝猜**（锚点匹配数 ≠ 1 直接报错），CMake 只打 WARNING 后继续 ⇒ 静默退回
+> 旧版本，属于"build 成功 ≠ 生效"那一类坑。两份表达同源才能避免。
 
 ## 改哪个组件、基于哪个版本（**换版本前一定先对这张表**）
 
@@ -13,7 +25,8 @@
 | 写入时的 HEAD | `6f79fb2a0f83ad49f9fdd10504ab97d6c9eaf6b3`（`6f79fb2a0f8`，2026-04-22 `chore: sync .github…`） |
 | 文件 | `subsys/bluetooth/host/scan.c` |
 | 该文件在 HEAD 的 blob | `8d6ff66b5ff51cb75908cb2e6a06aa4398401a0c` |
-| 补丁写于 | 2026-09-19 |
+| 补丁写于 | 2026-09-19（只堵 softreset + stop_mc 两处） |
+| **补齐于** | **2026-09-24**（同一根因的第 3、4 处：`bt_le_scan_user_add` / `bt_le_scan_user_remove` 入口；并把前两处收进构建脚本，上游树回到 pristine） |
 
 **怎么判断是否需要重新适配**（版本漂移时最省事的三步）：
 
@@ -21,7 +34,7 @@
 git -C external/zblue/zblue rev-parse HEAD
 git -C external/zblue/zblue rev-parse HEAD:subsys/bluetooth/host/scan.c   # 应等于上表 blob
 git -C external/zblue/zblue apply --check \
-    ../../../vendor/my_vendor/docs/pitch/patches/zblue-scan-stop-null-ctx.patch
+    ../../../vendor/HelmOne/docs/pitch/patches/zblue-scan-stop-null-ctx.patch
 ```
 
 - HEAD 变了但 blob 没变 ⇒ 文件没被动过，**照着下面"改后"直接改这两处**即可；
@@ -182,38 +195,88 @@ int bt_le_scan_stop_mc(uint8_t dev_id)
 - `LOG_WRN` 在本配置下**可能被编译掉**（不影响判空逻辑）：确认改动是否进了镜像要看反汇编，
   别看日志里有没有那句话。
 
+## 2026-09-24 补齐：同一个窗口的第 3、4 处
+
+2026-09-18 那次只堵了**本次故障路径上的两处**（softreset 与紧随其后的 stop_mc 尾部）。
+但"`scan_ctx == NULL`"这个前提是对**所有从上层进得来的入口**成立的，不只是 stop：
+
+| 入口 | 裸解引用在哪 | 谁会走到 |
+|---|---|---|
+| `bt_le_scan_user_remove()`（新增判空） | 函数体 `atomic_clear_bit(hdev->scan_ctx->scan_state.scan_flags, …)`；以及它调用的 `scan_update()` 第一行 `k_mutex_lock(&hdev->scan_ctx->…scan_update_mutex, K_NO_WAIT)`（`scan.c:467`） | 8 个调用点，其中 `hci_core.c:1106/1609/1707` 是连接完成/取消的收尾 —— 正是"链路事件撞上适配器拆栈"的组合 |
+| `bt_le_scan_user_add()`（新增判空） | `scan_check_if_state_allowed()` 第一行 `atomic_test_bit(hdev->scan_ctx->scan_state.scan_flags, flag)`（`scan.c:517`） | conn.c 四条连接路径 + `bt_le_scan_start_mc` |
+
+返回值口径**不是随手挑的**：
+
+- `user_add` 判空返回 **-ENODEV**：这里返回 0 反而危险 —— 上层会认为"flag 已经置上、
+  扫描已经起来了"，从而不再重试，等于把 bug 藏起来。
+- `user_remove` 判空返回 **0**：scan_ctx 不存在时"别扫了"这个目标状态本来就成立；
+  返回非零会被上层当成一次可重试的失败（本仓的历史教训就是拿错误码驱动重试会变成风暴）。
+  受影响的三个 best-effort 调用点（`hci_core.c:1106/1609/1707`）都是 `if (err) LOG_WRN(...)`，
+  多一条 WRN 就够。
+- `bt_scan_softreset` 是 `void`：直接 `return`，语义是"没有回调要清"。
+- `bt_le_scan_stop_mc` 尾部：只判空再写，不改控制流。
+
+两处新增判空都带各自唯一的 `LOG_WRN` 串（`scan state add skipped` / `scan state remove
+skipped`），方便 grep 计数这条窗口被踩到的次数；窗口本身很短，不构成刷屏源。
+
 ## 取舍与不做的部分
 
-- 只堵 **stop 路径**（本次故障路径）。`scan.c` 内部还有 30 余处 `hdev->scan_ctx->`
-  裸解引用，逐个加判空没有意义 —— 真正的约束是"不要在窗口里调进来"，
-  而 start 侧上游已有 `BT_DEV_READY` 门，stop 侧补上就够。
+- 只堵**入口**：四个位置合起来正好是"从上层能进 scan 模块的四条门"
+  （softreset / stop_mc / user_add / user_remove），而不是把 `scan.c` 里 30 余处
+  `hdev->scan_ctx->` 逐个加判空 —— 逐个加是噪音，真正的约束是"不要在窗口里调进来"。
+  同族的 `bt_le_scan_start_mc` 上游已有 `BT_DEV_READY` 门，不必重复。
 - 更治本的方向（未做）：让 adapter cycle **在 disable 之前等 SAL 队列排空**，
   或让 SAL 在拆栈时取消排队的工作项。前者在 Vela 侧；后者可做在板级 SAL 抽换件
   （`vela_override/bluetooth/sal_le_{scan,advertise}_interface.c`，属于本仓库，不进 pitch）。
 
 ## 验证
 
-构建后确认判空真的在目标码里（推荐，因为 `LOG_WRN` 可能不打印）：
+**① 两份表达是否等价**（改完脚本/补丁就该跑一次，0 成本的强判据）：
 
 ```bash
-O=$(find cmake_out/my_vendor_nsh -name scan.c.o -path "*zblue*" | head -1)
-prebuilts/gcc/linux-x86_64/arm-none-eabi/bin/arm-none-eabi-objdump -d "$O" |
-  awk '/<bt_scan_softreset>:/{f=1} f{print; n++} n>8{exit}'
+cd /home/jinsc/SDK/vela/openvela
+git -C external/zblue/zblue apply \
+    vendor/HelmOne/docs/pitch/patches/zblue-scan-stop-null-ctx.patch
+diff external/zblue/zblue/subsys/bluetooth/host/scan.c \
+     cmake_out/helmone_nsh/myvendor_zblue/myvendor_scan.c \
+  && echo "补丁 == 构建副本"
+git -C external/zblue/zblue apply -R \
+    vendor/HelmOne/docs/pitch/patches/zblue-scan-stop-null-ctx.patch
 ```
 
-期望两个 `cbz`（`hdev` 与 `scan_ctx`）挡在 `str [r2, #4]` 前面：
+**② 判空是否真在目标码里**（推荐，因为 `LOG_WRN` 在本配置下可能被编译掉 ——
+实测对象文件里 grep 不到那几个格式串，所以只能看反汇编）：
+
+```bash
+# 注意：改过之后对象名带 myvendor_ 前缀，别再用 `-name scan.c.o`
+O=$(find cmake_out/helmone_nsh -name myvendor_scan.c.o | head -1)
+# 注意：prebuilts/gcc/linux-aarch64 那份 objdump 在本机（x86_64）跑不了，用系统的
+arm-none-eabi-objdump -d "$O" |
+  awk '/<bt_le_scan_user_remove>:/{f=1} f{print} f&&/^$/{exit}' | head -8
+```
+
+期望**两个 `cbz` 挡在函数体前面**（2026-09-24 实测）：
 
 ```
-00000000 <bt_scan_softreset>:
-   0:	cbz	r0, 16
-   2:	ldr.w	r2, [r0, #692]	@ 0x2b4   ← scan_ctx
-   6:	cbz	r2, 16
-   e:	str	r1, [r2, #4]            ← 原来崩在这里
+00000000 <bt_le_scan_user_remove>:
+   0:	cbz	r0, 3e                ← hdev == NULL
+   2:	mov	r2, r0
+   4:	ldr.w	r3, [r0, #700]	@ 0x2bc   ← scan_ctx
+   8:	cbz	r3, 42                ← scan_ctx == NULL
+   a:	push	{r7, lr}                ← 真函数体从这里开始
 ```
+
+`bt_scan_softreset` 同理（`cbz` × 2 挡在 `str [r2, #4]` 之前，就是原来崩的那句）。
+
+**③ 归档成员**：`ar t .../libzblue.a | grep scan` 只应看到 `myvendor_scan.c.o`，
+不能再有上游的 `scan.c.o`（两份都在会以先入者为准，白改）。
 
 实机：进入一次 `adapter cycle`（码表断电再上电，或 `ctl radio off` → `on` 触发恢复阶梯），
 不该再出现 `arm_memfault.c … mmfar=00000004` 的 panic。
 
 ## 回退
 
-`git -C external/zblue/zblue checkout -- subsys/bluetooth/host/scan.c`，或删掉那两个判空。
+上游树本来就是 pristine（改动只在构建副本里），所以回退 = 改
+`vela_override/CMakeLists.txt`：注释掉 `myvendor_patch_zblue_scan_null()` 调用
+（或删掉 `vela_override/zblue/patch_scan_stop_null.py`），重新 configure + 构建即可。
+就地改那版的回退方式（`git checkout -- subsys/bluetooth/host/scan.c`）已不适用。

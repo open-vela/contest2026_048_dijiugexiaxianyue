@@ -74,6 +74,21 @@ struct _lv_draw_sw_blend_image_dsc_t {
     lv_area_t src_area;             /**< The original src area. */
 };
 
+/**
+ * Read or write four bytes of a pixel or mask buffer as one word. The caller must align the
+ * pointer to a word first.
+ *
+ * Through a union and not a cast: C99 6.5p7 lets an object be accessed through an aggregate
+ * that has its type among the members, `*(uint32_t *)ptr` on a `uint8_t` or `uint16_t` buffer
+ * is undefined and GCC 13 at -O2 really does keep a stale half word across it.
+ */
+typedef union {
+    uint32_t u32;
+    uint16_t u16[2];
+    uint8_t u8[4];
+    lv_color32_t c32;
+} lv_draw_sw_word_t;
+
 
 /**********************
  * GLOBAL PROTOTYPES
@@ -82,6 +97,27 @@ struct _lv_draw_sw_blend_image_dsc_t {
 /**********************
  *      MACROS
  **********************/
+
+/**
+ * Prepare an RGB565 color for mixing: spread it over 32 bits so each channel gets room to
+ * grow and a whole pixel can be mixed with one multiplication.
+ * See https://stackoverflow.com/a/50012418/1999969
+ */
+#define LV_COLOR_MIX_16_PREPARE(c) ((((uint32_t)(c)) | (((uint32_t)(c)) << 16)) & 0x07E0F81Fu)
+
+/**
+ * Mix a prepared foreground into an RGB565 background. `mix` must be 1..254, the
+ * callers handle 0 and 255 themselves. `res` may be the same variable as `bg`.
+ * A macro and not a function because -Os inlines neither, and this runs on every pixel.
+ * See https://stackoverflow.com/a/50012418/1999969
+ */
+#define LV_COLOR_MIX_16_TO_16_PREPARED(res, fg_prep, bg, mix)                               \
+    do {                                                                                    \
+        uint32_t bg_prep_ = LV_COLOR_MIX_16_PREPARE(bg);                                    \
+        uint32_t mix5_ = ((uint32_t)(mix) + 4) >> 3;                                        \
+        uint32_t res_ = (((((fg_prep) - bg_prep_) * mix5_) >> 5) + bg_prep_) & 0x07E0F81Fu; \
+        (res) = (uint16_t)((res_ >> 16) | res_);                                            \
+    } while(0)
 
 #endif /* LV_USE_DRAW_SW */
 

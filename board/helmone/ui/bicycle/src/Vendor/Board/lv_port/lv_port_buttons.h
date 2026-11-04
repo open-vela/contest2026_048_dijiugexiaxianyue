@@ -34,6 +34,13 @@ typedef void (*lv_port_page_btn_cb_t)(void *user_data);
 /** @brief KEY1（PA30）短按：主界面上一页 / 列表下一项。 */
 void lv_port_buttons_set_page_scroll_cb(lv_port_page_btn_cb_t cb, void *user_data);
 
+/**
+ * @brief KEY1（PA30）**双击**回调：列表**向上**一个聚焦（用户 2026-09-27）。
+ * @note 注册后该页的单击会**延后一个双击窗口**（350ms）再执行 —— 否则"单击下一个 +
+ *       双击上一个"会互相抵消。离开该页时记得用 NULL 注销，免得把延迟带给别的页。
+ */
+void lv_port_buttons_set_page_scroll_double_cb(lv_port_page_btn_cb_t cb, void *user_data);
+
 /** @brief KEY2（PA33）短按：主界面下一页 / 确定。 */
 void lv_port_buttons_set_page_confirm_cb(lv_port_page_btn_cb_t cb, void *user_data);
 

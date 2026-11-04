@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/lcd_softspi.h
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/lcd_softspi.h
  *
  * GPIO bit-bang SPI for TK024F3036 (ST7789S) bring-up.
  *

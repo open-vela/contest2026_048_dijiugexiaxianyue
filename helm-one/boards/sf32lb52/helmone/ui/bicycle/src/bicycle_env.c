@@ -3,7 +3,10 @@
  * @brief 路网+气压融合海拔、累计爬升；BMI270 俯仰坡度。
  *
  * 实时海拔：路网节点钉绝对高，气压跟短时起伏与节点之间的变化。
- * 累计爬升：用融合海拔，3 m 迟滞；无定位或速度过低不计（过夜静置不会积几千米）。
+ * 累计爬升：按"骑过一段距离才结账"记账 —— 记账高度先按**已骑过的距离**做
+ * 低通，走满一段（ENV_GAIN_SEG_M）才把这一段的净变化计入，不到门限当平地。
+ * 无定位或速度过低不计（过夜静置不会积几千米）；骑行结束由
+ * `bicycle_env_flush_gain()` 把最后没走满的一段结一次。
  *
  * 坡度：10 Hz 低通重力向量上算俯仰，再按 1.2 s 时间常数平滑，并限制
  * 每秒变化。路面颠簸不再直接打到数据页。
@@ -28,7 +31,23 @@
 #define ENV_GRADE_SLEW    8.0f
 #define ENV_P0_ALPHA      0.08f
 #define ENV_DEM_BIAS_A    0.05f
+/** @name 累计爬升的记账口径（用户 2026-10-05 定）
+ *
+ * 旧写法是"融合海拔 3 m 迟滞"：高度每跨过 ±3 m 就记一笔。问题是高度里
+ * 的单点跳变（GNSS 高度解算漂移、路口处路网/气压基准切换，实测一趟 6.5 km
+ * 平路有十几处 3~9 m 的跳）每次都被当成一段爬升/下降记下 —— 现场一趟平路
+ * 记出 183 m 爬升。新口径两条：
+ *   ① 只有**完全骑过**一段距离（SEG）之后才结这一段的账，且只记**净**变化
+ *      ⇒ 路口原地/小范围徘徊（距离不推进）永远不结账，往返抵消；
+ *   ② 记账高度先按已骑过的距离做一阶低通（TAU）：高度变化要"骑过去之后"
+ *      才被承认，单点毛刺在骑过 TAU 米的过程中被平均掉，不再是爬升。
+ * 净变化不到 THRESH 认定为平地（参考点不动、也不记账）——噪声不会一点点
+ * 攒成大数，长缓坡照常累计。骑行结束再 flush 一次（见 flush_gain）。
+ * @{ */
+#define ENV_GAIN_SEG_M    20.0f
+#define ENV_GAIN_TAU_M    80.0f
 #define ENV_GAIN_THRESH_M 3.0f
+/** @} */
 
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -47,8 +66,11 @@ static float g_dem_m;
 static bool g_dem_ok;
 static float g_dem_bias;
 static bool g_dem_bias_ok;
-static float g_gain_ref;
+static float g_gain_ref;          /**< 本段起点的记账海拔。 */
+static double g_gain_ref_dist;    /**< 本段起点的会话里程（m）。 */
 static bool g_gain_ref_ok;
+static float g_gain_acc;          /**< 距离键控低通后的"已认可"海拔。 */
+static double g_gain_acc_dist;    /**< g_gain_acc 更新到哪一米的会话里程。 */
 static float g_pitch_off;
 static float g_raw_grade;
 static float g_grade;
@@ -210,6 +232,49 @@ void bicycle_env_set_dem_m(float m, bool ok)
 void bicycle_env_hold_gain_ref(void)
 {
     g_gain_ref_ok = false;
+    g_gain_acc_dist = 0.0;
+}
+
+/**
+ * @brief 把爬升记账的参考点 / 低通值一起挪到 (alt, dist)。
+ *
+ * 参考点与低通值必须同时挪：只挪一个会让下一段的第一笔账把低通滞后当成
+ * 高度变化记进去。
+ */
+static void env_gain_ref_set(float alt, double dist_m)
+{
+    g_gain_ref = alt;
+    g_gain_ref_dist = dist_m;
+    g_gain_acc = alt;
+    g_gain_acc_dist = dist_m;
+    g_gain_ref_ok = true;
+}
+
+/**
+ * @brief 骑行结束：把最后没骑满一段的净高度变化结一次账。
+ *
+ * 用户 2026-10-05："骑行结束计算一次后方的高度变化"。判据与 tick 里结账
+ * 完全一致（只认 ≥ ENV_GAIN_THRESH_M 的净变化），差别只是不再要求走满
+ * ENV_GAIN_SEG_M。幂等：结完账参考点就移到当前位置，重复调用不会重复计。
+ * 由 `bicycle_runtime_set_recording(false)`（停止录制 = 骑行结束/暂停）
+ * 在**清 recording 之前**调用，所以这笔账照样进 gain/loss。
+ */
+void bicycle_env_flush_gain(void)
+{
+    const bicycle_runtime_t * rt = bicycle_runtime_get();
+    float d;
+
+    if (!g_gain_ref_ok || rt == NULL) {
+        return;
+    }
+
+    d = g_gain_acc - g_gain_ref;
+    if (d >= ENV_GAIN_THRESH_M || d <= -ENV_GAIN_THRESH_M) {
+        bicycle_runtime_add_dalt(d);
+    }
+
+    g_gain_ref = g_gain_acc;
+    g_gain_ref_dist = rt->session_distance_m;
 }
 
 static bool env_is_moving(const bicycle_runtime_t * rt)
@@ -316,17 +381,33 @@ void bicycle_env_tick(void)
     }
 
     if (has_alt) {
-        if (!g_gain_ref_ok) {
-            g_gain_ref = alt;
-            g_gain_ref_ok = true;
-        } else if (!env_is_moving(rt)) {
-            g_gain_ref = alt;
-        } else {
-            float d = alt - g_gain_ref;
+        /* 爬升/下降记账（口径见 ENV_GAIN_* 注释）：只在"在骑 + 在记录"时记账；
+         * 停车/暂停时参考点跟住当前值（这段不算，也避免停放期间的气压漂移在
+         * 起步后被当成爬升）。 */
+        const bool tracking = (rt != NULL) && rt->recording && env_is_moving(rt);
 
-            if (d >= ENV_GAIN_THRESH_M || d <= -ENV_GAIN_THRESH_M) {
-                dalt = d;
-                g_gain_ref = alt;
+        if (!tracking) {
+            env_gain_ref_set(alt, rt != NULL ? rt->session_distance_m : 0.0);
+        } else if (!g_gain_ref_ok) {
+            env_gain_ref_set(alt, rt->session_distance_m);
+        } else {
+            const double dist_m = rt->session_distance_m;
+            const float moved = (float)(dist_m - g_gain_acc_dist);
+
+            if (moved > 0.0f) {
+                const float a = moved / (moved + ENV_GAIN_TAU_M);
+
+                g_gain_acc += (alt - g_gain_acc) * a;
+                g_gain_acc_dist = dist_m;
+            }
+
+            if (dist_m - g_gain_ref_dist >= (double)ENV_GAIN_SEG_M) {
+                const float d = g_gain_acc - g_gain_ref;
+
+                if (d >= ENV_GAIN_THRESH_M || d <= -ENV_GAIN_THRESH_M) {
+                    dalt = d;
+                    env_gain_ref_set(g_gain_acc, dist_m);
+                }
             }
         }
 

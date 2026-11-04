@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/include/myvendor_idle_stat.h
+ * vendor/HelmOne/chips/sf32lb52/include/myvendor_idle_stat.h
  *
  * True CPU idle share measured in up_idle() (WFI + DWT), not NuttX cpuload.
  *

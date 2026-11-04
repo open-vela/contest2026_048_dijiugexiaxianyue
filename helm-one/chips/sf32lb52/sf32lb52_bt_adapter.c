@@ -17,10 +17,24 @@
  * under the License.
  ****************************************************************************/
 
+/**
+ * @file sf32lb52_bt_adapter.c
+ * @brief HCPU↔LCPU 的蓝牙控制器适配层（HCI 走 IPC 环 + wqueue 收包）。
+ *
+ * 板级补充（my_vendor 侧）：
+ *   - `hci tx` / `hci rx` 是**命令级追踪**（配对看"哪条命令没有回条"），
+ *     2026-09-25 起整族降为 DEBUG —— 常态不出，抬运行期掩码的 DEBUG 位（`ctl log`）
+ *     即可复现；其中 `evt=0x13`（Number Of Completed Packets，~10 ms 一次的周期性
+ *     流控回执）连 DEBUG 也不打；
+ *   - 探针计数（`sf32lb52_bt_note_host_rx()` 等）只累加、不打日志，
+ *     输出统一由 diag 线程负责（见 `myvendor_diag.c`）。
+ */
+
 #include <nuttx/config.h>
 #include <fcntl.h>
 
 #include <errno.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -29,6 +43,7 @@
 
 #include <nuttx/cache.h>
 #include <nuttx/clock.h>
+#include <nuttx/sched.h>
 #include <nuttx/spinlock.h>
 #include <nuttx/wqueue.h>
 
@@ -66,6 +81,15 @@
 #define SF32LB52_BT_RX_FAIL_LOG_MS 1000u
 #define SF32LB52_BT_RX_FAIL_GAP_MS 500u
 #define SF32LB52_BT_RX_ENOMEM_BACKOFF_US 3000u
+
+/** 上电后等控制器起来的**上限**（毫秒）；到点照常继续，不判失败。
+ *
+ *  8 s 不是拍的：SDK 2.4 自家 Zephyr 通路等栈就绪用的就是这个量级
+ *  （`sf_port/zbt_hci.c` 里 `sifli_sem_take_ex(5000)`，而
+ *  `SDK/2.4/CHANGELOG.md:478` 记着供应商把它上调到了 8 s）。
+ *  见 `sf32lb52_bt_controller_enable()` 里的说明 —— 那里的循环一旦看到
+ *  LCPU 往 RX 环写过东西就提前退出，所以正常路径**不会**真的等满 8 s。 */
+#define SF32LB52_BT_READY_MAX_MS  8000u
 #ifdef CONFIG_MYVENDOR_BLE_LOG
 #  define BLE_LOG(fmt, ...) syslog(LOG_INFO, "ble: " fmt "\n", ##__VA_ARGS__)
 #else
@@ -237,6 +261,41 @@ static size_t sf32lb52_bt_ring_data_len(uint32_t rd_ptr, uint32_t wr_ptr,
 static size_t sf32lb52_bt_tx_pending(struct circular_buf *tx_ring,
                                      uint32_t *rd_ptr,
                                      uint32_t *wr_ptr);
+
+/** RX 抽取链的"哪一环断了"计数器与判据（板级，2026-09-24）。
+ *
+ *  现场（那份 241 s 的 stall）：`rd` 与 `wr` **双双冻结**、`pend` 逼近满、`rxf=0`；
+ *  按本文件自己的判据"`rd` 不动 ⇒ 主机侧抽取链断了"，而`wr` 后来也停是因为
+ *  **环满了 LCPU 没窗口可写** ⇒ 上层看到的 `cmdsilent`（"控制器静默"）其实是**结果**。
+ *
+ *  这条链有四个环节，必须分开计数才能在日志里直接点名：
+ *    邮箱中断 → `sf32lb52_bt_rx_ind()` → `work_queue(HPWORK, rx_work)` → worker 取走
+ *      · `ind` 不涨（且 NVIC 那一位置着）⇒ **中断没来**；
+ *      · `ind` 涨、`drain` 不涨       ⇒ **回调来了但 worker 没跑**（work/队列问题）；
+ *      · 两者都涨、`pend` 不清        ⇒ 取走了但上层没收（`notify_host` 侧）。
+ *  判到"断层"就**直接打印**，并做一次自愈（重开中断位 / 重排 worker / 再唤一次 LCPU）。
+ *
+ *  **打印归口**：唯一的调用点是 diag 线程的周期（`myvendor_diag.c`）——
+ *  中断侧只计数，其它路径也不打印，这样"计数器打印"只有 diag 一个出口。
+ */
+#define SF32LB52_BT_RX_CHAIN_STALL_MS 1500u
+
+static volatile uint32_t g_rx_ind_n;      /**< IPC 回调（邮箱中断路径）次数。 */
+static volatile uint32_t g_rx_drain_n;    /**< worker 真正取走数据的次数。 */
+static volatile uint32_t g_rx_rearm_n;    /**< 自愈动作次数。 */
+static volatile uint32_t g_rx_stuck_n;    /**< "worker 挂着却无进展"的抢回次数。 */
+static pid_t g_rx_worker_tid;             /**< HPWORK 线程 tid（worker 入口记下）。 */
+static uint32_t g_rx_dump_ms;             /**< worker 栈转储限频（10 s）。 */
+static uint32_t g_rx_dump_n;              /**< 已转储张数（一次卡死最多 3 张）。 */
+static uint32_t g_rx_kick_ms;             /**< wqueue kick 限频（1 s）。 */
+static uint32_t g_rx_kick_n;              /**< kick 次数（自愈是否真的动过手）。 */
+static uint32_t g_rx_drain_last_ms;       /**< 最近一次真正 drain 的时刻（判进展用）。 */
+static volatile uint32_t g_rx_queue_fail_n; /**< work_queue 失败次数（中断里只计数）。 */
+static volatile uint32_t g_rx_preopen_n;  /**< 队列未开时丢掉的回调次数。 */
+static uint32_t g_rx_chain_ok_ms;         /**< 最近一次"链路有动静"的时刻。 */
+static uint32_t g_rx_chain_log_ms;        /**< 告警限频。 */
+static uint32_t g_rx_qfail_seen;          /**< 上一次已上报的 work_queue 失败数。 */
+static uint32_t g_rx_qfail_log_ms;        /**< 异常直报的限频。 */
 
 void sf32lb52_bt_hci_dump_stall(void)
 {
@@ -606,7 +665,18 @@ static void sf32lb52_bt_nvds_set_bd_addr(uint8_t *blob, size_t len,
 
   syslog(LOG_ERR, "sf32lb52 bt NVDS has no BD_ADDR tag\n");
 
-  sf32lb52_bt_nvds_kv_save();   /* BD_ADDR 是我们自己写的：立刻落盘 */
+  /** 2026-09-23（审计 F9j）：这里原来调 `sf32lb52_bt_nvds_kv_save()`，
+   *  想表达"BD_ADDR 是我们自己写的，立刻落盘"—— 但它是错的：
+   *
+   *  - 本函数只改**本地的 blob 副本**，共享缓冲（SHARED）此刻还是**上一代的
+   *    残留**；
+   *  - 而 `kv_save()` 读的是 SHARED ⇒ 它把**陈旧的**内容写进 KV，并把
+   *    `g_nvds_last_crc` 盖章成那个陈旧值；
+   *  - 紧接着 `sf32lb52_bt_nvds_kv_load()` 又把这个刚写进去的陈旧文件
+   *    **读回来**，于是"从 KV 恢复"变成了恢复一个寂寞。
+   *
+   *  落盘挪到真正写进 SHARED 之后（见 prepare_stack_nvds 末尾），
+   *  语义才对：内容确实变了才写。 */
 }
 
 static bool sf32lb52_bt_rx_ring_valid(struct circular_buf *rx_ring)
@@ -708,6 +778,15 @@ static void sf32lb52_bt_prepare_stack_nvds(void)
   nvds->writting = 0;
   memcpy((void *)(nvds + 1), blob, defaults_len);
   sf32lb52_bt_clean_nvds_shared();
+
+  /** BD_ADDR（来自 eFuse）是我们刚写进 SHARED 的 ⇒ 立刻落一次盘。
+   *
+   *  2026-09-23（审计 F9j）：这一步原来挂在 `set_bd_addr()` 里、跑在
+   *  `kv_load()` **之前**，读到的还是上一代的 SHARED ⇒ 把陈旧内容写进 KV，
+   *  随后 `kv_load()` 又把它读回来，"恢复"等于没恢复。挪到这里之后，
+   *  判据回到 `kv_save()` 自己的语义：**内容真的变了才写**（它先比
+   *  `g_nvds_last_crc`，而那个值是上面 `kv_load()` 刚盖的）。 */
+  sf32lb52_bt_nvds_kv_save();
 
   HAL_HPAON_CANCEL_LP_ACTIVE_REQUEST();
 }
@@ -933,6 +1012,11 @@ static void sf32lb52_bt_rx_worker(FAR void *arg)
 {
   struct sf32lb52_bt_env_s *env = arg;
 
+  /* 记下 HPWORK 线程自己的 tid：worker 就跑在它上面。卡死（`running=1 avl=0`、
+   * drain 不涨）时 stall 报告要顺着这个 tid 把它的调用栈拍下来 —— 堵在哪一行
+   * 只有栈能回答（同 `board_restart_ble_companion()` 里对 companion 的做法）。 */
+  g_rx_worker_tid = nxsched_gettid();
+
   for (;;)
     {
       irqstate_t flags;
@@ -1028,6 +1112,11 @@ static void sf32lb52_bt_rx_worker(FAR void *arg)
 
           leave_critical_section(flags);
 
+          /* 链路计数：worker 确实取走了数据（与 rx_ind 分开，用于区分哪一环断）。 */
+          g_rx_drain_n++;
+          g_rx_drain_last_ms = sf32lb52_bt_now_ms();
+          g_rx_chain_ok_ms = sf32lb52_bt_now_ms();
+
         #if SF32LB52_BT_TRACE
              syslog(LOG_INFO,
                "sf32lb52 bt rx drain: len=%lu local=%08lx wr=%08lx\n",
@@ -1067,19 +1156,25 @@ static void sf32lb52_bt_rx_worker(FAR void *arg)
                     }
                 }
 
-              /* 事件级追踪：与 `hci tx` 配对，就能看出"哪条命令没有回条"。 */
+              /* 事件级追踪：与 `hci tx` 配对，就能看出"哪条命令没有回条"。
+               * 2026-09-25：整族 hci tx/rx 追踪降到 DEBUG（它们是配对排查用的测试日志，
+               * 常态下没价值）。要看时把运行期掩码的 DEBUG 位打开（`ctl log`），
+               * 不用重编；默认掩码里没有 DEBUG 位，所以常态一行都不出。 */
               if (g_hci_last_rx_evt == 0x0e && read_len >= 6)
                 {
-                  syslog(LOG_INFO,
+                  syslog(LOG_DEBUG,
                          "hci rx evt=0x0e ncmd=%u op=0x%04x len=%lu\n",
                          (unsigned)env->data_buf[3],
                          (unsigned)((uint16_t)env->data_buf[4] |
                                     ((uint16_t)env->data_buf[5] << 8)),
                          (unsigned long)read_len);
                 }
-              else
+              else if (g_hci_last_rx_evt != 0x13)
                 {
-                  syslog(LOG_INFO, "hci rx evt=0x%02x len=%lu\n",
+                  /* 同族追踪 ⇒ DEBUG（见上）。0x13 = Number Of Completed Packets 更狠：
+                   * 控制器每 ~10 ms 一次，是周期流控回执，**连打开 DEBUG 时也不打**
+                   * （删掉本条件即可恢复）。 */
+                  syslog(LOG_DEBUG, "hci rx evt=0x%02x len=%lu\n",
                          (unsigned)g_hci_last_rx_evt, (unsigned long)read_len);
                 }
             }
@@ -1129,12 +1224,9 @@ static int32_t sf32lb52_bt_rx_ind(ipc_queue_handle_t handle, size_t size)
 
   if (!env->queue_open)
     {
-      struct circular_buf *rx_ring = (struct circular_buf *)sf32lb52_bt_rx_buf_addr();
-      #if SF32LB52_BT_TRACE
-            syslog(LOG_INFO, "sf32lb52 rx_ind (pre-open) wr=%08lx rd=%08lx\n",
-              (unsigned long)rx_ring->write_idx_mirror,
-              (unsigned long)rx_ring->read_idx_mirror);
-      #endif
+      /* 中断上下文里**只计数、不打印**（队列还没开时丢掉的回调）。
+       * 这个数会在外侧的 `rx chain stalled` 行里报出来。 */
+      g_rx_preopen_n++;
       return OK;
     }
 
@@ -1147,22 +1239,28 @@ static int32_t sf32lb52_bt_rx_ind(ipc_queue_handle_t handle, size_t size)
     }
   leave_critical_section(flags);
 
+  /* 链路计数：回调确实来过（IRQ/回调这一环的活证；配合 drain 判"断在哪一环"）。 */
+  g_rx_ind_n++;
+  g_rx_chain_ok_ms = sf32lb52_bt_now_ms();
+
 #if SF32LB52_BT_TRACE
-  {
-    struct circular_buf *rx_ring =
-        (struct circular_buf *)sf32lb52_bt_rx_buf_addr();
+  /* trace 也遵守"中断里不打印"（本回调由邮箱中断路径进入）。 */
+  if (!up_interrupt_context())
+    {
+      struct circular_buf *rx_ring =
+          (struct circular_buf *)sf32lb52_bt_rx_buf_addr();
 
-    up_invalidate_dcache((uintptr_t)sf32lb52_bt_rx_buf_addr(),
-                         (uintptr_t)sf32lb52_bt_rx_buf_addr() +
-                         sizeof(*rx_ring));
+      up_invalidate_dcache((uintptr_t)sf32lb52_bt_rx_buf_addr(),
+                           (uintptr_t)sf32lb52_bt_rx_buf_addr() +
+                           sizeof(*rx_ring));
 
-    syslog(LOG_INFO,
-           "sf32lb52 rx_ind: size=%lu local=%08lx rd=%08lx wr=%08lx\n",
-           (unsigned long)size,
-           (unsigned long)env->rx_read_idx_mirror,
-           (unsigned long)rx_ring->read_idx_mirror,
-           (unsigned long)rx_ring->write_idx_mirror);
-  }
+      syslog(LOG_INFO,
+             "sf32lb52 rx_ind: size=%lu local=%08lx rd=%08lx wr=%08lx\n",
+             (unsigned long)size,
+             (unsigned long)env->rx_read_idx_mirror,
+             (unsigned long)rx_ring->read_idx_mirror,
+             (unsigned long)rx_ring->write_idx_mirror);
+    }
 #endif
 
   if (queue_work)
@@ -1177,12 +1275,317 @@ static int32_t sf32lb52_bt_rx_ind(ipc_queue_handle_t handle, size_t size)
           env->rx_worker_running = false;
           leave_critical_section(flags);
 
-          syslog(LOG_ERR, "sf32lb52 bt queue rx work failed: %d\n", ret);
+          /* 中断上下文里只计数；失败详情由外侧的 `rx chain stalled` 行报出。 */
+          g_rx_queue_fail_n++;
           return ret;
         }
     }
 
   return OK;
+}
+
+/** @brief 判"RX 抽取链断在哪一环"：直接打印 + 一次自愈尝试。
+ *
+ *  **只由 diag 线程调用**（`myvendor_diag.c` 的周期里）—— 中断侧只计数，
+ *  这里是全工程唯一的打印出口；入口的 `up_interrupt_context()` 是保险，
+ *  防止以后有人从别的上下文调进来时在中断里 syslog。
+ *
+ *  只在"环里有积压、且最近 SF32LB52_BT_RX_CHAIN_STALL_MS 内回调与 worker 都没动静"
+ *  时才动作（限频 1 次/秒），所以正常运行时一次都不会触发。
+ *
+ *  `force=false`：异常判定 + 自愈（diag 每拍都调，保证恢复能力与开关无关）。
+ *  `force=true` ：**无条件**打一行计数器（diag 的周期报表用，见 `ctl cnt`）。
+ *
+ *  自愈按三个环节各补一脚（都是幂等的）：
+ *    ① NVIC 里 LCPU→HCPU 邮箱中断没开 → 重开（否则再怎么说话我们也收不到）；
+ *    ② worker 没在跑且 work 不在队 → 重排一次；
+ *    ③ 再唤一次 LCPU（`HAL_HPAON_WakeCore`）——LPSYS 总线桥没上电时，
+ *       连"解蔽邮箱中断"这类写都会落空，这一脚就是给它补电的。
+ */
+void sf32lb52_bt_rx_chain_report(bool force)
+{
+  struct circular_buf *rx_ring;
+  uint32_t now;
+  size_t pend;
+  uint32_t idle;
+  bool nvic_off;
+  bool stalled;
+
+  now = sf32lb52_bt_now_ms();
+
+  /** **中断上下文里绝不打印**（2026-09-24 定规）：本函数只从 diag 线程调用，
+   *  这里再加一道保险 —— 万一以后有人从 ISR 调进来，也只会读几个寄存器就返回。 */
+  if (up_interrupt_context())
+    {
+      return;
+    }
+
+  /* —— 异常直报（每拍跑、**与 `ctl cnt` 开关无关**；见 myvendor_diag.c 的约定）——
+   *
+   *  `work_queue()` 失败 = RX 抽取这一拍排不上队，是"链断"的最早信号；
+   *  计数在中断侧累加（`g_rx_queue_fail_n`），这里发现增长就 `LOG_ERR` 直报，
+   *  限频 1 s。用 ERROR 级：即使把 syslog 屏蔽位收紧到只留错误，它也看得见。 */
+  if (g_rx_queue_fail_n != g_rx_qfail_seen)
+    {
+      uint32_t d = g_rx_queue_fail_n - g_rx_qfail_seen;
+
+      g_rx_qfail_seen = g_rx_queue_fail_n;
+
+      if (g_rx_qfail_log_ms == 0u ||
+          (int32_t)(now - g_rx_qfail_log_ms) >= 1000)
+        {
+          g_rx_qfail_log_ms = now ? now : 1u;
+          syslog(LOG_ERR,
+                 "sf32lb52 bt rx chain: ERROR work_queue failed %lu time(s) "
+                 "(total %lu) — RX 抽取可能停摆\n",
+                 (unsigned long)d, (unsigned long)g_rx_queue_fail_n);
+        }
+    }
+
+  rx_ring = (struct circular_buf *)sf32lb52_bt_rx_buf_addr();
+
+  /** ⚠ **队列没开就别看、更别动手**（2026-09-24 现场教训）。
+   *
+   *  开机头几秒 `queue_open == 0`：此刻 IPC 环的 `wr/rd` 镜像**还是残值**
+   *  （实测 `pend=9597 rd=0x551a048d wr=0x7a97b8e2`），照它判会得到"环里有积压"
+   *  的假象；更糟的是自愈会在 **LCPU 正在启动**的窗口里去 re-enable 邮箱中断、
+   *  调 `HAL_HPAON_WakeCore()` —— 实测那几次之后 `HCI_RESET` 永不应答
+   *  （`pendop=0x0c03`、`rxn=0`）⇒ BLE 整场起不来。
+   *
+   *  所以：**只有队列已开**且（`rx_ind` 至少来过一次或 `pend` 看起来是正常量级）
+   *  才进入判定。队列没开就当作"链路尚未启用"，直接返回。 */
+  if (!g_sf32lb52_bt_env.queue_open || rx_ring == NULL)
+    {
+      return;
+    }
+
+  up_invalidate_dcache((uintptr_t)rx_ring,
+                       (uintptr_t)rx_ring + sizeof(*rx_ring));
+
+  pend = sf32lb52_bt_ring_data_len(rx_ring->read_idx_mirror,
+                                  rx_ring->write_idx_mirror,
+                                  rx_ring->buffer_size);
+
+  idle = now - g_rx_chain_ok_ms;
+  stalled = ((int32_t)(now - g_rx_chain_ok_ms) >=
+             (int32_t)SF32LB52_BT_RX_CHAIN_STALL_MS);
+
+  if (pend == 0)
+    {
+      g_rx_chain_ok_ms = now;
+    }
+
+  if (!force)
+    {
+      if (pend == 0 || !stalled)
+        {
+          return;
+        }
+
+      if (g_rx_chain_log_ms != 0u &&
+          (int32_t)(now - g_rx_chain_log_ms) < 1000)
+        {
+          return;
+        }
+    }
+
+  g_rx_chain_log_ms = now ? now : 1u;
+
+  nvic_off = ((NVIC->ISER[LCPU2HCPU_IRQn >> 5] & (1UL << (LCPU2HCPU_IRQn & 0x1F)))
+              == 0u);
+
+  /* —— 打印：`force` 是周期报表（正常也打），否则只在判到断层时打 —— */
+  if (!force)
+    {
+      syslog(LOG_ERR,
+             "sf32lb52 bt rx chain stalled: pend=%lu rd=0x%08lx wr=0x%08lx "
+             "ind=%lu drain=%lu rearm=%lu qfail=%lu preopen=%lu "
+             "pending=%d running=%d avl=%d irq_en=%d idle=%lu ms%s%s\n",
+             (unsigned long)pend,
+             (unsigned long)rx_ring->read_idx_mirror,
+             (unsigned long)rx_ring->write_idx_mirror,
+             (unsigned long)g_rx_ind_n, (unsigned long)g_rx_drain_n,
+             (unsigned long)g_rx_rearm_n,
+             (unsigned long)g_rx_queue_fail_n, (unsigned long)g_rx_preopen_n,
+             g_sf32lb52_bt_env.rx_work_pending ? 1 : 0,
+             g_sf32lb52_bt_env.rx_worker_running ? 1 : 0,
+             work_available(&g_sf32lb52_bt_env.rx_work) ? 1 : 0,
+             nvic_off ? 0 : 1,
+             (unsigned long)idle,
+             nvic_off ? " [邮箱中断没开 ⇒ 收不到]" : "",
+             (g_rx_drain_n == 0u) ? " [drain 从没成功过 ⇒ worker 没跑起来]" : "");
+    }
+  else
+    {
+      syslog(LOG_INFO,
+             "sf32lb52 bt rx chain cnt: pend=%lu ind=%lu drain=%lu rearm=%lu "
+             "qfail=%lu preopen=%lu pending=%d running=%d avl=%d irq_en=%d "
+             "rxage=%lu ms%s\n",
+             (unsigned long)pend,
+             (unsigned long)g_rx_ind_n, (unsigned long)g_rx_drain_n,
+             (unsigned long)g_rx_rearm_n,
+             (unsigned long)g_rx_queue_fail_n, (unsigned long)g_rx_preopen_n,
+             g_sf32lb52_bt_env.rx_work_pending ? 1 : 0,
+             g_sf32lb52_bt_env.rx_worker_running ? 1 : 0,
+             work_available(&g_sf32lb52_bt_env.rx_work) ? 1 : 0,
+             nvic_off ? 0 : 1,
+             (unsigned long)(now - g_hci_last_rx_ms),
+             nvic_off ? " [邮箱中断没开 ⇒ 收不到]" : "");
+    }
+
+  /* 自愈只在"真判到断层"时做（周期报表不触发动作）。 */
+  if (!stalled)
+    {
+      return;
+    }
+
+  /* —— 卡死现场取证：把 HPWORK 线程的调用栈拍下来 ——
+   *
+   * `pending=1 running=1 avl=0` 只说明"work 项还挂在队列里、有人挂着"，到底是
+   * 空转、还是堵在 `notify_host`（zblue 收包路径）里的某个信号量上，只有栈能答。
+   * 限频 10 s、一次卡死最多 3 张：第一张给位置，第二张给"它真的没动"的对照，
+   * 之后就不再刷屏（卡死是长事件，不缺样本）。 */
+  if (g_rx_dump_n < 3u &&
+      (g_rx_dump_ms == 0u || (int32_t)(now - g_rx_dump_ms) >= 10000))
+    {
+      g_rx_dump_ms = now ? now : 1u;
+      g_rx_dump_n++;
+
+      if (g_rx_worker_tid > 0)
+        {
+          syslog(LOG_ERR,
+                 "sf32lb52 bt rx chain: worker stack dump tid=%d "
+                 "pending=%d running=%d avl=%d (#%lu)\n",
+                 (int)g_rx_worker_tid,
+                 g_sf32lb52_bt_env.rx_work_pending ? 1 : 0,
+                 g_sf32lb52_bt_env.rx_worker_running ? 1 : 0,
+                 work_available(&g_sf32lb52_bt_env.rx_work) ? 1 : 0,
+                 (unsigned long)g_rx_dump_n);
+#ifdef CONFIG_SCHED_BACKTRACE
+          /* 自己逐行打，不用 `sched_dumpstack()`：那个走 `_alert`(ALERT 级)，
+           * 打出来没有 `[ ERROR]` 记号，只能靠落盘通道"续行继承上一行判定"
+           * 这条规则搭车 —— 顺序一变就整段丢。**现场（不带电脑）取证要求
+           * 每行自带级别记号**，所以这里每行都经 `syslog(LOG_ERR, …)`，
+           * 格式与 `sched_dumpstack` 同量级（一帧一个 `%p`，每行 8 帧）。 */
+          {
+            int skip;
+
+            for (skip = 0; skip < 4 * 8; skip += 8)
+              {
+                FAR void *frames[8];
+                char line[8 * 11 + 1];
+                size_t used = 0;
+                int n;
+                int i;
+
+                n = sched_backtrace(g_rx_worker_tid, frames, 8, skip);
+                if (n <= 0)
+                  {
+                    break;
+                  }
+
+                line[0] = '\0';
+                for (i = 0; i < n; i++)
+                  {
+                    int w = snprintf(line + used, sizeof(line) - used,
+                                     " %p", frames[i]);
+
+                    if (w <= 0 || (size_t)w >= sizeof(line) - used)
+                      {
+                        break;
+                      }
+
+                    used += (size_t)w;
+                  }
+
+                syslog(LOG_ERR, "sf32lb52 bt rx chain stack[%d]:%s\n",
+                       skip, line);
+
+                if (n < 8)
+                  {
+                    break;
+                  }
+              }
+          }
+#endif
+        }
+      else
+        {
+          syslog(LOG_ERR,
+                 "sf32lb52 bt rx chain: worker 一次都没跑起来（tid=0），无栈可拍\n");
+        }
+    }
+
+  /* —— 自愈 ①：中断位 —— */
+  if (nvic_off)
+    {
+      up_enable_irq(LCPU2HCPU_IRQn);
+      g_rx_rearm_n++;
+      syslog(LOG_ERR, "sf32lb52 bt rx chain: re-enabled LCPU2HCPU IRQ %d (#%lu)\n",
+             (int)LCPU2HCPU_IRQn, (unsigned long)g_rx_rearm_n);
+    }
+
+  /* —— 自愈 ②：**无条件重排（kick）** ——
+   *
+   *  判据从"看标志"改成"**看进展**"（2026-09-24 现场教训），2026-09-27 又往前
+   *  一步：**不再要求 `work_available()`**。
+   *
+   *  那天板上抓到的现场（栈解出 + `ps` 佐证）：worker 就是 pid1 `hpwork`、
+   *  状态 `Waiting Semaphore`，栈是 `nxsched_switch ← nxsem_wait_slow ←
+   *  nxsem_wait`；而我们的 work 项**还挂在队列里**（`pending=1 running=1
+   *  avl=0`，`rearm` 恒 0）—— 形状是"活在那儿、没人叫醒 worker"（丢唤醒）。
+   *  唤醒本来靠 wqueue 自己的定时器（`wd_start_abstick(&wqueue->timer, …,
+   *  work_timer_expired, wqueue)` ⇒ `nxsem_post(&wqueue->sem)`），而那个定时器
+   *  节点正是同一秒内核报"看门狗活动链表损坏"时被踩坏/裁掉的那批之一。
+   *
+   *  所以判据必须是"**有活却长时间没进展**"，而不是"项不在队里"：
+   *  `work_queue()` 对已入队的项做的是 `work_remove()` + 重插 + **重新 arm
+   *  队列定时器**（`work_queue_start()` 里的 `retimer` 分支）⇒ 这一脚既补唤醒、
+   *  也顺手把丢掉的定时器装回去，两条路都通。限频 1 s。 */
+  if ((int32_t)(now - g_rx_kick_ms) >= 1000)
+    {
+      int ret;
+
+      g_rx_kick_ms = now ? now : 1u;
+      g_rx_kick_n++;
+
+      /* `stuck` = worker 记着"跑着"但 drain 很久没进展 —— 就是 2026-09-24 那族。 */
+      if ((g_rx_drain_n == 0u) ||
+          ((int32_t)(now - g_rx_drain_last_ms) >=
+           (int32_t)(SF32LB52_BT_RX_CHAIN_STALL_MS * 2u)))
+        {
+          g_rx_stuck_n++;
+        }
+
+      /* 记账与"项已在队列里"一致：中断侧 rx_ind 见到 running=1 就不会再插一次。 */
+      g_sf32lb52_bt_env.rx_work_pending = true;
+      g_sf32lb52_bt_env.rx_worker_running = true;
+
+      ret = work_queue(HPWORK, &g_sf32lb52_bt_env.rx_work,
+                       sf32lb52_bt_rx_worker, &g_sf32lb52_bt_env, 0);
+
+      syslog(LOG_ERR,
+             "sf32lb52 bt rx chain: kick wqueue (avl=%d running=%d "
+             "drain 无进展 %lu ms, ret=%d #%lu)\n",
+             work_available(&g_sf32lb52_bt_env.rx_work) ? 1 : 0,
+             g_sf32lb52_bt_env.rx_worker_running ? 1 : 0,
+             (unsigned long)(now - g_rx_drain_last_ms), ret,
+             (unsigned long)g_rx_kick_n);
+    }
+
+  /** —— 自愈 ③：**只在我们没按着 LCPU 醒着**时补一脚唤醒 ——
+   *
+   *  `HAL_HPAON_WakeCore()` 原本是无条件调的，但开机那一小段（LCPU 正在引导、
+   *  `wake_held == false`）重复唤醒会干扰它起栈 —— 现场实测：连调 6 次之后
+   *  `HCI_RESET` 永不应答（`pendop=0x0c03`）、BLE 整场起不来。
+   *  正常运行时 `wake_held == true`，这一脚本来就不需要。 */
+  if (!g_sf32lb52_bt_env.wake_held)
+    {
+      HAL_HPAON_WakeCore(CORE_ID_LCPU);
+    }
+
+  /* 记账：给自愈留一个复查窗口，避免 1 s 内反复刷。 */
+  g_rx_chain_ok_ms = now;
 }
 
 static int sf32lb52_bt_mailbox_init(void)
@@ -1323,7 +1726,63 @@ int sf32lb52_bt_controller_enable(void)
   HAL_HPAON_WakeCore(CORE_ID_LCPU);
   g_sf32lb52_bt_env.wake_held = true;
 
-  usleep(500000);
+  /** 上电后等控制器"起来"再开队列。
+   *
+   *  2026-09-23（审计 F3）：这一段原来是**光秃秃的 `usleep(500000)`** —— 一个
+   *  固定睡眠，睡醒就往下走，**没有任何"控制器活了"的判据**。对照 SDK 2.4 的
+   *  自家 Zephyr 通路（`middleware/bluetooth/zephyr_bt/sf_port/zbt_hci.c:4829-4842`）：
+   *  它是 `bluetooth_init(); ble_power_on();` 之后**等一个"栈就绪"信号量**
+   *  （有界超时，超时只记日志、照常继续），而且 `SDK/2.4/CHANGELOG.md:478` 记着
+   *  SiFli 自己把这个超时**从 5 s 上调到 8 s**（"Increase stack ready wait time
+   *  from 5s to 8s"）—— 说明"等 500 ms 就走"在供应商看来是不够的。
+   *
+   *  我们在这一层拿不到那个 data-svc 信号量（`BSP_USING_DATA_SVC` 是本树要单独
+   *  确认的），所以这里先用**可观测的替代判据**：RX 环头部自洽（LCPU 已经把
+   *  `buffer_size` 写好），并且尽可能看到 LCPU 真的往环里写过东西。
+   *
+   *  ⚠ 这是**先补观测、不冒进**的版本：500 ms 的下限原样保留（正常路径不加
+   *  延时），只是把上限从 1 s 提到 `SF32LB52_BT_READY_MAX_MS`（8 s，对齐 SDK
+   *  的上调后值），并把实测耗时打出来。有这行日志，"LCPU 到底多久才活"就有
+   *  数据了，下一轮再按实数收紧上限 —— 不凭空猜一个更大的常量。
+   */
+
+  {
+    uint32_t t0 = sf32lb52_bt_now_ms();
+    uint32_t waited = 0;
+    bool     saw_write = false;
+
+    usleep(500000);
+
+    while (waited < SF32LB52_BT_READY_MAX_MS)
+      {
+        struct circular_buf *ring =
+            (struct circular_buf *)sf32lb52_bt_rx_buf_addr();
+
+        up_invalidate_dcache((uintptr_t)sf32lb52_bt_rx_buf_addr(),
+                             (uintptr_t)sf32lb52_bt_rx_buf_addr() +
+                             SF32LB52_BT_RX_BUF_SIZE);
+
+        if (sf32lb52_bt_rx_ring_valid(ring))
+          {
+            /* LCPU 往环里写过东西 = 它的 BLE 固件已经在跑（上电后它会先写
+             * 一串启动响应，见下面那段读指针对齐的注释）。 */
+            if (ring->write_idx_mirror != 0u)
+              {
+                saw_write = true;
+                break;
+              }
+          }
+
+        usleep(20000);
+        waited += 20u;
+      }
+
+    syslog(LOG_INFO,
+           "sf32lb52 bt ready: settle=%lu ms ctrl_alive=%d (cap=%u ms)\n",
+           (unsigned long)(sf32lb52_bt_now_ms() - t0),
+           saw_write ? 1 : 0,
+           (unsigned)SF32LB52_BT_READY_MAX_MS);
+  }
 
   ret = ipc_queue_open(g_sf32lb52_bt_env.ipc_port);
   if (ret < 0)
@@ -1385,14 +1844,25 @@ int sf32lb52_bt_controller_enable(void)
     __DSB();
   }
 
+  /* 原本这里是一段**算完就丢**的死代码（算 l2h / nvic_bit / nvic_en 再
+   * `(void)` 掉，2026-09-23 审计记为 F9i）。既然值都读出来了就让它有用：
+   * `ipc_queue_open()` 本该把 LCPU→HCPU 的邮箱中断在 NVIC 里放开；**没放开
+   * 的话控制器再怎么说话我们也收不到**，而现象是"RX 环里明明有字节、主机
+   * 一动不动"—— 这类静默最难查，正好用一行日志把它钉住。
+   *
+   * 只告警不判失败：中断没开仍可能靠轮询工作（本文件就有 tx 侧主动触发），
+   * 不该因此在 enable 路径上把一个可用的适配器判死。 */
   {
-    volatile MAILBOX_CH_TypeDef *l2h = L2H_MAILBOX;
     uint32_t nvic_bit = (1UL << (LCPU2HCPU_IRQn & 0x1F));
     uint32_t nvic_en  = NVIC->ISER[LCPU2HCPU_IRQn >> 5];
 
-    (void)l2h;
-    (void)nvic_bit;
-    (void)nvic_en;
+    if ((nvic_en & nvic_bit) == 0u)
+      {
+        syslog(LOG_WARNING,
+               "sf32lb52 bt: LCPU2HCPU IRQ %d not enabled after ipc_queue_open "
+               "(ISER=0x%08lx) - HCI RX depends on polling\n",
+               (int)LCPU2HCPU_IRQn, (unsigned long)nvic_en);
+      }
   }
 
   g_sf32lb52_bt_env.queue_open = true;
@@ -1468,7 +1938,24 @@ int sf32lb52_bt_controller_force_reset(void)
   bool tried_enable;
 
   cb = g_sf32lb52_bt_env.notify_host;
-  keep_skip = g_hci_skip_sync;
+
+  /** skip_sync 只在"控制器确实还活着"时才继承。
+   *
+   *  板级修正（2026-09-24，现场 08:52）：
+   *    `force reset` 原先无条件 `keep_skip = g_hci_skip_sync`，于是"BLE 死亡族
+   *    已经把 skip 置成 1"再撞上"status 已降到 IDLE"这一路时：
+   *      - `tried_enable = (status == INITED)` 为假 ⇒ **enable 根本没被调用**；
+   *      - `if (!keep_skip)` 也为假 ⇒ **skip 被永久留下**。
+   *    后果：`sf32lb52_host_send_packet()` 对一切 HCI 返回 -ENODEV ⇒ adapter 永远
+   *    到不了 ON ⇒ respawn 的 companion 停在 `bluetooth_create_instance failed`，
+   *    diag 记到 `ble restart … n=86`，**只有断电冷启能救**（热复位救不回来）。
+   *
+   *  skip 的持有者只可能是"一次成功的 init/enable"，IDLE 时没有任何持有者 ⇒
+   *  这时保 skip 就是自锁。下面 `if (!keep_skip)` 会把它清掉，落到"发不出去"
+   *  而不是"永远发不出去"（与那段注释的原意一致）。 */
+  keep_skip = g_hci_skip_sync &&
+              (g_sf32lb52_bt_status != SF32LB52_BT_STATUS_IDLE);
+
   syslog(LOG_ERR, "sf32lb52 bt force reset (LCPU)\n");
   BLE_LOG("force_reset begin keep_skip=%d status=%d open=%d cb=%d",
           keep_skip ? 1 : 0,
@@ -1484,6 +1971,25 @@ int sf32lb52_bt_controller_force_reset(void)
     }
 
   usleep(20000);
+
+  /** 板级修正（2026-09-24）：**IDLE 也要真的把它拉起来**。
+   *
+   *  原来只有 `status == INITED` 才 enable ⇒ IDLE（例如被 `…_deinit()` 降到 IDLE、
+   *  或死亡族中途退出）时这一路什么都不做，只留下"enable skipped (keep skip)"，
+   *  阶梯便再也回不去。`init()` 是幂等的，失败只是返回错误、下一轮再试，
+   *  所以这里放心调 —— 这正是 `force reset` 这个名字该做的事。 */
+  if (g_sf32lb52_bt_status == SF32LB52_BT_STATUS_IDLE)
+    {
+      int ini = sf32lb52_bt_controller_init();
+
+      BLE_LOG("force_reset: re-init from IDLE -> %d (status now %d)",
+              ini, (int)g_sf32lb52_bt_status);
+
+      if (ini < 0 && ret == OK)
+        {
+          ret = ini;
+        }
+    }
 
   /* 记下 enable 到底有没有被调用：下面"跳过 enable"那一栏靠它区分
    * 「enable 失败」和「根本没人可 enable」。 */
@@ -1525,9 +2031,9 @@ int sf32lb52_bt_controller_force_reset(void)
   if (!tried_enable)
     {
       syslog(LOG_ERR,
-             "sf32lb52 bt force reset: status=%d (not INITED), enable skipped%s\n",
+             "sf32lb52 bt force reset: status=%d (init 未能带起来), enable skipped%s\n",
              (int)g_sf32lb52_bt_status,
-             keep_skip ? " (keep skip)" : "");
+             keep_skip ? " (keep skip)" : " (skip cleared)");
     }
   else if (en < 0)
     {
@@ -1601,8 +2107,10 @@ int sf32lb52_host_send_packet(const uint8_t *data, uint16_t len)
         }
 
       /* 命令级追踪：排查"发出去没人应"时，必须知道**是哪一条**命令、
-       * 参数是什么（同一个 opcode 的 enable=0/1 行为完全不同）。 */
-      syslog(LOG_INFO, "hci tx op=0x%04x plen=%u p=%02x%02x%02x%02x len=%u\n",
+       * 参数是什么（同一个 opcode 的 enable=0/1 行为完全不同）。
+       * 2026-09-25：与 hci rx 同族 ⇒ 一并降到 DEBUG（常态不出，`ctl log` 打开掩码
+       * 的 DEBUG 位即可复现这套配对追踪）。 */
+      syslog(LOG_DEBUG, "hci tx op=0x%04x plen=%u p=%02x%02x%02x%02x len=%u\n",
              (unsigned)g_hci_last_tx_op,
              len >= 4 ? (unsigned)data[3] : 0u,
              len > 4 ? (unsigned)data[4] : 0u,

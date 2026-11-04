@@ -110,4 +110,70 @@ static inline uintptr_t board_mtp_psram_arena_base(void)
          BOARD_MTP_PSRAM_RESERVE_BYTES;
 }
 
+/*
+ * ============================ 画布专属 arena ============================
+ * 2026-09-27：vmap 的常驻画布（~470 KB）原来从 BoardPSRAM 池里 malloc。
+ * 现在从池子里**挖出一块固定、1 MiB 对齐的 1 MiB**给画布专用：画布地址从此确定，
+ * 不再和几百 KB 的其它分配抢同一片堆（也顺手把画布的取舍从"堆有多大"里独立出来）。
+ *
+ * ⚠ 关于"让画布变快"（2026-09-27 两轮实测，结论已收口）：
+ *   ① **PSRAM 现在默认写回**（`CONFIG_MYVENDOR_PSRAM_CACHE_WB=y`）：128 KiB 顺序写
+ *      22 → 15 周期/字节（−33%），CPU 搬运段（`cyc_begin`）−40%；
+ *   ② **vmap 的 EPIC 搬运已打开**（`MYVENDOR_BLIT_EPIC=1`）⇒ 同一搬运段再 −61%
+ *      （合计约 −75%）；
+ *   ③ 但**瓦片光栅化（`cyc_tile`）纹丝不动**：画布 457 KB vs D-cache 16 KB，逐像素散写
+ *      缓存帮不上；要动它只能走算法或把大块纯色填充也交给 EPIC。
+ *   ⚠ 给 arena **单加一个 MPU region** 那条路仍然是死的（WB/WT 各试一次都引导循环，
+ *     region 表回读完全正确 ⇒ 机制未明）—— 别再试；`mpu_config()` 保持出厂那份。
+ *   ⚠ 别把 `0xE0080000` 的 irange/drange 当成缓存开关 —— 那是**缓存性能计数器**
+ *     （profiler），只选给哪个 MPI 计数。
+ *   证据：`docs/psram_cache_wb_audit.md`（仓库内）+ `zcode/analysis/MPU_WB_ATTEMPT.md`。
+ *
+ * ⚠ 两块约束，改这里之前先读：
+ *  ① arena **必须 2 的幂对齐 + 2 的幂大小**：现在保留这个形状不用钱，而将来若真要
+ *     给它单独配 MPU region / 缓存窗口，那是硬要求；
+ *  ② 地址一律由下面的宏推导，不要在别处手写常量；`board_psram_canvas_arena()`
+ *     开机打一行地址，且自带三条自检（越界 / 对齐 / 池子是否真被挖开）。
+ *
+ * 选择偏移 9 MiB（= 池内偏低的大块留给既有用户，尾端 768 KiB 仍归池子）。
+ */
+#define BOARD_PSRAM_CANVAS_ARENA_BYTES  (1024u * 1024u)
+#define BOARD_PSRAM_CANVAS_ARENA_ALIGN  (1024u * 1024u)
+#define BOARD_PSRAM_CANVAS_ARENA_OFFSET (9u * 1024u * 1024u)
+
+/** @brief 画布 arena 的物理地址（池内固定偏移；编译期常量表达式）。 */
+static inline uintptr_t board_psram_canvas_arena_base(void)
+{
+  return board_psram_pool_base() + BOARD_PSRAM_CANVAS_ARENA_OFFSET;
+}
+
+/**
+ * @brief 池子里落在 arena **之前**的字节数（BoardPSRAM 堆 region 0）。
+ */
+static inline size_t board_psram_pool_lo_bytes(void)
+{
+  if (BOARD_PSRAM_POOL_BYTES <= BOARD_PSRAM_CANVAS_ARENA_OFFSET)
+    {
+      return 0;
+    }
+
+  return BOARD_PSRAM_CANVAS_ARENA_OFFSET;
+}
+
+/**
+ * @brief 池子里落在 arena **之后**的字节数（BoardPSRAM 堆 region 1）。
+ */
+static inline size_t board_psram_pool_hi_bytes(void)
+{
+  const size_t skip =
+      BOARD_PSRAM_CANVAS_ARENA_OFFSET + BOARD_PSRAM_CANVAS_ARENA_BYTES;
+
+  if (BOARD_PSRAM_POOL_BYTES <= skip)
+    {
+      return 0;
+    }
+
+  return BOARD_PSRAM_POOL_BYTES - skip;
+}
+
 #endif /* MY_VENDOR_BOARD_PSRAM_LAYOUT_H */

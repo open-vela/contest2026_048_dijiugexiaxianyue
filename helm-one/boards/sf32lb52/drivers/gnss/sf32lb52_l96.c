@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/gnss/sf32lb52_l96.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/gnss/sf32lb52_l96.c
  *
  * u-blox MAX-M10S-00B-01 board support: PA43 GNSS_PWR (module VCC) and
  * UART2 baud preset. Official low power is cutting VCC, not closing

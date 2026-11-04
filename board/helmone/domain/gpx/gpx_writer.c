@@ -159,6 +159,7 @@ int gpx_writer_open(gpx_writer_t *writer, const char *path,
       goto fail;
     }
 
+  writer->footer_written = false;
   writer->open = true;
   /* 空文件已占住。头留在 PSRAM。落盘只在缓存满或 close：append→fsync→close。 */
   return 0;
@@ -202,6 +203,7 @@ int gpx_writer_open_append(gpx_writer_t *writer, const char *path)
       return ret;
     }
 
+  writer->footer_written = false;
   writer->open = true;
   return 0;
 }
@@ -398,22 +400,24 @@ int gpx_writer_close(gpx_writer_t *writer)
       return 0;
     }
 
-  if (gpx_port_file_write_str(&writer->file, "</trkseg>\n</trk>\n</gpx>\n") != 0)
+  if (!writer->footer_written)
     {
-      ret = -EIO;
-    }
+      ret = gpx_port_file_write_str(&writer->file,
+                                    "</trkseg>\n</trk>\n</gpx>\n");
+      if (ret != 0)
+        {
+          return ret;
+        }
 
-  if (gpx_port_file_sync(&writer->file) != 0 && ret == 0)
-    {
-      ret = -EIO;
+      writer->footer_written = true;
     }
 
   close_ret = gpx_port_file_close(&writer->file);
-  if (close_ret != 0 && ret == 0)
+  if (close_ret != 0)
     {
-      ret = close_ret;
+      return close_ret;
     }
 
   writer->open = false;
-  return ret;
+  return 0;
 }

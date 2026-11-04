@@ -1,6 +1,6 @@
 /**
  * @file myvendor_watchdog.c
- * @brief 启动 IWDT；CPU（idle 或 work）与 UI 心跳都新鲜时由独立任务喂狗。
+ * @brief 启动 IWDT；idle、work 或 UI 主循环有进展时由独立任务喂狗。
  *
  * 不在 SysTick / LPWORK 里喂：中断仍在、调度已死时也必须能复位。
  * idle / UI / work 只打时间戳；ioctl 只放在 iwdg_feed 里。
@@ -48,7 +48,7 @@
 #endif
 
 #ifndef CONFIG_MYVENDOR_WATCHDOG_HEARTBEAT_MS
-#  define CONFIG_MYVENDOR_WATCHDOG_HEARTBEAT_MS 10000
+#  define CONFIG_MYVENDOR_WATCHDOG_HEARTBEAT_MS 30000
 #endif
 
 #ifndef CONFIG_MYVENDOR_WATCHDOG_UI_GRACE_MS
@@ -120,17 +120,26 @@ static bool wdt_should_feed(void)
   bool cpu_ok;
   bool ui_req;
   bool ui_ok;
+  bool idle_live;
+  bool work_live;
+  bool ui_live;
 
   if (g_suppressed)
     {
       return false;
     }
 
-  cpu_ok = wdt_fresh(g_idle_beat) ||
-           (g_work_seen && wdt_fresh(g_work_beat));
+  idle_live = wdt_fresh(g_idle_beat);
+  work_live = g_work_seen && wdt_fresh(g_work_beat);
+  ui_live = g_ui_seen && wdt_fresh(g_ui_beat);
+
+  /* The UI beat comes from the bicycle_ui main loop. If it advances, the
+   * scheduler and that application task are running even when a continuously
+   * runnable task prevents up_idle() and no transfer updates the work beat.
+   * Requiring idle/work alone reset a live board in this exact state. */
+  cpu_ok = idle_live || work_live || ui_live;
   ui_req = wdt_ui_required_now();
-  ui_ok = !ui_req || (g_ui_seen && wdt_fresh(g_ui_beat)) ||
-          (g_work_seen && wdt_fresh(g_work_beat));
+  ui_ok = !ui_req || ui_live || work_live;
 
   g_ui_required = ui_req;
   return cpu_ok && ui_ok;
@@ -175,6 +184,9 @@ static int wdt_hw_start_now(void)
 static int wdt_feed_task(int argc, FAR char *argv[])
 {
   uint32_t starve_log = 0;
+  clock_t feeder_last = 0;
+  bool feeder_have_last = false;
+  bool ui_only_logged = false;
   int fd;
 
   (void)argc;
@@ -190,7 +202,61 @@ static int wdt_feed_task(int argc, FAR char *argv[])
 
   for (; ; )
     {
+      /* 喂狗线程自己"回来晚了" —— 系统级停顿的**独立证据**（用户 2026-09-26）。
+       *
+       * 为什么放这里：它 prio 180、只做喂狗这一件事，任何远大于喂狗周期的间隔都
+       * 说明有别的活把 CPU/中断占住了。现场两次 WDT 饥饿复位的形态都是"升档后
+       * SD 时钟重配 ⇒ 日志静默窗口长度 == idle/work 心跳停摆长度（11.17 s /
+       * 11.98 s），而 ui 心跳只有 10 ms"；当时地图页不可见、泵不跑，[vperf] 那套
+       * 探针根本没机会执行 —— 放这里就与页面无关了。
+       *
+       * ⚠ **只在线程里打**（这里不是中断上下文；喂狗本身走 ioctl，ISR 里绝不打印）。
+       * 时间基准沿用本文件既有的 tick（与 wdt_should_feed / wdt_age_ms 同源），
+       * 所以它与看门狗判定看到的是同一条时间轴。 */
+      {
+        clock_t now = clock_systime_ticks();
+
+        if (feeder_have_last)
+          {
+            uint32_t gap_ms = (uint32_t)TICK2MSEC(now - feeder_last);
+
+            if (gap_ms > (uint32_t)(CONFIG_MYVENDOR_WATCHDOG_FEED_MS + 500))
+              {
+                syslog(LOG_WARNING,
+                       "[wdt] feeder late %ums (>%ums) idle=%ums work=%ums ui=%ums\n",
+                       (unsigned)gap_ms,
+                       (unsigned)(CONFIG_MYVENDOR_WATCHDOG_FEED_MS + 500),
+                       (unsigned)wdt_age_ms(g_idle_beat),
+                       g_work_seen ? (unsigned)wdt_age_ms(g_work_beat) : 0u,
+                       g_ui_seen ? (unsigned)wdt_age_ms(g_ui_beat) : 0u);
+              }
+          }
+        feeder_last = now;
+        feeder_have_last = true;
+      }
+
       bool feed = wdt_should_feed();
+
+      /* Keep one warning for a sustained no-idle/no-work interval. The UI
+       * beat proves progress, but the missing idle time is still worth
+       * investigating instead of silently masking a busy task. */
+      {
+        bool ui_only = !wdt_fresh(g_idle_beat) &&
+                       (!g_work_seen || !wdt_fresh(g_work_beat)) &&
+                       g_ui_seen && wdt_fresh(g_ui_beat);
+
+        if (ui_only && !ui_only_logged)
+          {
+            syslog(LOG_WARNING,
+                   "[wdt] idle/work stale but ui alive; keep feeding "
+                   "idle=%ums work=%ums ui=%ums\n",
+                   (unsigned)wdt_age_ms(g_idle_beat),
+                   g_work_seen ? (unsigned)wdt_age_ms(g_work_beat) : 0u,
+                   (unsigned)wdt_age_ms(g_ui_beat));
+          }
+
+        ui_only_logged = ui_only;
+      }
 
       g_feeding = feed;
       if (feed)
@@ -239,6 +305,33 @@ void myvendor_watchdog_work_beat(void)
 {
   g_work_beat = wdt_now();
   g_work_seen = true;
+}
+
+/**
+ * @brief SysTick / HCLK 换档后同步心跳时间戳。
+ *
+ * `wdt_age_ms()` 用 `clock_systime_ticks()` + 编译期 `TICK2MSEC`。DVFS
+ * 重配 SysTick 后，旧时间戳会算出天文数字年龄（n580：idle_age≈58 min
+ * 而 pc 却在 up_idle）→ 误停喂 → 误复位。切频后把三条 beat 写成"现在"，
+ * 只抹掉换档造成的断层；之后 10 s 内仍无新 beat 照样饿死复位。
+ */
+void myvendor_watchdog_tick_reclock(void)
+{
+  clock_t now = wdt_now();
+
+  g_idle_beat = now;
+  if (g_work_seen)
+    {
+      g_work_beat = now;
+    }
+
+  if (g_ui_seen)
+    {
+      g_ui_beat = now;
+    }
+
+  g_start_tick = now;
+  g_busy_yield_tick = now;
 }
 
 void myvendor_watchdog_busy_pump(void)

@@ -530,7 +530,7 @@ int xfer_list_pack(const char *dir, uint16_t *cursor, uint8_t *out,
   DIR           *dp;
   struct dirent *ent;
   uint16_t       skip;
-  uint16_t       packed = 0;
+  uint32_t       consumed = 0;
   uint16_t       off = 0;
   int            err = 0;
 
@@ -574,23 +574,36 @@ int xfer_list_pack(const char *dir, uint16_t *cursor, uint8_t *out,
         }
 
       need = (uint16_t)(1 + 4 + 4 + 1 + nlen);
-      if (off + need > out_max)
+      /* cursor counts consumed entries, including failed stat/path entries. */
+      if ((uint32_t)*cursor + consumed == UINT16_MAX)
         {
-          /* This page is full; caller will resume with the updated cursor. */
-
+          err = EOVERFLOW;
           goto done;
         }
 
       ret = snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
       if (ret < 0 || (size_t)ret >= sizeof(full))
         {
+          consumed++;
           continue;
         }
 
       ret = xfer_stat(full, &st);
       if (ret != 0)
         {
+          consumed++;
           continue;
+        }
+
+      if (off + need > out_max)
+        {
+          /* An entry must fit an empty page; otherwise never repeat it. */
+          if (off == 0)
+            {
+              err = EMSGSIZE;
+            }
+
+          goto done;
         }
 
       out[off] = st.type;
@@ -599,7 +612,7 @@ int xfer_list_pack(const char *dir, uint16_t *cursor, uint8_t *out,
       out[off + 9] = (uint8_t)nlen;
       memcpy(out + off + 10, ent->d_name, nlen);
       off    = (uint16_t)(off + need);
-      packed++;
+      consumed++;
     }
 
   *last = true;
@@ -610,7 +623,7 @@ done:
       err = errno;
     }
 
-  *cursor = (uint16_t)(*cursor + packed);
+  *cursor = (uint16_t)(*cursor + consumed);
   if (err != 0)
     {
       return -err;
@@ -904,25 +917,104 @@ int xfer_write_data(int fd, const uint8_t *buf, size_t len)
   return 0;
 }
 
-/** @brief rename 提交正式文件。 */
+/** @brief rename 提交正式文件；始终接管并关闭 fd，失败保留 .part。 */
 int xfer_write_commit(int fd, const char *tmp_path, const char *final_path)
 {
+  char backup[XFER_PATH_MAX];
+  struct stat st;
+  bool backed_up = false;
+  int ret = 0;
+  int n;
+
   if (fd >= 0)
     {
       myvendor_watchdog_hw_pet();
-      close(fd);
+      if (fsync(fd) != 0)
+        {
+          ret = errno != 0 ? errno : EIO;
+        }
+
+      if (close(fd) != 0 && ret == 0)
+        {
+          ret = errno != 0 ? errno : EIO;
+        }
     }
 
-  if (tmp_path == NULL || final_path == NULL)
+  if (ret != 0)
+    {
+      return ret;
+    }
+
+  if (tmp_path == NULL || final_path == NULL ||
+      strcmp(tmp_path, final_path) == 0)
     {
       return EINVAL;
     }
 
-  unlink(final_path);
+  /* NuttX VFS rename unlinks an existing destination before calling LFS.
+   * Move the old file aside first; never rename over either recoverable copy.
+   * A leftover backup is intentionally retained for recovery after power loss.
+   */
+  n = snprintf(backup, sizeof(backup), "%s.bak", final_path);
+  if (n < 0 || (size_t)n >= sizeof(backup))
+    {
+      return ENAMETOOLONG;
+    }
+
+  if (stat(tmp_path, &st) != 0)
+    {
+      return errno != 0 ? errno : EIO;
+    }
+
+  if (!S_ISREG(st.st_mode))
+    {
+      return EINVAL;
+    }
+
+  if (stat(backup, &st) == 0)
+    {
+      /* Do not overwrite a backup from an interrupted earlier commit. */
+      return EBUSY;
+    }
+  else if (errno != ENOENT)
+    {
+      return errno;
+    }
+
+  if (stat(final_path, &st) == 0)
+    {
+      if (!S_ISREG(st.st_mode))
+        {
+          return EISDIR;
+        }
+
+      if (rename(final_path, backup) != 0)
+        {
+          return errno != 0 ? errno : EIO;
+        }
+
+      backed_up = true;
+    }
+  else if (errno != ENOENT)
+    {
+      return errno;
+    }
+
   if (rename(tmp_path, final_path) != 0)
     {
-      unlink(tmp_path);
-      return errno != 0 ? errno : EIO;
+      ret = errno != 0 ? errno : EIO;
+      if (backed_up)
+        {
+          /* Failure to restore still leaves the old data in backup. */
+          (void)rename(backup, final_path);
+        }
+
+      return ret;
+    }
+
+  if (backed_up)
+    {
+      (void)unlink(backup);
     }
 
   (void)myvendor_fw_slot_on_commit(final_path);

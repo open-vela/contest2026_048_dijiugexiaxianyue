@@ -31,6 +31,7 @@
 #include "bf0_hal_mpi_ex.h"
 #include "dma_config.h"
 
+#include "myvendor_watchdog.h"
 #include "sf32lb_flash.h"
 
 /****************************************************************************
@@ -739,6 +740,14 @@ static int SF32LB_FLASH_RAMFUNC sf32lb_nor_erase_range(FAR FLASH_HandleTypeDef *
 
   while (erase_size > 0)
     {
+      /* ⚠ 每擦一块**报一次平安**（2026-09-27 现场：开机"恢复未保存 gpx" 触发 LFS 回收，
+       * 连着擦很多块，整段 ~11 s 里三条心跳全僵 ⇒ 喂狗线程按策略停喂 ⇒ IWDG 复位）。
+       * 这里擦一块就关一次中断（`up_irq_save()`），关中断期间**谁都喂不了心跳**；
+       * 块与块之间恢复中断，所以在这条缝里喂一次即可让整段存活：
+       * `busy_pump()` 同时喂 work 心跳（`cpu_ok` 与 `ui_ok` 都认它）并每 1 s 让出 10 ms
+       * 给喂狗线程/空闲任务。判据见 bsp/myvendor_watchdog.c 的 `wdt_should_feed()`。 */
+      myvendor_watchdog_busy_pump();
+
       chunk_addr = erase_addr;
       chunk_size = 0;
       sf32lb_flash_lock();
@@ -867,6 +876,10 @@ static ssize_t SF32LB_FLASH_RAMFUNC sf32lb_nor_write_range(FAR FLASH_HandleTypeD
   cnt = 0;
   tsize = size;
   tbuf = buffer;
+
+  /* 每次写操作开头报一次平安（同 `sf32lb_flash_erase()` 的理由：LFS 回收/大文件写入
+   * 会连着做很多次 4 KB 写，这段里没人喂心跳就会被判"忙且失联"）。 */
+  myvendor_watchdog_busy_pump();
 
   if (addr >= hflash->base)
     {

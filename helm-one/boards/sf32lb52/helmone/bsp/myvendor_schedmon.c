@@ -30,6 +30,7 @@ static volatile uint32_t g_null_n;
 static uint8_t g_null_w;
 static uint32_t g_logged_null;
 static uint32_t g_logged_mutex;
+static uint32_t g_logged_ready_orphan;
 static clock_t g_log_ticks;
 
 static void schedmon_copy_name(char *dst, FAR struct tcb_s *tcb)
@@ -155,6 +156,41 @@ void myvendor_schedmon_mutex_bad(int32_t holder, pid_t tid, pid_t run_pid,
     }
 }
 
+void myvendor_schedmon_ready_orphan(FAR struct tcb_s *rtcb,
+                                    FAR struct tcb_s *idle)
+{
+  struct myvendor_schedmon_null_s *e = &g_snap.last_ready_orphan;
+  uint32_t n;
+
+  n = g_snap.ready_orphan_n + 1u;
+  if (n == 0u)
+    {
+      n = 1u;
+    }
+
+  g_snap.ready_orphan_n = n;
+  memset(e, 0, sizeof(*e));
+  e->seq = n;
+  e->ticks = (uint32_t)clock_systime_ticks();
+  e->ipsr = (uint32_t)up_interrupt_context();
+  if (rtcb != NULL)
+    {
+      e->wt_pid = (int16_t)rtcb->pid;
+      e->wt_pri = (int16_t)rtcb->sched_priority;
+      e->wt_state = (uint8_t)rtcb->task_state;
+      e->errcode = rtcb->errcode;
+      schedmon_copy_name(e->wt_name, rtcb);
+    }
+
+  if (idle != NULL)
+    {
+      e->run_pid = (int16_t)idle->pid;
+      e->run_lock = idle->lockcount;
+      e->run_state = (uint8_t)idle->task_state;
+      schedmon_copy_name(e->run_name, idle);
+    }
+}
+
 static void schedmon_one(FAR struct tcb_s *tcb, FAR void *arg)
 {
   struct myvendor_schedmon_snap_s *s = arg;
@@ -247,9 +283,11 @@ void myvendor_schedmon_tick(void)
   clock_t now = clock_systime_ticks();
   uint32_t null_n;
   uint32_t mutex_n;
+  uint32_t ready_n;
   bool due;
   bool new_null;
   bool new_mutex;
+  bool new_ready;
 
   memset(&tmp, 0, sizeof(tmp));
   tmp.ticks = (uint32_t)now;
@@ -259,16 +297,22 @@ void myvendor_schedmon_tick(void)
   tmp.gen = g_snap.gen + 1u;
   tmp.null_n = g_null_n;
   tmp.mutex_bad_n = g_snap.mutex_bad_n;
+  tmp.sembad_n = g_snap.sembad_n;
+  tmp.ready_orphan_n = g_snap.ready_orphan_n;
   tmp.last_null = g_snap.last_null;
   tmp.last_mutex = g_snap.last_mutex;
+  tmp.last_sembad = g_snap.last_sembad;
+  tmp.last_ready_orphan = g_snap.last_ready_orphan;
   g_snap = tmp;
   g_snap.gen = tmp.gen + 1u;
   null_n = g_null_n;
   mutex_n = tmp.mutex_bad_n;
+  ready_n = tmp.ready_orphan_n;
   up_irq_restore(flags);
 
   new_null = (null_n != g_logged_null);
   new_mutex = (mutex_n != g_logged_mutex);
+  new_ready = (ready_n != g_logged_ready_orphan);
   due = (g_log_ticks == 0) ||
         ((clock_t)(now - g_log_ticks) >= SCHEDMON_TICKS_15S);
 
@@ -293,6 +337,20 @@ void myvendor_schedmon_tick(void)
       g_logged_null = null_n;
     }
 
+  if (new_ready)
+    {
+      const struct myvendor_schedmon_null_s *e = &g_snap.last_ready_orphan;
+
+      syslog(LOG_ERR,
+             "sched: ready-orphan n=%u "
+             "head pid=%d %s st=%u pri=%d "
+             "idle pid=%d %s st=%u\n",
+             (unsigned)e->seq,
+             (int)e->wt_pid, e->wt_name, (unsigned)e->wt_state,
+             (int)e->wt_pri,
+             (int)e->run_pid, e->run_name, (unsigned)e->run_state);
+      g_logged_ready_orphan = ready_n;
+    }
   if (new_mutex)
     {
       const struct myvendor_schedmon_mutex_s *m = &g_snap.last_mutex;

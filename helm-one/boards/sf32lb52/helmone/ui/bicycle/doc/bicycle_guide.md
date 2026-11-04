@@ -32,7 +32,7 @@
 apps/packages/demos/x_track/
 ```
 
-该 Demo 由 X-TRACK 原作者移植，功能包括时速、里程、轨迹显示等，分辨率 240×320，使用 LVGL + 触摸屏。官方文档见 [X_Track_zh-cn.md](../../../../../docs/zh-cn/demo/X_Track_zh-cn.md)。
+该 Demo 由 X-TRACK 原作者移植，功能包括时速、里程、轨迹显示等，分辨率 240×320，使用 LVGL + 触摸屏。官方文档见 `X_Track_zh-cn.md`（openvela 文档仓 `docs/zh-cn/demo/`，不在本仓）。
 
 在模拟器上跑 x_track 的**传统方式**是：
 
@@ -45,7 +45,7 @@ apps/packages/demos/x_track/
 
 ### 1.2 需求：像 test_app 一样挂在板级
 
-在真机板级（如 `vendor/my_vendor/.../test_app`）中，应用通常：
+在真机板级（如 `vendor/HelmOne/.../test_app`）中，应用通常：
 
 - 放在 **board 目录** 下（`nuttx_add_application`）；
 - 用 **Kconfig + defconfig** 控制是否编入固件；
@@ -458,7 +458,7 @@ rsync -a --delete "${SRC}/resource/track/" "${DST}/etc/track/"
 
 ## 13. LiveMap 矢量地图与资源（SF32 当前）
 
-真机板级（`vendor/my_vendor/.../bicycle`）当前以 **LiveMap 为默认主页**，矢量地图资源在 LittleFS，与模拟器 ROMFS `/etc` 路径不同。
+真机板级（`vendor/HelmOne/.../bicycle`）当前以 **LiveMap 为默认主页**，矢量地图资源在 LittleFS，与模拟器 ROMFS `/etc` 路径不同。
 
 ### 13.1 地图资源路径
 
@@ -491,6 +491,6 @@ rm -f nuttx/{Make.defs,defconfig,.config,.config.*,.gdbinit,.dirlinks}
 
 ## 参考
 
-- [X-TRACK 上游文档](../../../../../docs/zh-cn/demo/X_Track_zh-cn.md)
-- [模拟器快速入门](../../../../../docs/zh-cn/quickstart/openvela_ubuntu_quick_start.md)
-- [test_app 板级示例](../../../../../vendor/my_vendor/docs/test_app_guide.md)
+- X-TRACK 上游文档：openvela 文档仓 `docs/zh-cn/demo/X_Track_zh-cn.md`（不在本仓）
+- 模拟器快速入门（openvela 文档仓 `docs/zh-cn/quickstart/`，不在本仓）
+- [test_app 板级示例](../../../../../../docs/test_app_guide.md)

@@ -3,7 +3,7 @@
 树形与 **OpenVela 根目录** 对齐。在根目录：
 
 ```bash
-R=vendor/my_vendor/docs/pitch/replace
+R=vendor/HelmOne/docs/pitch/replace
 cp $R/external/zblue/zblue/subsys/bluetooth/host/id.c   external/zblue/zblue/subsys/bluetooth/host/id.c
 cp $R/frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c \
    frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c

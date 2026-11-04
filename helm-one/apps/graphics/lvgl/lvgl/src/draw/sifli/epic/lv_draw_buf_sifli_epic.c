@@ -85,7 +85,7 @@ static void buf_invalidate_cache(const lv_draw_buf_t * draw_buf, const lv_area_t
     }
 
 #if LV_USE_NUTTX
-    up_invalidate_dcache((uintptr_t)start, (uintptr_t)start + size);
+    lv_epic_invalidate_cache_range(start, size);
 #else
     if(!lv_epic_is_cached_ram((uint32_t)(uintptr_t)start, size)) {
         return;
@@ -108,7 +108,7 @@ static void buf_flush_cache(const lv_draw_buf_t * draw_buf, const lv_area_t * ar
     }
 
 #if LV_USE_NUTTX
-    up_flush_dcache((uintptr_t)start, (uintptr_t)start + size);
+    lv_epic_clean_invalidate_cache_range(start, size);
 #else
     if(!lv_epic_is_cached_ram((uint32_t)(uintptr_t)start, size)) {
         return;

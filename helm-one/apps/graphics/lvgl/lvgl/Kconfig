@@ -127,6 +127,7 @@ menu "LVGL configuration"
 	menu "Operating System (OS)"
 		choice LV_USE_OS
 			prompt "Default operating system to use"
+			default LV_OS_PTHREAD if MYVENDOR_LVGL_EPIC_QUEUE_MODE
 			default LV_OS_NONE
 
 			config LV_OS_NONE
@@ -204,10 +205,13 @@ menu "LVGL configuration"
 
 		config LV_DRAW_THREAD_STACK_SIZE
 			int "Stack size of draw thread in bytes"
+			default 32768 if MYVENDOR_LVGL_EPIC_QUEUE_MODE
 			default 8192
 			depends on !LV_OS_NONE
 			help
 				If FreeType or ThorVG is enabled, it is recommended to set it to 32KB or more.
+				MYVENDOR_LVGL_EPIC_QUEUE_MODE forces 32768 (lv_conf_internal
+				#errors when LV_USE_FREETYPE is on and the stack is below 32KB).
 
 		config LV_DRAW_THREAD_PRIO
 			int "Thread priority for the drawing thread"

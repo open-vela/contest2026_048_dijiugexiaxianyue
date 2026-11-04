@@ -48,16 +48,21 @@ helm-one/
 │       └── nsh/                # NSH / 探针
 ├── boot_loader/                # NAND 启动链（sifli 无）
 │   ├── build.sh
+│   ├── project/                # 二级 boot（2SFBL）源码：butterflmicro / ram_v2
 │   ├── bin/                    # bootloader.bin / ftab.bin（预置；其余为构建产物）
 │   ├── config/nsh/             # ptab.json, sftool_param.json, boot.json
 │   ├── include/                # ptab.h, custom_mem_map.h（分区宏）
+│   ├── third_party/sgl/        # 二级 boot 的 GUI 库
 │   └── scripts/                # gen_ftab.py, load_boot_config.py
 ├── chips/sf32lb52/             # chip 层（Kconfig / 板级扩展）
 ├── middleware/
 ├── scripts/                    # wrap_nuttx_image.sh, build_fs_root.sh, pack_sd_img.py …
 ├── .cache/                     # littlefs 源码缓存（随仓发布，离线也能构建）
-└── docs/
-    ├── pitch/                  # 上游必改件：替换文件、补丁、改法
+└── docs/                       # 全部工程文档（osm / map / pitch / ble / ui / font / tools …）
+    ├── osm/                    #   OSM → 瓦片 → 分片 全流水线（工具 + 手册 + 样本）
+    ├── map/                    #   渲染规范 STYLE.md、运行时 RUNTIME.md、性能实测
+    ├── pitch/                  #   上游必改件：替换文件、补丁、改法
+    ├── tools/                  #   上板探针 serial_hub.py / pty_run.py / probe_boot.py
     └── tools/make_sd_{2,4,8,16}g.sh
 ```
 

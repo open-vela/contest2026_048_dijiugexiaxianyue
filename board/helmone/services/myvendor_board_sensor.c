@@ -77,6 +77,20 @@
 #define BOARD_SENSOR_BAT_HYST        2
 #define BOARD_SENSOR_ADC_PATH        "/dev/adc0"
 
+/** @brief 满电校准要"条件连续成立"多久才允许改一次（毫秒）。
+ *
+ *  满充观测窗口（`MYVENDOR_DEVCTL_BAT_FULL_OBS_MIN..MAX`）很宽，而单次观测本身
+ *  就有几十 mV 的移动，死区却只有 50 mV ⇒ 只要充电器还报"充满"，**每一拍（2 s）
+ *  都可能重写一次**，`full` 就跟着读数走：现场实测 12 s 里 4397→4061 连走
+ *  340 mV，全会话 264 条 `ctl: bat full cal`。而 `full` 是电量曲线拉伸的轴，
+ *  它被推着走 = 显示的百分比被推着走。
+ *
+ *  所以改成：**充满判定 + 读数落在观测窗口内连续成立这么久，才提交一次**，
+ *  提交后重新计时；中间任意一拍不成立就清零重来。
+ *  60 s ≈ 4 倍电压 EMA（`BOARD_SENSOR_BAT_EMA`=8 × 2 s）的时间常数，读数已经稳了，
+ *  而一次真正充满会持续很久，这个门槛不苛刻。 */
+#define BOARD_SENSOR_BAT_CAL_HOLD_MS 60000u
+
 enum i2c_read_kind
 {
   I2C_READ_DATA = 0,
@@ -175,6 +189,9 @@ static bool g_adc_conv;
 static int g_bat_ema = -1;
 static int g_bat_pct_ui = -1;
 static uint32_t g_bat_ms;
+/** @brief 满电校准"连续成立"的累计时长（ms）与上一拍时刻，见 bat_maybe_cal()。 */
+static uint32_t g_bat_cal_hold_ms;
+static uint32_t g_bat_cal_last_ms;
 #endif
 
 static struct board_fault_window g_fault_win[BOARD_LANE_COUNT];
@@ -544,41 +561,66 @@ static int bat_pct_ui(int filt_mv)
 }
 
 /**
- * @brief 充电→充满、坐在充满 IO、或旧 4.10 V KV 已到 CV 时更新满电校准。
+ * @brief 满电校准：门条件**连续成立** `BOARD_SENSOR_BAT_CAL_HOLD_MS` 之后才提交一次。
  *
- * 电压门槛在 ctl：低于约 4.05 V 的观测直接丢弃。
- * 已在充满 IO、或充电且 KV 仍是旧默认（约 4.10 V）而电压已到 CV。
+ * 门条件（两条入口，任一成立即可）：
+ *   ① 坐在充满电 IO 上（电平，或刚到的上升沿）；
+ *   ② 充电中、且 KV 还是旧默认（< `MYVENDOR_BAT_SOC_STALE_FULL_MAX`）而电压已到 CV。
+ * 无论走哪条，`mv` 都必须落在满充观测窗口内 —— 窗口本身就挡掉了"使用中的 3.98 V"。
+ *
+ * 这两条以前是**每一拍都直接提交**，于是充满期间 `full` 被读数推着走（见
+ * `BOARD_SENSOR_BAT_CAL_HOLD_MS` 的注释）；现在统一由这里的连续计时把关。
+ *
+ * @param mv     本拍电压（mV，已过 EMA）。
+ * @param now_ms 本拍时刻，用来累计真实经过的时间（轮询会被监督器跳拍，
+ *               所以不能按"每次 +2000 ms"算）。
  */
-static void bat_maybe_cal(int mv)
+static void bat_maybe_cal(int mv, uint32_t now_ms)
 {
-  bool edge;
-  bool full;
+  uint32_t dt;
+  bool valid;
+  bool armed;
   int stored;
 
-  if (mv < 0)
+  /* 不管本拍是否成立，都先把"上一拍到现在"备好：不成立时这段会被丢掉。 */
+  dt = (g_bat_cal_last_ms != 0u && now_ms > g_bat_cal_last_ms)
+           ? now_ms - g_bat_cal_last_ms
+           : 0u;
+  g_bat_cal_last_ms = now_ms;
+
+  if (mv >= MYVENDOR_DEVCTL_BAT_FULL_OBS_MIN &&
+      mv <= MYVENDOR_DEVCTL_BAT_FULL_OBS_MAX)
+    {
+      valid = true;
+    }
+  else
+    {
+      valid = false;
+    }
+
+  armed = valid && (eta9184_take_full_edge() || eta9184_charge_full());
+
+  if (!armed && valid && bat_charging() && !myvendor_devctl_bat_full_have())
+    {
+      stored = myvendor_devctl_bat_full_mv_get();
+      armed = (stored < MYVENDOR_BAT_SOC_STALE_FULL_MAX &&
+               mv >= MYVENDOR_BAT_SOC_STALE_OBS_MIN);
+    }
+
+  if (!armed)
+    {
+      g_bat_cal_hold_ms = 0u;
+      return;
+    }
+
+  g_bat_cal_hold_ms += dt;
+  if (g_bat_cal_hold_ms < BOARD_SENSOR_BAT_CAL_HOLD_MS)
     {
       return;
     }
 
-  edge = eta9184_take_full_edge();
-  full = eta9184_charge_full();
-  if (edge || full)
-    {
-      myvendor_devctl_bat_full_note(mv);
-      return;
-    }
-
-  if (!bat_charging() || !myvendor_devctl_bat_full_have())
-    {
-      return;
-    }
-
-  stored = myvendor_devctl_bat_full_mv_get();
-  if (stored < MYVENDOR_BAT_SOC_STALE_FULL_MAX &&
-      mv >= MYVENDOR_BAT_SOC_STALE_OBS_MIN)
-    {
-      myvendor_devctl_bat_full_note(mv);
-    }
+  myvendor_devctl_bat_full_note(mv);
+  g_bat_cal_hold_ms = 0u;   /* 重新计时：改一次至少再等一个完整窗口 */
 }
 
 static void bat_publish(int mv, int pct, uint32_t now_ms)
@@ -698,7 +740,7 @@ static void bat_poll(uint32_t now_ms)
           g_bat_ema += (mv - g_bat_ema) / BOARD_SENSOR_BAT_EMA;
         }
 
-      bat_maybe_cal(g_bat_ema);
+      bat_maybe_cal(g_bat_ema, now_ms);
       (void)bat_pct_ui(g_bat_ema);
       bat_publish(mv, g_bat_pct_ui, now_ms);
     }

@@ -79,6 +79,16 @@
 **事实**：BLE 约 15 KB/s（CRC32 + 偏移续传）；大文件走 USB MTP（产品固件只暴露 `/mnt/lfs/mtp`，工厂固件暴露 `/mnt/lfs`+`/mnt/kv`+`/mnt/fat`）。
 **源**：`docs/sd_partition.md` §2.1、`docs/debug/mtp_upload.md`
 
+### C5. 已绑定手机不自动回连 / 一直回退无定向
+**判据**：`ctl pair phone`（应为身份地址 type=0）、`ctl pair list`（sec=2 bonded=1）、`bt_keys kv: ... RAL rl_size=3 entries=N`；窗口外应有 `phone RPA cached ...` → `adv directed (paired; cached RPA ...)`。
+**处置**：`entries=0` 先查 IRK 落盘/RAL；`no fresh RPA`/`directed cooldown`/`directed adv no connection` 见定向回连文档。首次开机/重启后无 RPA 缓存，第一次回连走无定向是设计行为。
+**源**：`docs/ble/directed_reconnect.md`
+
+### C6. 定向广播 HCI 成功但手机不连 / 连上即断
+**根因**：TargetA 必须是手机当前 RPA（身份地址不行）；own 必须是码表 public 地址（own=RANDOM 手机不认）；host 侧 pending conn 必须按原始 RPA 查（`patch_hci_core.py`）。
+**处置**：看 `adv_param ... type=0x04 own=0x00 peer_type=0x01 peer=<RPA>`；若出现 `No pending conn`/`reason=0x16`，确认构建期补丁生效。
+**源**：`docs/ble/directed_reconnect.md`
+
 ---
 
 ## D. 看门狗与整机

@@ -97,6 +97,8 @@ typedef struct {
     pthread_t thread;
     bool thread_run;
     bool thread_alive;
+    /** @brief 演示「暂停骑行」：回放线程原地待命，出口速度强制 0。 */
+    bool hold;
     bicycle_gnss_fix_t fix;
 } gpx_sim_t;
 
@@ -450,6 +452,36 @@ static int gpx_sim_load_file(gpx_sim_t * sim)
     return 0;
 }
 
+/** @brief 往返循环标志（默认关；NSH `gnss sim ... loop` 置开）。 */
+static volatile bool g_gpx_loop;
+
+/**
+ * @brief  往返循环开关（长测用）：到端点后**掉头**继续，而不是停在端点。
+ * @param  on true = 开。
+ * @note   用文件级标志、而不是每次 start 的参数：NSH 侧 `gnss sim ... loop` 在"设标志"与
+ *         "UI 真正 start"之间隔着一次 ctl 投递（跨任务），而标志只在**到端点**时才被读，
+ *         所以这个顺序是安全的。
+ * @note   掉头（ping-pong）而不是跳回起点：跳回起点会造成一次上千公里的瞬移 ⇒ 瓦片整批
+ *         重载 + 全图重绘（长测里就是周期性尖峰），掉头只是继续沿轨迹往回骑。
+ */
+void bicycle_gpx_sim_set_loop(bool on)
+{
+    g_gpx_loop = on;
+}
+
+/** @brief 往返循环是否已打开（供日志/调试用）。 */
+bool bicycle_gpx_sim_loop_enabled(void)
+{
+    return g_gpx_loop;
+}
+
+/**
+ * @brief 取轨迹上的下一个点；到端点时按循环开关决定"掉头"还是"结束"。
+ * @param sim 回放状态。
+ * @retval true 已把下一个点装进 sim->next；false 到头了（或数据不足）。
+ * @note 掉头时打一行 INFO（`gpx_sim: loop turn -> fwd/rev at idx=i/n`）——长测里就是
+ *       "它在循环"的唯一证据，一次往返一行。
+ */
 static bool load_next_point(gpx_sim_t * sim)
 {
     uint32_t n;
@@ -460,8 +492,17 @@ static bool load_next_point(gpx_sim_t * sim)
 
     n = sim_next_idx(sim, sim->idx);
     if (n == sim->idx) {
-        sim->has_next = false;
-        return false;
+        if (g_gpx_loop && sim->pt_count >= 2u) {
+            sim->reverse = !sim->reverse;
+            n = sim_next_idx(sim, sim->idx);
+            syslog(LOG_INFO, "gpx_sim: loop turn -> %s at idx=%u/%u\n",
+                   sim->reverse ? "rev" : "fwd", (unsigned)sim->idx,
+                   (unsigned)sim->pt_count);
+        }
+        if (n == sim->idx) {
+            sim->has_next = false;
+            return false;
+        }
     }
 
     sim->idx = n;
@@ -564,7 +605,10 @@ static void * gpx_thread(void * arg)
     gpx_sim_t * sim = (gpx_sim_t *)arg;
 
     while (sim->thread_run) {
-        parser_update(sim);
+        /* 演示暂停：原地待命（不加时、不动位置），放开后从同一点继续。 */
+        if (!sim->hold) {
+            parser_update(sim);
+        }
         usleep((useconds_t)sim->period_ms * 1000u);
     }
     return NULL;
@@ -1119,25 +1163,217 @@ bool bicycle_gpx_sim_active(void)
     return g_sim.thread_run;
 }
 
+/** @brief 演示暂停：冻结/恢复回放（见头文件）。 */
+void bicycle_gpx_sim_set_hold(bool on)
+{
+    g_sim.hold = on;
+}
+
+bool bicycle_gpx_sim_hold(void)
+{
+    return g_sim.thread_run && g_sim.hold;
+}
+
+/* ======================= 全国跳（调试用合成定位） =======================
+ * @brief  伪造 GNSS 定位在固定城市序列间大跳，造可重复的渲染负载。
+ *
+ * @details 为什么有它：瓦片是**按需重绘**的 —— 小幅平移常常一个新瓦片都不需要，
+ *          `[vperf] frame` 就不出帧（实测：15-40 km/h 的 GPX 回放跑 45 s 只有 1 帧）。
+ *          要可重复地压满"瓦片整批作废 + 重新加载 + 全屏重绘"这条路径，就得让定位
+ *          **大跳**（上千公里）。
+ *          用法（NSH）：`bicycle_nsh gnss hop [period_ms] [count]` 开始（count=0 不限次）、
+ *          `bicycle_nsh gnss hop stop` 停止（随后回到真实 GNSS）。
+ *
+ * @note    实现取舍：**不建线程、不建定时器** —— getter 每次被调用时按"距上次换点的时间"
+ *          决定要不要跳到下一个城市（调用方是 `bicycle_runtime.c` 的定位更新，≥1 Hz）。
+ *          城市表是固定序列 ⇒ 两次跑的顺序一致（A/B 需要的可重复性）。
+ *
+ * @warning 跨任务只共享几个标量，竞态后果最多是"某个点多/少停留一档"，调试命令可接受；
+ *          **不要**把它当产品功能用。另：跳的时候定位是真的在瞬移，若此时在录轨，
+ *          那段轨迹是脏的。
+ * ====================================================================== */
+#include <nuttx/clock.h>
+
+static const bicycle_gnss_hop_pt_t g_hop_pts[] = {
+    { "北京",     39.9042f, 116.4074f },
+    { "上海",     31.2304f, 121.4737f },
+    { "广州",     23.1291f, 113.2644f },
+    { "成都",     30.5728f, 104.0668f },
+    { "乌鲁木齐", 43.8256f,  87.6168f },
+    { "哈尔滨",   45.8038f, 126.5350f },
+    { "拉萨",     29.6520f,  91.1721f },
+    { "三亚",     18.2528f, 109.5119f },
+    { "昆明",     25.0389f, 102.7183f },
+    { "西安",     34.3416f, 108.9398f },
+};
+
+#define BICYCLE_GNSS_HOP_N (sizeof(g_hop_pts) / sizeof(g_hop_pts[0]))
+
+/**
+ * @brief 自定义点表（`bicycle_gnss_hop_set_pts()`；演示模式用它跳风景点）。
+ * @note 只在**一次**跳点期间有效：`hop_stop()` 与"跳够次数自动停"两处都清掉 ⇒
+ *       `bicycle_nsh gnss hop`（渲染压测）永远还是那串固定城市，口径不被演示改掉。
+ */
+static const bicycle_gnss_hop_pt_t * g_hop_use;
+static uint32_t g_hop_use_n;
+
+#define HOP_N()  (g_hop_use != NULL ? g_hop_use_n : (uint32_t)BICYCLE_GNSS_HOP_N)
+#define HOP_PT(i) (&(g_hop_use != NULL ? g_hop_use : g_hop_pts)[(i) % HOP_N()])
+
+static void hop_override_clear(void)
+{
+    g_hop_use = NULL;
+    g_hop_use_n = 0;
+}
+
+/** @brief 换一组跳点（演示用：太湖 / 青海湖 这类风景点）。 */
+void bicycle_gnss_hop_set_pts(const bicycle_gnss_hop_pt_t * pts, uint32_t n)
+{
+    if (pts == NULL || n == 0u) {
+        hop_override_clear();
+        return;
+    }
+
+    g_hop_use = pts;
+    g_hop_use_n = n;
+}
+
+static volatile bool     g_hop_run;
+static volatile unsigned g_hop_period_ms;
+static volatile unsigned g_hop_count;   /* 0 = 不限次 */
+static volatile unsigned g_hop_idx;
+static volatile unsigned g_hop_sent;
+static uint32_t          g_hop_last_ms;
+
+/**
+ * @brief 开始全国跳。
+ * @param period_ms 换点周期（下限 200 ms）。
+ * @param count     总次数；0 = 不限次（用 bicycle_gnss_hop_stop() 停）。
+ */
+void bicycle_gnss_hop_start(unsigned period_ms, unsigned count)
+{
+    g_hop_period_ms = (period_ms < 200u) ? 200u : period_ms;
+    g_hop_count     = count;
+    g_hop_idx       = 0;
+    g_hop_sent      = 0;
+    g_hop_last_ms   = 0;   /* 0 表示"下一次调用立刻出点" */
+    g_hop_run       = true;
+}
+
+/**
+ * @brief 停止全国跳；随后回到真实 GNSS（或 GPX 回放，若有）。
+ */
+void bicycle_gnss_hop_stop(void)
+{
+    g_hop_run = false;
+    hop_override_clear();
+}
+
+/** @brief 是否在跳。 */
+bool bicycle_gnss_hop_active(void)
+{
+    return g_hop_run;
+}
+
+/** @brief 当前所在城市名（未跳时为 "-"）；仅日志用。 */
+const char * bicycle_gnss_hop_cur_name(void)
+{
+    return g_hop_run ? HOP_PT(g_hop_idx)->name : "-";
+}
+
+/**
+ * @brief 取当前跳到的定位（在 bicycle_gpx_sim_get_fix() 里最优先）。
+ * @param out 输出的定位快照；填一个"干净"的 3D 定位（星数/精度都合理，免得上层当过
+ *            异常过滤掉）。
+ * @retval true 已填入；false 未在跳（或在本次达到 count 已经自动停）。
+ * @note 时间基准用 `clock_systime_ticks()` + `TICK2MSEC`（与 vmap_route_nav.c 一致）。
+ */
+bool bicycle_gnss_hop_get_fix(bicycle_gnss_fix_t * out)
+{
+    const bicycle_gnss_hop_pt_t * p;
+    uint32_t now;
+
+    if (!g_hop_run || out == NULL) {
+        return false;
+    }
+
+    now = (uint32_t)TICK2MSEC(clock_systime_ticks());
+    if (g_hop_last_ms == 0U || (now - g_hop_last_ms) >= g_hop_period_ms) {
+        if (g_hop_last_ms != 0U) {
+            g_hop_idx = (g_hop_idx + 1U) % HOP_N();
+            g_hop_sent++;
+            if (g_hop_count != 0U && g_hop_sent >= g_hop_count) {
+                g_hop_run = false;
+                hop_override_clear();
+                return false;
+            }
+        }
+
+        g_hop_last_ms = (now == 0U) ? 1U : now;
+    }
+
+    p = HOP_PT(g_hop_idx);
+
+    /* 一个"干净"的 3D 定位：星数/精度都填合理值，免得上层把这次定位当异常过滤掉。 */
+    memset(out, 0, sizeof(*out));
+    out->longitude    = p->lon;
+    out->latitude     = p->lat;
+    out->speed_kph    = 20.0f;
+    out->speed_pvt_kph = 20.0f;
+    out->pos_acc_m    = 5.0f;
+    out->satellites   = 9;
+    out->sats_locked  = 9;
+    out->sats_heard   = 9;
+    out->fix_quality  = 2;
+    out->hdop_x10     = 10;
+    out->rx_hz        = 1;
+    out->valid        = true;
+    out->alive        = true;
+    out->pvt_valid    = true;
+    out->pvt_gnss_ok  = true;
+    out->stamp_ms     = now;
+    return true;
+}
+
 /**
  * @brief 自行车 gpx sim get fix。
  */
 bool bicycle_gpx_sim_get_fix(bicycle_gnss_fix_t * out)
 {
-    if (route_sim_get_fix(out)) {
-        return true;
-    }
-    if (!out) {
+    bool from_gpx = false;
+    bool have;
+    if (out == NULL) {
         return false;
     }
-    if (g_sim.thread_run) {
+
+    /* 全国跳优先（见上面那段）：它是"最大渲染负载"的定位源，专供 A/B 用。 */
+    if (bicycle_gnss_hop_get_fix(out)) {
+        have = true;
+    } else if (route_sim_get_fix(out)) {
+        have = true;
+    } else if (g_sim.thread_run) {
         pthread_mutex_lock(&g_sim.lock);
         *out = g_sim.fix;
         pthread_mutex_unlock(&g_sim.lock);
-        return out->valid;
+        have = out->valid;
+        from_gpx = have;
+    } else {
+        have = false;
     }
 
-    return false;
+    if (!have) {
+        return false;
+    }
+
+    /* 暂停演示：回放位置冻住 + 速度报 0（只认 GPX 回放，别把路线 sim 也冻了）。 */
+    if (from_gpx && g_sim.hold) {
+        out->speed_kph = 0.0f;
+        out->speed_pvt_kph = 0.0f;
+        out->alive = true;
+        out->valid = true;
+    }
+
+    return true;
 }
 
 bool bicycle_gpx_sim_get_wall_hms(int * hour, int * min)

@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/sensor/sf32lb52_bmi270/sf32lb52_bmi270.h
+ * vendor/HelmOne/boards/sf32lb52/drivers/sensor/sf32lb52_bmi270/sf32lb52_bmi270.h
  *
  * SF32LB52 board BMI270 IMU — registers /dev/uorb/sensor_accelN and gyroN.
  *

@@ -60,6 +60,9 @@ bool ble_supervisor_take_adapter_cycle(enum ble_supervisor_fault *reason);
  */
 bool ble_supervisor_take_escalation(void);
 
+/** @brief 控制器复位受限频约束时保留升级请求，下次 pump 再尝试。 */
+void ble_supervisor_defer_escalation(void);
+
 /** @brief 升级动作做完了：阶梯归零，下一轮 cycle 重新计数。 */
 void ble_supervisor_escalation_done(uint32_t now_ms);
 

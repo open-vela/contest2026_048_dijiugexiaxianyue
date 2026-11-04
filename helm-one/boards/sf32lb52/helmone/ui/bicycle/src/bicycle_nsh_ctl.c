@@ -4,6 +4,8 @@
  */
 
 #include "bicycle_nsh.h"
+#include "bicycle_demo.h"      /* 单场景 + 循环演示：scene_* / mode_* 系列接口 */
+#include "bicycle_gpx_sim.h"   /* 全国跳：bicycle_gnss_hop_start/stop（调试负载） */
 #include "myvendor_bicycle_ctl.h"
 #include "vmap/vmap_config.h"
 
@@ -11,6 +13,8 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <strings.h>
+#include <unistd.h>
 
 typedef struct {
     const char * name;
@@ -146,8 +150,17 @@ static void bicycle_nsh_print_usage(void)
     printf("  bicycle_nsh zoom z <11-15>                     set tile zoom\n");
     printf("  bicycle_nsh zoom scale <0.25-8>                set display scale\n");
     printf("  bicycle_nsh zoom reset                         default z + scale\n");
+    printf("  bicycle_nsh rot on|off                         heading-up map (arrow up)\n");
+    printf("  bicycle_nsh rot label on|off                   heading-up: also bake road names\n");
     printf("  bicycle_nsh gnss sim <gpx> [fwd|rev] [kph] [10km|at 10]\n");
     printf("  bicycle_nsh gnss stop                          stop GPX GNSS replay\n");
+    printf("  bicycle_nsh demo list                          list scenes + loop modes\n");
+    printf("  bicycle_nsh demo run <name>                    run one scene (scene <name>)\n");
+    printf("  bicycle_nsh demo next|prev                     switch to next/previous scene\n");
+    printf("  bicycle_nsh demo on [name]                     loop mode; no name = full (4 steps)\n");
+    printf("  bicycle_nsh demo start <name>                  loop mode (alias: mode <name>)\n");
+    printf("  bicycle_nsh demo off|toggle                    stop / flip demo mode\n");
+    printf("  bicycle_nsh demo status                        which step/mode it is on\n");
     printf("Themes:");
     for (unsigned i = 0; i < myvendor_bicycle_ctl_style_name_count(); i++) {
         printf(" %s", myvendor_bicycle_ctl_style_name(i));
@@ -628,6 +641,43 @@ static int bicycle_nsh_post_zoom(const char * payload)
     return 0;
 }
 
+static int bicycle_nsh_cmd_rot(int argc, char * argv[])
+{
+    char payload[24];
+
+    /* rot on|off            —— 航向朝上开/关
+     * rot label on|off      —— 航向朝上时是否也画路名（A/B 用） */
+    if (argc >= 2 && strcmp(argv[0], "label") == 0) {
+        if (strcmp(argv[1], "on") != 0 && strcmp(argv[1], "off") != 0) {
+            fprintf(stderr, "bicycle_nsh: rot label needs on|off\n");
+            return 1;
+        }
+        if (snprintf(payload, sizeof(payload), "label,%s", argv[1])
+            >= (int)sizeof(payload)) {
+            return 1;
+        }
+    } else if (argc >= 1
+        && (strcmp(argv[0], "on") == 0 || strcmp(argv[0], "off") == 0)) {
+        snprintf(payload, sizeof(payload), "%s", argv[0]);
+    } else {
+        fprintf(stderr, "bicycle_nsh: rot needs on|off | label on|off\n");
+        return 1;
+    }
+
+    if (!myvendor_bicycle_ctl_ui_alive()) {
+        fprintf(stderr, "bicycle_nsh: UI not running (start via rcS / bicycle &)\n");
+        return 1;
+    }
+
+    if (myvendor_bicycle_ctl_post(MYVENDOR_BICYCLE_CTL_OP_MAP_ROT, payload) != 0) {
+        fprintf(stderr, "bicycle_nsh: ctl post failed\n");
+        return 1;
+    }
+
+    printf("bicycle_nsh: MAP_ROT posted (%s)\n", payload);
+    return 0;
+}
+
 static int bicycle_nsh_cmd_zoom(int argc, char * argv[])
 {
     char payload[MYVENDOR_BICYCLE_CTL_ARG_MAX];
@@ -806,13 +856,19 @@ static bool bicycle_nsh_token_is_dir(const char * s, bool * out_rev)
 static void bicycle_nsh_print_gnss_usage(void)
 {
     printf("GNSS GPX replay (bicycle_nsh gnss ...):\n");
-    printf("  gnss sim <gpx> [fwd|rev] [kph] [10km|at 10|skip 10]\n");
+    printf("  gnss sim <gpx> [fwd|rev] [kph] [10km|at 10|skip 10] [loop]\n");
     printf("      Replay track points as onboard GNSS (overrides MAX-M10S).\n");
     printf("      fwd = start to finish (default); rev = finish to start.\n");
     printf("      kph optional (1-360); omit = 15-40 km/h ramp.\n");
     printf("      10km / at 10: jump there; prefix is already ridden.\n");
+    printf("      loop: at the track end TURN AROUND and keep riding (soak tests;\n");
+    printf("            without it the replay just stops at the last point).\n");
     printf("  gnss stop\n");
     printf("      Stop replay; onboard GNSS resumes.\n");
+    printf("  gnss hop [period_ms] [count]\n");
+    printf("      Debug: jump between far-apart cities (fixed sequence) to force\n");
+    printf("      full tile reload + repaint -- a REPEATABLE heavy load for A/B.\n");
+    printf("      period_ms default 2000, count 0 = until 'gnss hop stop'.\n");
     printf("Examples:\n");
     printf("  bicycle_nsh gnss sim /mnt/lfs/mtp/record/TRK_20260831_102750.gpx\n");
     printf("  bicycle_nsh gnss sim /mnt/lfs/mtp/record/TRK_20260831_102750.gpx rev\n");
@@ -827,6 +883,7 @@ static int bicycle_nsh_cmd_gnss(int argc, char * argv[])
     char payload[MYVENDOR_BICYCLE_CTL_ARG_MAX];
     const char * path = NULL;
     bool reverse = false;
+    bool loop = false;
     float kph = 0.0f;
     float skip_km = 0.0f;
     int i;
@@ -835,6 +892,34 @@ static int bicycle_nsh_cmd_gnss(int argc, char * argv[])
     if (argc < 1 || strcmp(argv[0], "help") == 0 || strcmp(argv[0], "-h") == 0
         || strcmp(argv[0], "--help") == 0) {
         bicycle_nsh_print_gnss_usage();
+        return 0;
+    }
+
+    /*
+     * 全国跳：调试用合成定位（固定城市序列大跳），用来造**可重复的大渲染负载**
+     * —— 小幅平移常常一个新瓦片都不需要，`[vperf] frame` 就不出帧。
+     * 实现在 bicycle_gpx_sim.c（不建线程，getter 里按时间换点）。
+     */
+    if (strcmp(argv[0], "hop") == 0) {
+        unsigned period_ms = 2000u;
+        unsigned count = 0u;
+
+        if (argc >= 2 && (strcmp(argv[1], "stop") == 0 || strcmp(argv[1], "off") == 0)) {
+            bicycle_gnss_hop_stop();
+            printf("bicycle_nsh: gnss hop stop\n");
+            return 0;
+        }
+
+        if (argc >= 2) {
+            period_ms = (unsigned)strtoul(argv[1], NULL, 10);
+        }
+        if (argc >= 3) {
+            count = (unsigned)strtoul(argv[2], NULL, 10);
+        }
+
+        bicycle_gnss_hop_start(period_ms, count);
+        printf("bicycle_nsh: gnss hop start period=%u ms count=%u (0=until stop)\n",
+            period_ms, count);
         return 0;
     }
 
@@ -891,6 +976,12 @@ static int bicycle_nsh_cmd_gnss(int argc, char * argv[])
             continue;
         }
 
+        /* 长测用：`loop` ⇒ 到端点掉头继续骑（默认关闭 = 到端点停住）。 */
+        if (strcmp(argv[i], "loop") == 0) {
+            loop = true;
+            continue;
+        }
+
         if (path != NULL) {
             fprintf(stderr, "bicycle_nsh: extra gnss sim arg \"%s\"\n", argv[i]);
             bicycle_nsh_print_gnss_usage();
@@ -928,12 +1019,253 @@ static int bicycle_nsh_cmd_gnss(int argc, char * argv[])
         return 1;
     }
 
+    /* 循环标志要在投递之前设好（投递只是让 UI 去 start，跨任务，标志只在到端点时读）。*/
+    bicycle_gpx_sim_set_loop(loop);
+
     if (myvendor_bicycle_ctl_post(MYVENDOR_BICYCLE_CTL_OP_GNSS_SIM, payload) != 0) {
         fprintf(stderr, "bicycle_nsh: ctl post failed\n");
         return 1;
     }
 
-    printf("bicycle_nsh: GNSS_SIM posted (%s)\n", payload);
+    printf("bicycle_nsh: GNSS_SIM posted (%s) loop=%d\n", payload, (int)loop);
+    return 0;
+}
+
+/**
+ * @brief 打印单场景 demo 列表（`demo list` / `demo run` 缺名字时）。
+ */
+static void bicycle_nsh_print_demo_scenes(void)
+{
+    const unsigned count = bicycle_demo_scene_count();
+
+    printf("可用场景 / demo run <name>:\n");
+    for (unsigned i = 0; i < count; i++) {
+        const char * name = bicycle_demo_scene_name(i);
+        const char * desc = bicycle_demo_scene_desc(i);
+
+        printf("  %-14s %s\n", name != NULL ? name : "?",
+            desc != NULL ? desc : "");
+    }
+}
+
+/**
+ * @brief 打印循环演示模式列表（`demo list` / `start` 缺名字或打错时）。
+ */
+static void bicycle_nsh_print_demo_modes(void)
+{
+    const unsigned count = bicycle_demo_mode_count();
+
+    printf("循环演示 / demo start <name>:\n");
+    for (unsigned i = 0; i < count; i++) {
+        bicycle_demo_mode_t mode = (bicycle_demo_mode_t)i;
+        const char * name = bicycle_demo_mode_name(mode);
+        const char * desc = bicycle_demo_mode_desc(mode);
+
+        printf("  %-14s %s\n", name != NULL ? name : "?",
+            desc != NULL ? desc : "");
+    }
+}
+
+/**
+ * @brief 场景名/索引是否有效（NSH 侧先校验，避免打错名字白等 3 秒）。
+ * @note 与 UI 侧 `demo_scene_find()` 同一套规则：纯数字按索引，否则大小写不敏感。
+ */
+static bool bicycle_nsh_demo_scene_valid(const char * name)
+{
+    char * end = NULL;
+    unsigned long idx;
+    unsigned i;
+    unsigned n;
+
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+
+    idx = strtoul(name, &end, 10);
+    if (end != NULL && *end == '\0') {
+        return idx < bicycle_demo_scene_count();
+    }
+
+    n = bicycle_demo_scene_count();
+    for (i = 0; i < n; i++) {
+        const char * s = bicycle_demo_scene_name(i);
+
+        if (s != NULL && strcasecmp(name, s) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief `bicycle_nsh demo ...` —— 演示模式（全量循环/循环模式）/ 单场景。
+ *
+ * @details 真正的动作在 UI 线程（`bicycle_demo_poll()`），这里只投一条 ctl 命令，
+ *          再读回状态槽里的"当前那一步/场景/模式"（UI 侧每步都会写，见 bicycle_demo.c）。
+ *          on/off/toggle：全量循环（GPX 导航 → 坐标点导航 → 暂停/继续 →
+ *          城区偏航重规划 → 全国跳点 → 换主题）。
+ *          start/mode/on <name>：指定循环模式（见 bicycle_demo_mode_*）。
+ *          list/run/next/prev：单场景演示（见 bicycle_demo_scene_*）。
+ */
+static int bicycle_nsh_cmd_demo(int argc, char * argv[])
+{
+    char state[64];
+    char prev[64];
+    const char * expect = NULL;
+    char payload[MYVENDOR_BICYCLE_CTL_ARG_MAX];
+    const char * arg = (argc >= 1) ? argv[0] : NULL;
+
+    if (argc >= 1 && (strcmp(argv[0], "help") == 0 || strcmp(argv[0], "-h") == 0)) {
+        printf("Demo mode (bicycle_nsh demo ...):\n");
+        printf("  demo list        list single-scene demos + loop modes\n");
+        printf("  demo run <name>  run one scene (alias: scene <name>)\n");
+        printf("  demo next        switch to the next scene\n");
+        printf("  demo prev        switch to the previous scene\n");
+        printf("  demo on [name]   start a loop mode (no name: full loop)\n");
+        printf("  demo start <name>  start a loop mode (alias: mode <name>)\n");
+        printf("  demo off         stop, restore theme + zoom\n");
+        printf("  demo toggle      flip it\n");
+        printf("  demo status      print the current step/scene/mode (no change)\n");
+        return 0;
+    }
+
+    if (argc >= 1 && strcmp(argv[0], "list") == 0) {
+        bicycle_nsh_print_demo_scenes();
+        bicycle_nsh_print_demo_modes();
+        return 0;
+    }
+
+    /* 循环演示：start/mode <name>；on <name> 等价于 start <name>。
+     * 不带名字的 on 仍走下面的通用分支（全量循环）。 */
+    if (argc >= 1 && (strcmp(argv[0], "start") == 0 ||
+                      strcmp(argv[0], "mode") == 0 ||
+                      (strcmp(argv[0], "on") == 0 && argc >= 2))) {
+        const char * name = (argc >= 2) ? argv[1] : NULL;
+        int mode = (name != NULL && name[0] != '\0') ?
+                   bicycle_demo_mode_from_name(name) : -1;
+
+        if (mode < 0) {
+            if (name != NULL && name[0] != '\0') {
+                fprintf(stderr, "bicycle_nsh: unknown demo mode '%s'\n", name);
+            } else {
+                fprintf(stderr, "bicycle_nsh: demo %s needs a mode name\n",
+                    argv[0]);
+            }
+            bicycle_nsh_print_demo_modes();
+            return 1;
+        }
+
+        /* UI 侧按 "mode:" 前缀识别循环演示（见 bicycle_ui_ctl_handle_demo）。 */
+        if (snprintf(payload, sizeof(payload), "mode:%s", name)
+            >= (int)sizeof(payload)) {
+            fprintf(stderr, "bicycle_nsh: demo mode name too long\n");
+            return 1;
+        }
+        arg = payload;
+    }
+
+    if (argc >= 1 && (strcmp(argv[0], "run") == 0 || strcmp(argv[0], "scene") == 0)) {
+        if (argc < 2 || argv[1][0] == '\0') {
+            fprintf(stderr, "bicycle_nsh: demo %s needs a scene name\n", argv[0]);
+            bicycle_nsh_print_demo_scenes();
+            return 1;
+        }
+
+        if (!bicycle_nsh_demo_scene_valid(argv[1])) {
+            fprintf(stderr, "bicycle_nsh: unknown demo scene '%s'\n", argv[1]);
+            bicycle_nsh_print_demo_scenes();
+            return 1;
+        }
+
+        /* UI 侧按 "run:" 前缀识别单场景；名字很短，但仍按缓冲上限检查。 */
+        if (snprintf(payload, sizeof(payload), "run:%s", argv[1])
+            >= (int)sizeof(payload)) {
+            fprintf(stderr, "bicycle_nsh: demo scene name too long\n");
+            return 1;
+        }
+        arg = payload;
+    }
+
+    if (arg == NULL || arg[0] == '\0') {
+        arg = "on";
+    }
+
+    if (strcmp(arg, "status") != 0) {
+        int i;
+
+        if (!myvendor_bicycle_ctl_ui_alive()) {
+            fprintf(stderr, "bicycle_nsh: UI not running (start via rcS / bicycle &)\n");
+            return 1;
+        }
+
+        if (!myvendor_bicycle_ctl_state_get(MYVENDOR_BICYCLE_CTL_STATE_DEMO,
+                prev, sizeof(prev))) {
+            prev[0] = '\0';
+        }
+
+        if (strncmp(arg, "run:", 4) == 0) {
+            char * end = NULL;
+            unsigned long idx = strtoul(arg + 4, &end, 10);
+
+            expect = arg + 4;
+            /* 数字别名：状态槽里发布的是场景名，不是数字。 */
+            if (end != NULL && *end == '\0') {
+                const char * name = bicycle_demo_scene_name((unsigned)idx);
+
+                if (name != NULL) {
+                    expect = name;
+                }
+            }
+        } else if (strncmp(arg, "mode:", 5) == 0) {
+            int mode = bicycle_demo_mode_from_name(arg + 5);
+
+            /* 新模式发布模式名；全量四步仍发布步骤 id，等"状态变化"即可。 */
+            if (mode >= 0 && mode != (int)BICYCLE_DEMO_MODE_FULL) {
+                expect = bicycle_demo_mode_name((bicycle_demo_mode_t)mode);
+            }
+        } else if (strcmp(arg, "off") == 0) {
+            expect = "off";
+        }
+
+        if (myvendor_bicycle_ctl_post(MYVENDOR_BICYCLE_CTL_OP_DEMO, arg) != 0) {
+            fprintf(stderr, "bicycle_nsh: ctl post failed\n");
+            return 1;
+        }
+
+        printf("bicycle_nsh: DEMO %s posted\n", arg);
+
+        /* UI 侧要跑完 leave/enter 才写状态槽；重场景（主题重建、导航规划）在
+         * 200 ms 时常常只读到中间态 off 或上一场景。轮询到目标场景/模式/状态
+         * 变化为止，最多 3 s：`run:`/`mode:` 等目标名字，其余
+         * （on/off/toggle/next/prev）等状态离开旧值。 */
+        for (i = 0; i < 30; i++) {
+            usleep(100000);
+            if (!myvendor_bicycle_ctl_state_get(MYVENDOR_BICYCLE_CTL_STATE_DEMO,
+                    state, sizeof(state))) {
+                continue;
+            }
+            if (expect != NULL) {
+                if (strcasecmp(state, expect) == 0) {
+                    break;
+                }
+            } else if (strcmp(state, prev) != 0) {
+                break;
+            }
+        }
+    }
+
+    if (myvendor_bicycle_ctl_state_get(MYVENDOR_BICYCLE_CTL_STATE_DEMO, state,
+            sizeof(state))) {
+        if (expect != NULL && strcasecmp(state, expect) != 0) {
+            printf("bicycle_nsh: demo = %s (still switching to %s)\n",
+                   state, expect);
+        } else {
+            printf("bicycle_nsh: demo = %s\n", state);
+        }
+    } else {
+        printf("bicycle_nsh: demo = off\n");
+    }
+
     return 0;
 }
 
@@ -945,6 +1277,10 @@ int bicycle_nsh_dispatch(int argc, char * argv[])
     if (argc < 1) {
         bicycle_nsh_print_usage();
         return 1;
+    }
+
+    if (strcmp(argv[0], "demo") == 0) {
+        return bicycle_nsh_cmd_demo(argc - 1, argv + 1);
     }
 
     if (strcmp(argv[0], "style") == 0) {
@@ -973,6 +1309,10 @@ int bicycle_nsh_dispatch(int argc, char * argv[])
 
     if (strcmp(argv[0], "zoom") == 0) {
         return bicycle_nsh_cmd_zoom(argc - 1, argv + 1);
+    }
+
+    if (strcmp(argv[0], "rot") == 0) {
+        return bicycle_nsh_cmd_rot(argc - 1, argv + 1);
     }
 
     if (strcmp(argv[0], "gnss") == 0) {

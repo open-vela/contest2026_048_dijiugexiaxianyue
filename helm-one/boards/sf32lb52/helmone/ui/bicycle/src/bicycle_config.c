@@ -5,6 +5,7 @@
 
 #include "bicycle_config.h"
 
+#include "helm_palette.h"
 #include "lv_pm_theme.h"
 #include "vmap/vmap_config.h"
 #include "vmap/vmap_style.h"
@@ -129,6 +130,16 @@ void bicycle_config_set(const bicycle_config_t * cfg)
 void bicycle_config_apply(void)
 {
     bicycle_config_ensure_init();
+
+    /* 主题名已经落盘（`/mnt/kv/ui_theme`）⇒ **让它说了算**，这里不再覆盖。
+     * 原有的 map_style 只有 classic/outdoor 两支，而"夜间"是主题才表达得出的取值：
+     * 开机再拿它去 set 一次，用户选的夜间重启后就没了（实测：选 outdoor 重启变
+     * classic，而且回调里会把 KV 改写成 classic）。没有 KV（首次开机/被清）时
+     * 仍按原样用地图样式兜底。 */
+    if (helm_theme_kv_present()) {
+        return;
+    }
+
     if (g_cfg.map_style == VMAP_STYLE_OUTDOOR) {
         lv_pm_theme_set_by_name("outdoor");
     } else {

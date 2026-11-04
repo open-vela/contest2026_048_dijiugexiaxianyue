@@ -19,9 +19,9 @@
 
 ```bash
 # openvela 根目录
-python3 vendor/my_vendor/build_board.py build-fs
-python3 vendor/my_vendor/build_board.py pack-sd-img
-python3 vendor/my_vendor/build_board.py burn-sd --sd /dev/sdX
+python3 vendor/HelmOne/build_board.py build-fs
+python3 vendor/HelmOne/build_board.py pack-sd-img
+python3 vendor/HelmOne/build_board.py burn-sd --sd /dev/sdX
 ```
 
 SD 上不要用 `flash-fs` 灌地图（余量 FAT 走 pack-sd-img）。
@@ -46,13 +46,13 @@ OTA 固件槽 `/mnt/kv/fw/`（目录打进镜像，避免第一次 `lfs_alloc`�
 ## `fat/` → `/mnt/fat`
 
 - **不要**手工往 `fat/map/` 里放 loose 的 `<z>/<x>/<y>.vt`；用打包工具从 OSM 流水线生成。
-- 完整流程：[docs/osm/README.md](../../../docs/osm/README.md) → [docs/map/README.md](../../../docs/map/README.md)。
+- 完整流程：[docs/osm/README.md](../../../../docs/osm/README.md) → [docs/map/README.md](../../../../docs/map/README.md)。
 
 ```bash
-python3 vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/tools/pack_map.py \
-  -i vendor/my_vendor/docs/osm/vmap \
-  --graph vendor/my_vendor/docs/osm/graph.vgrf \
-  -o vendor/my_vendor/boards/sf32lb52/my_vendor/mkfs/fat/map \
+python3 vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/tools/pack_map.py \
+  -i vendor/HelmOne/docs/osm/vmap \
+  --graph vendor/HelmOne/docs/osm/graph.vgrf \
+  -o vendor/HelmOne/boards/sf32lb52/helmone/mkfs/fat/map \
   --clean --pack-size 512000
 ```
 

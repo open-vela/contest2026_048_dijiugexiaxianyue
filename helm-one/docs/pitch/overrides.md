@@ -21,6 +21,7 @@
 | 抽换件 | 类型 | 替的上游仓库 | 上游文件 | 文件 blob（12位） | 为什么抽换 |
 |---|---|---|---|---|---|
 | `bluetooth/sal_gatt_client_interface.c` | 同名替换 | `frameworks/connectivity/bluetooth` | `service/stacks/zephyr/sal_gatt_client_interface.c` | `a5bc28c7ed71` | keep_db / 溢出不拆链 |
+| `bluetooth/sal_gatt_server_interface.c` | 同名替换 | `frameworks/connectivity/bluetooth` | `service/stacks/zephyr/sal_gatt_server_interface.c` | `4cbc9d365a1a` | CCC 写回调按写入字节/peer cfg 上报（不用 conn_index） |
 | `bluetooth/sal_le_advertise_interface.c` | 同名替换 | `frameworks/connectivity/bluetooth` | `service/stacks/zephyr/sal_le_advertise_interface.c` | `9d4ba4033133` | SF32 走 legacy bt_le_adv_start（无 Ext Adv）；与 scan 共用跨角色 ticket 队列，等待有界 2 s |
 | `bluetooth/sal_le_scan_interface.c` | 同名替换 | `frameworks/connectivity/bluetooth` | `service/stacks/zephyr/sal_le_scan_interface.c` | `24d8275d5d8b` | -EALREADY 重试、options=0；与 adv 共用跨角色 ticket 队列，等待有界 2 s |
 | `bluetooth/scan_manager.c` | 同名替换 | `frameworks/connectivity/bluetooth` | `service/src/scan_manager.c` | `bf4ef311849d` | LOCAL 下不编 bt_socket.h |
@@ -37,7 +38,7 @@
 | `zblue/long_wq.c` | 同名替换 | `external/zblue/zblue` | `subsys/bluetooth/host/long_wq.c` | `b7b6e3dc03b1` | 禁止第二条 BT LW WQ 共用 BSS 栈 |
 | `zblue/system_work_q.c` | 同名替换 | `external/zblue/zblue` | `kernel/system_work_q.c` | `5cc26fd82e14` | 禁止第二条 sysworkq 共用 BSS 栈 |
 | `zblue/patch_gatt_ccc_pool.py` | 构建期补丁脚本 | `external/zblue/zblue` | `subsys/bluetooth/host/gatt.c` | `8e31d1cfa353` | 断开释放 CCC 槽 + 池满时回收已断开的 peer；CCC 池金丝雀 + 30 s 校验；CCC 写入/复位的原始字节取证；地址对不上时不把还在用的 CCC 打成 0 |
-| `zblue/patch_hci_core.py` | 构建期补丁脚本 | `external/zblue/zblue` | `subsys/bluetooth/host/hci_core.c` | `ab23d63b2da4` | 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待 |
+| `zblue/patch_hci_core.py` | 构建期补丁脚本 | `external/zblue/zblue` | `subsys/bluetooth/host/hci_core.c` | `ab23d63b2da4` | 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待；peripheral 连接完成先按原始 RPA 查 pending conn，再回退身份地址（修复定向连接 0x16 No pending conn） |
 | `zblue/patch_net_buf_timeout.py` | 构建期补丁脚本 | `external/zblue/zblue` | `subsys/bluetooth/host/buf.c` | `b7ed19303be2` | 缓冲区 K_FOREVER 改成有上限的轮询（否则卡死不可杀） |
 | `↑同上` | ↑ | `external/zblue/zblue` | `subsys/bluetooth/host/hci_core.c` | `ab23d63b2da4` | 同上（控制流侧） |
 
@@ -48,7 +49,7 @@
 ```bash
 cd /home/jinsc/SDK/vela/openvela && python3 - <<'EOF'
 import pathlib, re, subprocess
-VO = pathlib.Path('vendor/my_vendor/boards/sf32lb52/my_vendor/vela_override')
+VO = pathlib.Path('vendor/HelmOne/boards/sf32lb52/helmone/vela_override')
 pat = re.compile(r'(?:替的是上游|改的是)\s*:\s*([\w./-]+?)\s*/\s*([\w./-]+\.(?:c|h))'
                  r'(?:\n[^\n]*){0,2}?\n[^\n]*?blob\s*:\s*([0-9a-f]{12,40})')
 for f in sorted(list(VO.rglob('*.c')) + list(VO.rglob('*.py'))):

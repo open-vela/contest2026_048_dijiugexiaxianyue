@@ -82,4 +82,15 @@ bool sf32lb52_bt_hci_skip_sync(void);
  */
 void sf32lb52_bt_hci_dump_stall(void);
 
+/**
+ * @brief 报"RX 抽取链"的计数器，并在判到断层时自愈（**只由 diag 线程调用**）。
+ *
+ * @param force false = 只在判到断层时打印（diag 每拍调，保证恢复与开关无关）；
+ *              true  = 无条件打一行计数器（diag 的周期报表，见 `ctl cnt`）。
+ *
+ * 中断侧（`sf32lb52_bt_rx_ind()`）只累加计数，打印与自愈统一在这里 ——
+ * 于是"计数器打印"只有 diag 一个出口。详见 .c 里的说明。
+ */
+void sf32lb52_bt_rx_chain_report(bool force);
+
 #endif

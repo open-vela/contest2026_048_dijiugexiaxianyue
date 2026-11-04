@@ -375,6 +375,15 @@ typedef struct myvendor_sys_sensor_ui_s
 void myvendor_sys_sensor_ui_get(myvendor_sys_sensor_ui_t *out);
 
 /**
+ * @brief 某个传感器槽位是否**已绑定**（有保存的对端地址，连不连上都算）。
+ * @param kind 0 HR / 1 CSC / 2 CPS。
+ * @return true = 已绑定。UI 用它决定"功率/踏频那一栏要不要显示"：绑定后无论
+ *         是否连上都要留着那一栏（值显示 --），删除绑定才收掉。
+ * @note 只取一个布尔，不整份 ui 快照 —— UI 每拍都问。
+ */
+bool myvendor_sys_sensor_bound(uint8_t kind);
+
+/**
  * @brief 手机 Companion GATT 是否已连接（不是传感器、也不是 companion 线程存活）。
  */
 bool myvendor_sys_phone_ble_connected(void);
