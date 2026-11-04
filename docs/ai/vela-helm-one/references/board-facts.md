@@ -1,6 +1,11 @@
 # 板级事实表（权威值）
 
 > 这些值是**结论**，不是建议。改任何一项前先回到「唯一源」文档确认，并同步所有副本。
+>
+> **开发主树：`vendor/my_vendor`**（开发机上 `/home/jinsc/SDK/vela/openvela/vendor/my_vendor`）。
+> 本参赛仓的 `helm-one/`（构建树里由 linkfile 落到 **`vendor/HelmOne`**）是从开发主树导出的
+> **打包快照**，评审与复现直接用这一份，**非特殊声明不要改**；要改板级值请回开发主树改，
+> 并同步全部副本（映射见 `helm-one/README.md`）。
 
 ## 1. 硬件与软件基线
 
@@ -119,6 +124,19 @@ MDT 几何：LittleFS 看 page 512 / erase 4096。
 - 固件侧 `companion_proto.h` ↔ App 侧 `companion_proto.dart`：**版本号与特征号必须双端同步**，改一端必改另一端。
 - 单射频同时双角色：GATT Server（对手机）+ GATT Central（心率/踏频/功率）。
 - 已知限制：传感器绑定未用 IRK，随机地址配件需固定地址才能稳定回连。
+- **手机定向 ADV 不支持（2026-09-22 实测）**：`ADV_DIRECT_IND` + `DIR_ADDR_RPA` 在 SF32
+  上稳定 `adv start failed status=2`；产品路径用可连接无名 ADV + 准入/ENCRYPT。
+  勿再打开定向广播。
+- **配对窗口内射频只给手机 ADV（2026-09-23）**：开窗上升沿停传感器扫/拆链
+  （保留 `want_link`，关窗后回连），禁止 `hold phone adv`；窗内不建传感器连接。
+  修现场「window open 后整段 adv held by sensor / busy=1、手机扫不到」。
+- **手机绑定最多 3 台（IRK/CONFIG_BT_MAX_PAIRED=3）**：`bt_phone.tsv` 多行名单；
+  码表「手机蓝牙」页列出手机1..3，可再配对至满，长按单台解绑。
+  **注意**：改 `defconfig` 后必须让 `cmake_out/.../include/nuttx/config.h` 重生
+  （删 config.h 再 build）；`.config=3` 而 config.h 仍为 1 时运行态仍是
+  `phones 1/1`、密钥池只 1 槽，第二台手机会报 PIN 错且无配对弹窗。
+- **开配对窗口清拒连冷却**：避免 grace 踢过后 60 s cooldown 挡掉窗内再配。
+- **RPA 宽限**：名单外地址 3 s 等 L2 + 60 s 拒连冷却（防陌生人空连占 ADV）。
 - BLE 文件传输约 15 KB/s（带 CRC32，支持偏移续传），大文件走 USB MTP。
 - 星历：App 取当天广播星历 → 转 UBX-MGA → 注入模组，连接期间每 2 h 同步。
 - OTA：SHA-256 + 长度校验，版本号 + 硬件型号双重校验，槽位 `/fw`（最多 12 个版本），回退 `main → factory`。
