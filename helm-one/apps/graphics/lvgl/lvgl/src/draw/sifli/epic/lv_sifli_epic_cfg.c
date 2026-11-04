@@ -15,6 +15,7 @@
 
 #include "lv_sifli_epic_cfg.h"
 #include "lv_sifli_epic_osa.h"
+#include "lv_sifli_epic_cache.h"
 
 #if LV_USE_SIFLI_EPIC
 #include "../../../misc/lv_log.h"
@@ -25,6 +26,9 @@
 #if LV_USE_NUTTX
     #include <nuttx/arch.h>
     #include <nuttx/cache.h>
+    #include <nuttx/clock.h>
+    #include <nuttx/semaphore.h>
+    #include <errno.h>
 #endif
 
 #if defined(__ZEPHYR__)
@@ -322,6 +326,61 @@ EZIP_HandleTypeDef * lv_ezip_get_handle(void)
 }
 #endif
 
+#if LV_USE_NUTTX
+#if defined(CONFIG_MYVENDOR_LVGL_BENCH)
+static lv_epic_cache_stats_t cache_stats;
+static bool cache_filter_enabled = true;
+
+void lv_epic_cache_bench_reset(bool filter_enabled)
+{
+    memset(&cache_stats, 0, sizeof(cache_stats));
+    cache_filter_enabled = filter_enabled;
+}
+
+void lv_epic_cache_bench_get(lv_epic_cache_stats_t * stats)
+{
+    *stats = cache_stats;
+}
+#endif
+
+/* operation: 0 clean, 1 clean+invalidate, 2 invalidate. Keep the original
+ * cache operations for cached/unknown memory, including unaligned boundaries.
+ */
+static void epic_cache_maintain(const void * data, uint32_t size, unsigned operation)
+{
+    if(data == NULL || size == 0) return;
+    bool required = lv_epic_is_cached_ram((uint32_t)(uintptr_t)data, size);
+#if defined(CONFIG_MYVENDOR_LVGL_BENCH)
+    cache_stats.requested_bytes += size;
+    if(!cache_filter_enabled) required = true;
+    if(!required) {
+        cache_stats.skipped_calls++;
+        cache_stats.skipped_bytes += size;
+    }
+    else if(operation == 0) cache_stats.clean_calls++;
+    else if(operation == 1) cache_stats.flush_calls++;
+    else cache_stats.invalidate_calls++;
+#endif
+    if(!required) {
+        /* Non-cacheable does not mean writes have reached the EPIC bus yet.
+         * Preserve the ordering barrier supplied by the cache primitives. */
+        __DSB();
+        return;
+    }
+#ifdef CONFIG_ARCH_DCACHE
+    uintptr_t start = (uintptr_t)data;
+    if(operation == 0) up_clean_dcache(start, start + size);
+    else if(operation == 1) up_flush_dcache(start, start + size);
+    else up_invalidate_dcache(start, start + size);
+#endif
+}
+
+void lv_epic_clean_invalidate_cache_range(const void * data, uint32_t size)
+{
+    epic_cache_maintain(data, size, 1);
+}
+#endif
+
 void lv_epic_flush_cache_range(const void * data, uint32_t size)
 {
     if(data == NULL || size == 0U) {
@@ -331,14 +390,7 @@ void lv_epic_flush_cache_range(const void * data, uint32_t size)
 #if defined(__ZEPHYR__)
     (void)arch_dcache_flush_range((void *)data, size);
 #elif LV_USE_NUTTX
-#ifdef CONFIG_ARCH_DCACHE
-    {
-      uintptr_t start = (uintptr_t)data;
-      uintptr_t end = start + (uintptr_t)size;
-
-      up_clean_dcache(start, end);
-    }
-#endif
+    epic_cache_maintain(data, size, 0);
 #else
     (void)mpu_dcache_clean((void *)data, size);
 #endif
@@ -353,14 +405,7 @@ void lv_epic_invalidate_cache_range(const void * data, uint32_t size)
 #if defined(__ZEPHYR__)
     (void)arch_dcache_invd_range((void *)data, size);
 #elif LV_USE_NUTTX
-#ifdef CONFIG_ARCH_DCACHE
-    {
-      uintptr_t start = (uintptr_t)data;
-      uintptr_t end = start + (uintptr_t)size;
-
-      up_invalidate_dcache(start, end);
-    }
-#endif
+    epic_cache_maintain(data, size, 2);
 #else
     (void)mpu_dcache_invalidate((void *)data, size);
 #endif
@@ -368,12 +413,12 @@ void lv_epic_invalidate_cache_range(const void * data, uint32_t size)
 
 bool lv_epic_is_cached_ram(uint32_t start, uint32_t len)
 {
-    /* Platform-specific implementation
-     * This should check if the memory region is in cached RAM.
-     * For now, return a conservative default.
-     */
+#if LV_USE_NUTTX && defined(SF32LB52X)
+    if(lv_epic_sf32lb52_uncached_range(start, len)) return false;
+#else
     LV_UNUSED(start);
     LV_UNUSED(len);
+#endif
 
 #if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
     /* If D-Cache is present, assume memory might be cached */
@@ -435,6 +480,15 @@ HAL_StatusTypeDef lv_epic_blend(EPIC_LayerConfigTypeDef * input_layers, uint8_t 
     lv_epic_flush_layers_cache(input_layers, input_layer_cnt, output_layer);
 
 #if LV_USE_NUTTX
+    /*
+     * 保持**忙等**（2026-10-28 实测回退）。
+     *
+     * 曾改成 `_IT` + 信号量，想让 UI 线程在等 EPIC 时睡下去；实测（明湖、
+     * CONFIG_SCHED_CPULOAD 窗口 200 Hz）：`ps` 的 bicycle_ui 从 51.5% 涨到
+     * 72.2%，重烘从 138 ms 变成 140~174 ms —— 每次 EPIC 调用都要付信号量
+     * 排空 + 中断唤醒的固定开销，而省下的"空转"本来也没人抢（IDLE 有 33%）。
+     * 结论：这颗 EPIC 的瓶颈是引擎吞吐，不是 CPU 有没有空。
+     */
     HAL_StatusTypeDef ret = HAL_EPIC_BlendStartEx(epic, input_layers, input_layer_cnt, output_layer);
     lv_epic_osa_set_idle();
     return ret;

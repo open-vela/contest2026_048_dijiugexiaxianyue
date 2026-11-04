@@ -100,12 +100,7 @@ def generate(ttf: str, size: int, name: str, symbols: str, bpp: int,
 
 
 def write_header(names: list[str]) -> None:
-    # 输出固定在 OUT_DIR 下；这里显式做一次包含性校验（同时也让"直接写参数路径"
-    # 这类安全扫描模式不再命中）。
-    path = os.path.abspath(os.path.join(OUT_DIR, "ftest_fonts.h"))
-    base = os.path.abspath(OUT_DIR)
-    if os.path.commonpath([path, base]) != base or ".." in path.split(os.sep):
-        raise SystemExit(f"拒绝输出到 {OUT_DIR} 之外: {path}")
+    path = os.path.join(OUT_DIR, "ftest_fonts.h")
     lines = [
         "/**",
         " * @file ftest_fonts.h",

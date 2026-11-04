@@ -103,6 +103,18 @@ void board_mem_free(void *ptr);
 /** 指针是否落在 BoardPSRAM 独立堆内（非 SRAM 回退）。 */
 bool board_ptr_in_psram_pool(const void *ptr);
 
+/**
+ * @brief 画布专属 arena（板级 MPU 给它的区间开 write-back）。
+ *
+ * 位置/大小由 `board_psram_layout.h` 的 `BOARD_PSRAM_CANVAS_ARENA_*` 决定；
+ * 它是**固定地址、不属于任何堆**（BoardPSRAM 堆被拆成 arena 前/后两块加进去，
+ * 见 `board_malloc.c` 的 `board_psram_init()`），所以**不能 free**。
+ *
+ * @param[out] bytes 可为 NULL；输出 arena 字节数。
+ * @return 基址；不可用（未启用 PSRAM / 与 Umem 重叠）时 NULL。
+ */
+void *board_psram_canvas_arena(size_t *bytes);
+
 #ifdef __cplusplus
 }
 #endif

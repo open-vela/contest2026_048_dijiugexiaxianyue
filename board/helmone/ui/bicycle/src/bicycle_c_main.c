@@ -10,6 +10,7 @@
 #include "bicycle_runtime.h"
 #include "bicycle_ui_ctl.h"
 #include "lvgl_page.h"
+#include "lv_pm_theme.h"
 #ifdef CONFIG_MYVENDOR_FACTORY_MODE
 #include "factory/factory_page.h"
 #endif
@@ -27,8 +28,10 @@
 #include "bicycle_handler_stat.h"
 #endif
 #include "bicycle_c_debug.h"
+#include "bicycle_demo.h"
 #include "myvendor_lcd_disp.h"
 #include "myvendor_watchdog.h"
+#include "helm_palette.h"
 #ifdef CONFIG_MYVENDOR_BLE_COMPANION_AUTOSTART
 void board_ble_companion_start_after_ui(void);
 #endif
@@ -53,6 +56,14 @@ void board_ble_companion_start_after_ui(void);
 #define BICYCLE_LOOP_SLEEP_MS 10u
 #endif
 
+/* LVGL 日志的出口**不在这里**（2026-09-25 修正）：
+ * `lv_nuttx_init()` 内部会 `lv_log_register_print_cb(syslog_print)`，把这里注册过的
+ * 回调**覆盖掉** —— 所以 UI 层的日志实际由 LVGL 栈自己的回调落到 syslog
+ * （`apps/graphics/lvgl/lvgl/src/drivers/nuttx/lv_nuttx_entry.c` 的 `syslog_print()`，
+ * 输出形如 `[LVGL] [User] ( ts, +dt) func: msg file:line`）。
+ * 那边原来把 `LV_LOG_LEVEL_USER` 映射成 `LOG_CRIT`（整屏红色），已修成 `LOG_INFO`。
+ * 所以这里**不再注册第二个回调**：一套机制、且 `transfer_ui` / `lvgl_bench` 同样受益。 */
+
 static bool wait_for_lcddev(const char * path, int timeout_ms)
 {
     const int step_ms = 100;
@@ -62,7 +73,7 @@ static bool wait_for_lcddev(const char * path, int timeout_ms)
         int fd = open(path, O_RDWR);
         if (fd >= 0) {
             close(fd);
-            LV_LOG_USER("lcd ready: %s (%d ms)", path, elapsed);
+            LV_LOG_INFO("lcd ready: %s (%d ms)", path, elapsed);
             return true;
         }
         usleep(step_ms * 1000);
@@ -176,9 +187,9 @@ int main(int argc, char * argv[])
 
     page = lvgl_page_map();
     if (myvendor_is_factory()) {
-        LV_LOG_USER("bicycle: factory page (bitmap fonts, no TTF)");
+        LV_LOG_INFO("bicycle: factory page (bitmap fonts, no TTF)");
     } else if (!page) {
-        LV_LOG_USER("bicycle: splash active, LiveMap loads under Startup");
+        LV_LOG_INFO("bicycle: splash active, LiveMap loads under Startup");
     }
 
     myvendor_mtp_owner_reset();
@@ -194,7 +205,7 @@ int main(int argc, char * argv[])
     }
     lvgl_page_set_app_started(true);
 
-    LV_LOG_USER(myvendor_is_factory()
+    LV_LOG_INFO(myvendor_is_factory()
                 ? "bicycle started (factory page + MTP + BLE)"
                 : "bicycle started (lvgl_page + vmap + MTP)");
     bicycle_ui_ctl_ready();
@@ -235,6 +246,12 @@ int main(int argc, char * argv[])
         /* 传感器快照 → runtime：**主骑行页也要看得到 HR/踏频**（以前只有地图页
          * 的 render pump 在同步，停在主界面时值一直是 0）。 */
         bicycle_runtime_sync_companion_sensors();
+        /* 演示模式：全量顺序推进（GPX 导航 → 坐标点导航 → 暂停/继续 →
+         * 城区偏航重规划 → 全国跳点 → 换主题）。
+         * **必须放在传感器同步之后**：演示场景会写假 HR/功率，若先写再同步，
+         * 无传感器时 `myvendor_sys_sensor_get_try()` 会把它们清回 0，屏幕上看不到。
+         * 与 ctl 同一个上下文（循环顶、LVGL 刷新之外），未开时是空操作。 */
+        bicycle_demo_poll();
         {
 #if MYVENDOR_LVGL_STALL_LOG
             uint32_t t0 = lv_tick_get();
@@ -252,11 +269,39 @@ int main(int argc, char * argv[])
 #if defined(CONFIG_MYVENDOR_LCD_DISP) && CONFIG_MYVENDOR_LCD_DISP
             myvendor_lcd_disp_poll_recover_ui();
 #endif
+
+            /* 换主题的**重活**放这里 —— 在 `lv_timer_handler()` **之后**，也就是本帧
+             * 已经画完之后（同样在"LVGL refresh 之外"，安全性与循环顶等价，见
+             * myvendor_lcd_disp.c 的 recover 注释）。
+             * 为什么不在循环顶：循环顶做的任何事都会**推迟本帧的刷新** ⇒ 用户点一下
+             * 「主题」要等重活跑完屏幕才动（现场像"要点两次"）。挪到帧后，可见变化
+             * 只等"按键回调里的行重画"，① 屏底 ② 页头 ③ 主界面 由这一步补上（晚一帧）。
+             *   · helm_theme_poll_apply()：写 KV + ①② + 登记 ③ 重建
+             *   · lv_pm_theme_poll_styles()：页面级主题应用 + LVGL 整树样式重算（1.2~1.5 s） */
+            helm_theme_poll_apply();
+            lv_pm_theme_poll_styles();
 #if defined(CONFIG_MYVENDOR_BICYCLE_HANDLER_STAT) && CONFIG_MYVENDOR_BICYCLE_HANDLER_STAT
             bicycle_handler_stat_after_handler(idle, BICYCLE_LOOP_SLEEP_MS);
             bicycle_handler_stat_usleep_begin();
 #endif
             bicycle_c_debug_loop(idle);
+
+            /* ── EPIC/GPU 卡死探针 ─────────────────────────────────────────
+             * `g_epic_wait_timeouts` 只在 `EPIC_WaitDone()` 的守卫用尽（硬件没给
+             * done）时自增，HAL 自己不打日志。P02 骑行页的"心率彩条"每拍都会
+             * 失效、一帧几十~上百次小 fill —— 现场"总是卡在彩条"最可能就是这里。
+             * 这一行让"GPU 不给 done"变成可证伪：出现即确认，不出现就排除。 */
+            {
+                extern volatile uint32_t g_epic_wait_timeouts;
+                static uint32_t s_epic_wt_last;
+                uint32_t wt = g_epic_wait_timeouts;
+
+                if (wt != s_epic_wt_last) {
+                    syslog(LOG_WARNING, "[epic] wait timeout +%u (total=%u)\n",
+                           (unsigned)(wt - s_epic_wt_last), (unsigned)wt);
+                    s_epic_wt_last = wt;
+                }
+            }
         }
         if (page && !lvgl_page_is_usb_transfer()) {
             map_page_debug_snap(page);

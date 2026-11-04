@@ -20,6 +20,7 @@ extern "C" {
 typedef struct gpx_writer
 {
   gpx_port_file_t file;  /* 输出文件 */
+  bool footer_written;   /* close retry must not append a second footer */
   bool open;             /* 是否已 open 且 trkseg 未关闭 */
 } gpx_writer_t;
 

@@ -317,6 +317,10 @@ static struct gatt_instance* gatt_find_instance_by_addr(bt_address_t* addr)
     return NULL;
 }
 
+static void gatt_log_addr(const char* tag, const bt_address_t* a);
+static void gatt_log_addr_warn(const char* tag, const bt_address_t* a);
+static void gatt_dump_instance_slots(void);
+
 static struct gatt_instance* gatt_find_alloc_instance_by_addr(bt_address_t* addr)
 {
     struct gatt_instance* instance;
@@ -336,7 +340,167 @@ static struct gatt_instance* gatt_find_alloc_instance_by_addr(bt_address_t* addr
         }
     }
 
+    /* 表满：**先踢掉"对端已经不在"的陈旧槽，再谈失败**
+     * （板级改动 my_vendor，2026-09-25）。
+     *
+     * 为什么必须在这里兜：实例的释放挂在断连事件上
+     * （bt_sal_gatt_client_connection_state_changed_callback → gatt_free_instance），
+     * 而那条路要同时满足三个前提才走得到 —— 断开回调上报的地址能解析回同一个
+     * 身份地址、该链此刻还在 le_conn 表里、且 role 带 GATT_ROLE_CLIENT。
+     * 任一条不成立，`zblue_on_disconnected` 就提前 return，槽位留在 active。
+     * "同一外设两种地址形 ⇒ 一直释放不掉"正是 2026-09-25 定性的那个机制
+     * （见 gatt_free_instance 的注释）。
+     *
+     * 判据用本文件已在用的 get_le_conn_from_addr()：只有地址对得上、且连接
+     * 还在册的槽才算"在用"。**只在表满时才动手**，正常路径完全不变 ——
+     * 所以最坏情况也只是把"本来注定失败的那次分配"换成"回收一个已断开的槽"。
+     *
+     * 代价：被踢的槽丢掉已发现的属性表（service/element/CCC），对端重连后要重新
+     * discover。而它已经不在了，这个代价本来就是 0；换来的是新外设能连上
+     * （否则应用把发现失败当链路失败 ⇒ 拆链重连 ⇒ 永久连不上，见 2026-09-24 现场）。 */
+    for (int i = 0; i < CONFIG_BLUETOOTH_GATTC_MAX_CONNECTIONS; i++) {
+        instance = &g_gatt_client[i];
+
+        if (!instance->active) {
+            continue;
+        }
+
+        if (get_le_conn_from_addr(&instance->addr) != NULL) {
+            continue;
+        }
+
+        gatt_log_addr_warn("gatt instance reclaim (no live conn)", &instance->addr);
+        gatt_log_addr_warn("gatt instance reclaim, want", addr);
+
+        memset(instance, 0, sizeof(struct gatt_instance));
+        instance->active = true;
+        memcpy(&instance->addr, addr, sizeof(bt_address_t));
+        return instance;
+    }
+
+    /* 二级回收（板级改动 my_vendor，2026-09-25）：**在册的对端都还连着**时也要让
+     * 新设备拿得到槽 —— 用户口径："给太多的槽，异常也会被消耗掉"，所以不能靠加槽，
+     * 要让"该释放的能释放"。
+     *
+     * 现场（2026-09-25，GATTC=3，build `202609251251`）：3 个槽全被占，踏频 CSC
+     * 连续 **76 次** `instance alloc fail` ⇒ 它每次连上（LL 与特性位交换都正常）
+     * 都立刻被判发现失败、拆链重连，**永久连不上**；同一固件在 GATTC=4 时是 0 次。
+     *
+     * 判据不需要新字段：先挑 `element_size == 0` 的（从没发现成任何属性 = 占着槽
+     * 不干活），否则挑**已发现属性数最少**的那台（最没价值）。被回收的那台会丢掉
+     * 缓存的属性表，它下次连接重新发现即可（应用本来每次重连都重发现）—— 这是
+     * "保证新设备可用"与"保住老的缓存"之间必须做的取舍，所以记 WARNING 而不是 INFO。 */
+    {
+        struct gatt_instance* victim = NULL;
+
+        for (int i = 0; i < CONFIG_BLUETOOTH_GATTC_MAX_CONNECTIONS; i++) {
+            instance = &g_gatt_client[i];
+
+            if (!instance->active) {
+                continue;
+            }
+
+            if (victim == NULL || instance->element_size < victim->element_size) {
+                victim = instance;
+            }
+        }
+
+        if (victim != NULL) {
+            BT_LOGW("%s, reclaim least-discovered slot (%u elements/%u services)",
+                    __func__, (unsigned)victim->element_size,
+                    (unsigned)victim->service_size);
+            gatt_log_addr_warn("gatt instance reclaim (least discovered)", &victim->addr);
+            gatt_log_addr_warn("gatt instance reclaim, want", addr);
+
+            memset(victim, 0, sizeof(struct gatt_instance));
+            victim->active = true;
+            memcpy(&victim->addr, addr, sizeof(bt_address_t));
+            return victim;
+        }
+    }
+
+    /* 走到这儿只可能是"一个 active 都没有却也没找到空槽"（调用方并发）。 */
+    gatt_log_addr("instance alloc fail, want", addr);
+    gatt_dump_instance_slots();
     return NULL;
+}
+
+/* 板级改动（my_vendor）：把地址按**原始字节序**打成定长串。
+ * 不用 bt_addr_str()：它多半返回静态缓冲，一条日志里放多个地址会互相覆盖；
+ * 这里只求"能比出相同/不同"，展示顺序无所谓（前缀 raw= 已标明）。 */
+static void gatt_log_addr(const char* tag, const bt_address_t* a)
+{
+    BT_LOGE("%s raw=%02X:%02X:%02X:%02X:%02X:%02X", tag,
+            a->addr[0], a->addr[1], a->addr[2], a->addr[3], a->addr[4], a->addr[5]);
+}
+
+/**
+ * @brief 与 `gatt_log_addr()` 同格式，但走 DEBUG 级 —— 取证用的槽表 dump。
+ *
+ * @details 平时不吵；需要时抬框架日志掩码（`ctl log`）就能看到全部槽的地址。
+ *
+ * @param tag 行首标签（说明这个地址是什么角色，例如 "  instance slot busy"）。
+ * @param a   要打印的地址（按原始字节序，只求可比对）。
+ */
+static void gatt_log_addr_dbg(const char* tag, const bt_address_t* a)
+{
+    BT_LOGD("%s raw=%02X:%02X:%02X:%02X:%02X:%02X", tag,
+            a->addr[0], a->addr[1], a->addr[2], a->addr[3], a->addr[4], a->addr[5]);
+}
+
+/**
+ * @brief 与 `gatt_log_addr()` 同格式，但走 WARNING 级 —— 槽位回收这类"要人看见"的事件。
+ *
+ * @details 回收会丢掉被踢那台已发现的属性表，所以既不能静默（INFO 会被刷掉），
+ *          也不该冒充 ERROR（它不是错误，是设计内的取舍）。见
+ *          `gatt_find_alloc_instance_by_addr()` 的两级回收注释。
+ *
+ * @param tag 行首标签（说明这个地址扮演什么角色，例如 "gatt instance reclaim"）。
+ * @param a   要打印的地址（按原始字节序，只求可比对）。
+ */
+static void gatt_log_addr_warn(const char* tag, const bt_address_t* a)
+{
+    BT_LOGW("%s raw=%02X:%02X:%02X:%02X:%02X:%02X", tag,
+            a->addr[0], a->addr[1], a->addr[2], a->addr[3], a->addr[4], a->addr[5]);
+}
+
+/**
+ * @brief 数当前被占用的 GATTC 实例槽个数（= `g_gatt_client[]` 里 active 的个数）。
+ *
+ * @details 板级用途：日志里同时报"用了几槽 / 表有多大"，这样"某外设连不上"到底是
+ *          **表满**还是**别的错**一眼可分（表只有 3 槽，而心率计/CSC/CPS 各占一槽：
+ *          用户放两台心率计就会 4 抢 3，表现为 discover 失败 + 拆链）。
+ *
+ * @return 已占用的槽数（0 = 全部空闲）。
+ */
+static int gatt_instance_slots_used(void)
+{
+    int used = 0;
+
+    for (int i = 0; i < CONFIG_BLUETOOTH_GATTC_MAX_CONNECTIONS; i++) {
+        if (g_gatt_client[i].active) {
+            used++;
+        }
+    }
+
+    return used;
+}
+
+static void gatt_dump_instance_slots(void)
+{
+    int used = 0;
+
+    for (int i = 0; i < CONFIG_BLUETOOTH_GATTC_MAX_CONNECTIONS; i++) {
+        if (!g_gatt_client[i].active) {
+            continue;
+        }
+        used++;
+        gatt_log_addr_dbg("  instance slot busy", &g_gatt_client[i].addr);
+    }
+
+    if (used == 0) {
+        BT_LOGD("  instance slots: all idle");
+    }
 }
 
 static void gatt_free_instance(bt_address_t* addr)
@@ -345,11 +509,61 @@ static void gatt_free_instance(bt_address_t* addr)
 
     instance = gatt_find_instance_by_addr(addr);
     if (!instance) {
-        BT_LOGE("%s, instance null", __func__);
+        /* 板级改动（my_vendor）：这条**不是错误** —— 建链失败（`reason=0x3e`）这类
+         * 日常掉线本来就会"从未认领即释放"（认领发生在连接成功后）。
+         *
+         * 2026-09-24 曾把"还有槽占着"当泄漏信号，**2026-09-25 实测否掉**：现场
+         * `want=CPS(02:…)` 时占着的是 **HR(03:…) / CSC(01:…)** 两台的槽 —— 那只是
+         * "别的外设正在用"，不是泄漏。真正的泄漏（同一外设连接期间与断开回调上报的
+         * 地址不同形 ⇒ 一直释放不掉）**在这一行里判不出来**（"是不是同一台"只能靠
+         * 身份地址/RPA 解析，而那个解析刚失败才会走到这儿）。
+         * ⇒ 定级一律 INFO，并把占用数一起打出来：**想找真泄漏就看这个数是否只涨不落**。
+         * 槽表 dump 留在 DEBUG 档（上面 `gatt_dump_instance_slots()` 内部已改 DEBUG）。 */
+        BT_LOGI("%s raw=%02X:%02X:%02X:%02X:%02X:%02X (gatt slots %d/%d busy)",
+                "gatt_free_instance, instance null, want",
+                addr->addr[0], addr->addr[1], addr->addr[2],
+                addr->addr[3], addr->addr[4], addr->addr[5],
+                gatt_instance_slots_used(),
+                (int)CONFIG_BLUETOOTH_GATTC_MAX_CONNECTIONS);
+        gatt_dump_instance_slots();
         return;
     }
 
     memset(instance, 0, sizeof(struct gatt_instance));
+}
+
+/* 板级改动（my_vendor，2026-09-25）：清掉这个对端**上一次连接留下的发现表**。
+ *
+ * 为什么需要：`keep_db`（见 gatt_discover_finish_keep_db）让同一实例上的后续
+ * UUID 发现**追加**而不是冲表 —— 这是有意的（"先发现 0x180F 再发现主服务"时，
+ * 第二次不能把第一次的 BAS/CCC 冲掉）。但应用的重试循环会反复走同一批 handle
+ * ⇒ 追加退化成**累积** ⇒ 把 SERVICE_MAX(8) / ELEMENT_MAX(40) 吃满，而溢出路径
+ * （`alloc service/element fail`）会**中止这次本来可能成功的发现**。
+ * 现场：2026-09-25 12:51 那次启动 `service_size:8 overflow` ×2 + 12 次
+ * `discover timeout`；改前的 202609251048 那次更严重（6 次溢出 + 31 次电量超时）。
+ *
+ * 为什么可以拿"连接"当分界：GATT 句柄属于**上一次 ATT 会话**，新连接上无论如何
+ * 都要重新发现（应用每次连接都重发现）⇒ 按连接清是安全的，且 **keep_db 在一条
+ * 连接内的追加语义完全不变**。
+ *
+ * 为什么不能只靠断连回调里的 gatt_free_instance：它对"同一外设两种地址形"的
+ * 情形找不到实例（本文件 2026-09-25 已定性的那个机制），旧表会跨连接留着。
+ */
+static void gatt_reset_stale_table(bt_address_t* addr)
+{
+    struct gatt_instance* instance = gatt_find_instance_by_addr(addr);
+
+    if (instance == NULL) {
+        return;
+    }
+
+    if (instance->service_size == 0 && instance->element_size == 0) {
+        return;
+    }
+
+    BT_LOGI("%s, drop stale discovery table (svc=%u elem=%u)", __func__,
+            (unsigned)instance->service_size, (unsigned)instance->element_size);
+    gatt_discover_cleanup(instance);
 }
 
 static struct gatt_service* gatt_alloc_service_by_addr(bt_address_t* addr)
@@ -450,6 +664,10 @@ static void STACK_CALL(conn_connect)(void* args)
     if (le_conn_set_role(&req->addr, GATT_ROLE_CLIENT) != BT_STATUS_SUCCESS) {
         return;
     }
+
+    /* 新连接先丢掉上一次会话的发现表，免得重试循环把表累积到溢出
+     * （见 gatt_reset_stale_table 的注释）。 */
+    gatt_reset_stale_table(&req->addr);
 
     address.type = req->addr_type;
     memcpy(&address.a, &req->addr, sizeof(address.a));
@@ -1046,7 +1264,9 @@ static uint8_t bt_gatt_notify_handler(struct bt_conn* conn, struct bt_gatt_subsc
 
     handle = params->value_handle;
     if (data == NULL) {
-        BT_LOGE("[UNSUBSCRIBED] 0x%04X", params->value_handle);
+        /* 板级改动（my_vendor，2026-09-25）：订阅结束是**正常收尾**（对端或本端退订，
+         * 或发现流程回卷），不是错误 ⇒ 降到 INFO，别占 `[ ERROR]` 这一档。 */
+        BT_LOGI("[UNSUBSCRIBED] 0x%04X", params->value_handle);
         return BT_GATT_ITER_STOP;
     }
 

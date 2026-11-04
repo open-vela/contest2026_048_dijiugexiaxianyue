@@ -68,6 +68,9 @@ if(CONFIG_MYVENDOR_LVGL_STACK)
     "${LVGL_DIR}/src/*.cpp"
     "${LVGL_DIR}/demos/*.c"
     "${LVGL_DIR}/examples/*.c")
+  if(NOT CONFIG_LV_USE_SIFLI_EPIC)
+    list(FILTER SRCS EXCLUDE REGEX "/src/draw/sifli/")
+  endif()
   nuttx_add_library(lvgl)
 
   target_compile_definitions(lvgl PUBLIC LV_CONF_SKIP)

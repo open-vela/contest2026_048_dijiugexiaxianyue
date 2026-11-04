@@ -121,6 +121,13 @@ if(CONFIG_BSP_USING_SPI_NAND)
   endif()
 endif()
 
+# 全局 PSRAM 写回（WIP，默认关）：让 HAL/arch 看到 SDK 的 PSRAM_CACHE_WB。
+# 代价是非 CPU master 碰 PSRAM 都要做缓存维护 —— 审计、缺口清单与验证计划见
+# docs/psram_cache_wb_audit.md，别在 `test coh` 探针通过之前打开。
+if(CONFIG_MYVENDOR_PSRAM_CACHE_WB)
+  target_compile_definitions(arch PRIVATE PSRAM_CACHE_WB)
+endif()
+
 target_include_directories(arch PRIVATE ${NUTTX_CHIP_ABS_DIR}/include)
 target_include_directories(arch PRIVATE ${NUTTX_CHIP_ABS_DIR}/../drivers/Include)
 target_include_directories(arch PRIVATE ${NUTTX_CHIP_ABS_DIR}/../drivers/cmsis/Include)

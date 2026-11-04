@@ -30,6 +30,9 @@
 static const char * const g_map_style_names[] = {
     "classic",
     "outdoor",
+    /* 用户界面上「显示」那一行走的就是这一档（UI 现在是两档：classic ↔ night）。
+     * 缺了它 ⇒ `bicycle_nsh style night` 会被校验拒掉，控制台测不到用户实际那套。 */
+    "night",
 };
 
 /** 支持的 locale 名表。 */
@@ -145,6 +148,8 @@ const char * myvendor_bicycle_ctl_op_name(myvendor_bicycle_ctl_op_t op)
         return "idle_hour";
     case MYVENDOR_BICYCLE_CTL_OP_IDLE_STAY:
         return "idle_stay";
+    case MYVENDOR_BICYCLE_CTL_OP_DEMO:
+        return "demo";
     default:
         return "none";
     }
@@ -209,7 +214,7 @@ int myvendor_bicycle_ctl_post(myvendor_bicycle_ctl_op_t op, const char * arg)
     myvendor_bicycle_ctl_init_once();
 
     if (op <= MYVENDOR_BICYCLE_CTL_OP_NONE ||
-        op > MYVENDOR_BICYCLE_CTL_OP_IDLE_STAY) {
+        op > MYVENDOR_BICYCLE_CTL_OP_DEMO) {
         return -EINVAL;
     }
 

@@ -14,8 +14,8 @@ Make.dep
 cscope.out
 
 # Packed vector map (generated: pack_map.py). Keep the directory in git.
-boards/sf32lb52/my_vendor/mkfs/fat/map/**
-!boards/sf32lb52/my_vendor/mkfs/fat/map/.gitkeep
+boards/sf32lb52/helmone/mkfs/fat/map/**
+!boards/sf32lb52/helmone/mkfs/fat/map/.gitkeep
 
 # Terrarium DEM cache used by build_vgraph.py
 docs/osm/cache/

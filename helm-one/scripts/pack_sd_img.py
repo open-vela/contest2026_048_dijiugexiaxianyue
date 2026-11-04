@@ -15,7 +15,7 @@ factory) is filled with 0xFF so ``dd conv=sparse`` cannot skip NUL gaps.
 Those gaps were why a packed card failed to boot while sftool (file-accurate
 writes) succeeded.
 
-Prefer: sudo dd if=<img> of=/dev/sdX bs=4M status=progress conv=fsync
+Prefer: python3 vela_my_vendor_tools.py burn-sd --sd /dev/sdX
 """
 
 from __future__ import annotations
@@ -28,12 +28,19 @@ import sys
 import time
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve()
+# 注意：用 absolute() 不用 resolve() —— repo 的 <linkfile> 把
+# vendor/HelmOne 做成**符号链接**，resolve() 会跟进去，把「工作区根」算成
+# 链接目标的上两级（少了 workspace 那一层），后面所有 cmake_out/boot_loader
+# 路径全错。absolute() 只做词法归一，保留符号链接。
+SCRIPT = Path(__file__).absolute()
 sys.path.insert(0, str(SCRIPT.parent))
 import flash_args_lib as fal  # noqa: E402
 
-BOOT_CONFIG = "vendor/HelmOne/boot_loader/config/nsh"
-BOOT_BIN_DIR = "vendor/HelmOne/boot_loader/bin"
+# 相对**本树根**（VENDOR_ROOT = <vendor>/scripts/ 往上两级）—— 这棵树在 vendor/ 下
+# 叫什么都行；解析统一由 flash_args_lib 的 boot_config_dir / boot_bin_dir 完成。
+VENDOR_ROOT = SCRIPT.parent.parent
+BOOT_CONFIG = "boot_loader/config/nsh"
+BOOT_BIN_DIR = "boot_loader/bin"
 DEFAULT_OUT_NAME = "helmone_sd.img"
 SECTOR = 512
 # Boot band 1 MiB + main 4 MiB + factory 4 MiB. 0xFF like erased flash.
@@ -348,7 +355,7 @@ def pack_sd_img(
         fs_bin = boot_bin / fal.FS_ROOT_BIN_NAME
         if not fs_bin.is_file():
             raise FileNotFoundError(
-                f"未找到 {fs_bin}，请先: bash vendor/HelmOne/scripts/build_fs_root.sh"
+                f"未找到 {fs_bin}，请先: python3 vendor/HelmOne/build_board.py build-fs"
             )
         addrs = fal.load_ptab_img_addresses(ptab)
         fs_addr = fal.fmt_addr(addrs["fs_root"])
@@ -368,7 +375,7 @@ def pack_sd_img(
     elif not any(fal.is_fs_flash_entry(e) for e in entries):
         raise RuntimeError(
             "无 fs_root sparse 段，请先: "
-            "bash vendor/HelmOne/scripts/build_fs_root.sh"
+            "python3 vendor/HelmOne/build_board.py build-fs"
         )
 
     content_end = _align_up(_entry_span(entries, mem_base), SECTOR)
@@ -425,7 +432,7 @@ def pack_sd_img(
     if not any(e.get("ptab_img") == "factory" for e in entries):
         raise RuntimeError(
             "pack-sd-img 需要 factory 槽（ptab factory）。请先: "
-            "bash vendor/HelmOne/docs/tools/make_sd_2g.sh（或任一尺寸脚本，它会编 main+factory）"
+            "python3 vendor/HelmOne/build_board.py build-all"
         )
     payload = _pack_entries(
         entries,
@@ -451,8 +458,9 @@ def pack_sd_img(
         f"  on-disk      : ~{blocks} bytes "
         f"({blocks / (1024 * 1024):.1f} MiB)\n"
         f"\n下一步：把镜像刻录到 SD 卡（确认设备节点，会覆盖卡头）\n"
-        f"  sudo dd if=<镜像> of=/dev/sdX bs=4M status=progress conv=fsync\n"
-        f"  # 或 balenaEtcher / Rufus DD / Win32 Disk Imager\n"
+        f"  python3 vela_my_vendor_tools.py burn-sd --sd /dev/sdX\n"
+        f"  python3 vela_my_vendor_tools.py burn-sd --sd /dev/sdX --yes\n"
+        f"  python3 vela_my_vendor_tools.py burn-sd --sd /dev/sdX --repack --yes\n"
           f"  # burn-sd 先密写前 9 MiB（boot+main+factory），再从 256 MiB 起 sparse 写 kv/lfs/fat\n"
           f"  # 或 balenaEtcher / Rufus DD / Win32 Disk Imager\n"
           f"\n说明: 前 9 MiB 为 0xFF 实心（ftab/bootloader/main/factory），避免 dd sparse 跳过 0 间隙。\n"
@@ -524,7 +532,10 @@ def main() -> int:
     )
     args = parser.parse_args()
     root = args.root.resolve()
-    out = (args.out or (root / "cmake_out" / "my_vendor_nsh")).resolve()
+    # 输出目录名取**板级目录名**（build.sh 的算法），不是 vendor 树目录名：
+    # 本树 vendor 目录叫 HelmOne、板级目录叫 helmone ⇒ cmake_out/helmone_nsh。
+    board_name = Path(fal.DEFAULT_FACTORY_BOARD_CONFIG).parent.parent.name
+    out = (args.out or (root / "cmake_out" / f"{board_name}_nsh")).resolve()
 
     pack_sd_img(
         root,

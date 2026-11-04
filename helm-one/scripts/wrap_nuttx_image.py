@@ -197,12 +197,20 @@ def main() -> int:
     ota_dir.mkdir(parents=True, exist_ok=True)
     ota_path = ota_dir / ota_name
     if ota_path.resolve() != out_path.resolve():
+        # 这里曾经用 os.link（省一次 3 MB 拷贝）。**不能再用**：out_path
+        # （nuttx.flash.bin）每次构建是**原地重写**同一个 inode，于是所有旧版本名
+        # 的硬链接会一起变成新镜像 —— fw/1.4.0-Helm-One.bin 的 OVNX 头真的读出了
+        # 1.4.1，而 Kconfig 明写 "/fw/*.bin 留作 rollback"（2026-09-25 实测踩到）。
+        # 顺带修掉一个下游：_latest_ota_fw() 按 st_mtime 挑文件，同 inode 时几个
+        # 版本的 mtime 完全相同 ⇒ 选择结果不确定。
+        # ⇒ 版本化产物必须是**独立内容的不可变拷贝**。
         try:
             if ota_path.exists() or ota_path.is_symlink():
                 ota_path.unlink()
-            os.link(out_path, ota_path)
-        except OSError:
             ota_path.write_bytes(wrapped)
+        except OSError as exc:
+            print(f"OTA pack failed: {ota_path}: {exc}", file=sys.stderr)
+            raise
     print(f"OTA pack: {ota_path}")
     print(f"  upload as   /mnt/kv/fw/{ota_name}")
     sidecar = ota_path.with_suffix(".txt")

@@ -25,6 +25,7 @@ target_sources(board PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_identity.c
   ${CMAKE_CURRENT_SOURCE_DIR}/board_mtp.c
   ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_gnss.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_gnss_uart.c
   ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_fw_slot.c
   ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_board_sensor.c
   ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_sound.c
@@ -33,6 +34,13 @@ target_sources(board PRIVATE
 
 if(CONFIG_MYVENDOR_BLE_COMPANION OR CONFIG_MYVENDOR_BICYCLE)
   target_sources(board PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/companion_bridge.c)
+endif()
+
+# EPIC 2D 搬运封装：应用（bicycle）侧看不见芯片层头文件，所以硬件那一半放这儿。
+if(CONFIG_LV_USE_SIFLI_EPIC AND CONFIG_MYVENDOR_BICYCLE)
+  target_sources(board PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_epic_blit.c)
+elseif(CONFIG_MYVENDOR_BICYCLE)
+  target_sources(board PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/myvendor_epic_blit_stub.c)
 endif()
 
 add_subdirectory(ble_companion)

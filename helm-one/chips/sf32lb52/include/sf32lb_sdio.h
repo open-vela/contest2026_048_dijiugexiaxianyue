@@ -197,6 +197,23 @@ int sf32lb_sd_fs_heal(void);
 bool sf32lb_sd_lfs_readonly(void);
 
 /**
+ * @brief SD 是否处于"判死"状态（快速失败窗口）。
+ *
+ * @details 判死之后所有块 I/O 立刻返回 `-EIO`，卡的重识别（`CMD0/CMD8` +
+ *          全量 identify，卡不应答时要数秒）改由**后台任务**做，不再压在
+ *          调用者线程上。单次 I/O 的耗时因此有了硬上限
+ *          （`SF32LB_SD_CALL_BUDGET_US`，见驱动里的重试阶梯）。
+ *
+ *          这个判据是给"读文件只是锦上添花"的上层用的：地图瓦片、GPX 预读
+ *          这类路径在判死期间应当**直接画空片 / 跳过**，不要发起 open ——
+ *          发起也只会立刻失败，还要白付一次 VFS 查找。
+ *
+ * @note 判死不等于坏卡：后台复活成功后自己清掉，随后的读就恢复正常。
+ * @return true 当前判死。
+ */
+bool sf32lb_sd_dead(void);
+
+/**
  * @brief 崩溃裸机路径：关掉 SD/DMA 中断，RCC 复位 SDMMC 后重新 identify。
  *
  * 假定控制器和卡状态都不可信。不拿 NuttX 锁、不走 DMA。

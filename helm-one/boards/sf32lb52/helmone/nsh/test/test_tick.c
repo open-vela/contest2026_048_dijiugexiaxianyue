@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/my_vendor/test/test_tick.c
+ * vendor/HelmOne/boards/sf32lb52/helmone/test/test_tick.c
  *
  * SPDX-License-Identifier: Apache-2.0
  *

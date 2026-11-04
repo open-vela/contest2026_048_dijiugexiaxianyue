@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/sensor/bmp388_uorb.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/sensor/bmp388_uorb.c
  *
  * Bosch BMP388 barometer — NuttX sensor (uORB) lower-half driver.
  * Compensation adapted from Zephyr bmp388 driver / Bosch BMP3-Sensor-API.

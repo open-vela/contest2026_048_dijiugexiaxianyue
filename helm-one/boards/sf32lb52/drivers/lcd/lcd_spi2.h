@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/lcd_spi2.h
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/lcd_spi2.h
  *
  * Dedicated SPI2 for ST7789 (PA37-PA42). Not part of sifli_spi.
  *

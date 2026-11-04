@@ -13,6 +13,7 @@
 #include "vmap_config.h"
 #include "vmap_format.h"
 #include "vmap_vpk_heap.h"
+#include "vmap_style.h"   /* 只用来记录风格 id：几何缓存与风格无关，切主题不清缓存 */
 #include "lvgl/lvgl.h"
 #include <myvendor_mtp_lfs.h>
 #include "myvendor_watchdog.h"
@@ -26,6 +27,10 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* SD 判死闸门（见 load_from_flash）。弱符号：模拟器 / 单元测试没有 SD 驱动，
+ * 未定义时链接成 0，闸门恒开 —— 不引入新的链接依赖。 */
+extern bool sf32lb_sd_dead(void) __attribute__((weak));
 
 /* Number of region packs kept open simultaneously. A single on-screen view can
  * straddle several grid cells (especially when zoomed out or when the current
@@ -73,6 +78,8 @@ struct vmap_tile_cache {
     uint32_t region_graph_sz;
     struct reg_slot slots[VMAP_REG_SLOTS];
     uint32_t lru_clock;
+    /** 上一次观察到的 vmap 风格 id（只用于换色日志；缓存里是几何，与风格无关）。 */
+    uint8_t style_id;
 };
 
 static inline uint16_t rd_u16(const uint8_t * p)
@@ -362,24 +369,61 @@ static bool fill_entries(struct reg_slot * victim, const uint8_t * hdr,
     return true;
 }
 
-static bool slot_bind_ram(struct reg_slot * victim, vmap_cell_id_t region_id,
-    const uint8_t * ram, uint32_t ram_sz)
+/* 只读显示需要的那一小段：16 B vpk 头 + 52 B RIDX 头 + 16n B 瓦片记录
+ * （本格 197~259 KiB 里路由图占大头，显示路径不碰它）。句柄留在槽里，
+ * 瓦片按需 fseek/fread；导航真正要路由图时再走 vpk heap 整文件读入。 */
+static bool slot_bind_disk(struct reg_slot * victim, vmap_cell_id_t region_id,
+    const char * path)
 {
-    if (!ram || ram_sz < VMAP_VPK_HDR_SIZE + VMAP_REG_PACK_INDEX_HDR_SIZE) {
+    uint8_t hdr[VMAP_VPK_HDR_SIZE + VMAP_REG_PACK_INDEX_HDR_SIZE];
+    uint8_t * recs = NULL;
+    uint32_t tile_count;
+    uint32_t rec_sz;
+    uint32_t recs_bytes;
+    FILE * fp;
+
+    if (!victim || !path) {
         return false;
     }
-    if (!(ram[0] == VMAP_PACK_MAGIC0 && ram[1] == VMAP_PACK_MAGIC1
-            && ram[2] == VMAP_PACK_MAGIC2 && ram[3] == VMAP_PACK_MAGIC3)) {
+
+    fp = fopen(path, "rb");
+    if (!fp) {
         return false;
     }
-    if (!fill_entries(victim, ram + VMAP_VPK_HDR_SIZE,
-            ram + VMAP_VPK_HDR_SIZE + VMAP_REG_PACK_INDEX_HDR_SIZE,
-            ram_sz - VMAP_VPK_HDR_SIZE - VMAP_REG_PACK_INDEX_HDR_SIZE)) {
+    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)
+        || !(hdr[0] == VMAP_PACK_MAGIC0 && hdr[1] == VMAP_PACK_MAGIC1
+            && hdr[2] == VMAP_PACK_MAGIC2 && hdr[3] == VMAP_PACK_MAGIC3)
+        || !(hdr[VMAP_VPK_HDR_SIZE] == VMAP_REG_PACK_INDEX_MAGIC0
+            && hdr[VMAP_VPK_HDR_SIZE + 1] == VMAP_REG_PACK_INDEX_MAGIC1
+            && hdr[VMAP_VPK_HDR_SIZE + 2] == VMAP_REG_PACK_INDEX_MAGIC2
+            && hdr[VMAP_VPK_HDR_SIZE + 3] == VMAP_REG_PACK_INDEX_MAGIC3)) {
+        fclose(fp);
         return false;
     }
+    tile_count = rd_u32(hdr + VMAP_VPK_HDR_SIZE + 8);
+    if (tile_count == 0 || tile_count > 4096u) {
+        fclose(fp);
+        return false;
+    }
+    rec_sz = (hdr[VMAP_VPK_HDR_SIZE + 4] == VMAP_REG_PACK_INDEX_VERSION2)
+        ? (uint32_t)VMAP_REG_PACK_TILE_REC_SIZE_V2
+        : (uint32_t)VMAP_REG_PACK_TILE_REC_SIZE;
+    recs_bytes = tile_count * rec_sz;
+    recs = (uint8_t *)vmap_malloc(recs_bytes);
+    if (!recs) {
+        fclose(fp);
+        return false;
+    }
+    if (fread(recs, 1, recs_bytes, fp) != recs_bytes
+        || !fill_entries(victim, hdr + VMAP_VPK_HDR_SIZE, recs, recs_bytes)) {
+        vmap_free(recs);
+        fclose(fp);
+        return false;
+    }
+    vmap_free(recs);
+    victim->fp = fp;
     victim->ram = NULL;
     victim->ram_sz = 0;
-    victim->fp = NULL;
     victim->region_id = region_id;
     victim->used = true;
     return true;
@@ -391,8 +435,6 @@ static struct reg_slot * slot_load(vmap_tile_cache_t * cache, vmap_cell_id_t reg
 {
     char path[VMAP_GRID_PATH_MAX];
     struct reg_slot * victim = NULL;
-    const uint8_t * ram = NULL;
-    uint32_t ram_sz = 0;
     int i;
 
     if (!cache || cache->tile_dir[0] == '\0') {
@@ -430,23 +472,17 @@ static struct reg_slot * slot_load(vmap_tile_cache_t * cache, vmap_cell_id_t reg
     slot_clear(victim);
 
     resolve_region_vpk(path, sizeof(path), cache->tile_dir, region_id);
-    if (!vmap_vpk_heap_pin(region_id, path, &ram, &ram_sz)) {
+    if (!slot_bind_disk(victim, region_id, path)) {
         static vmap_cell_id_t last_fail = VMAP_CELL_NONE;
 
         if (last_fail != region_id) {
             last_fail = region_id;
-            syslog(LOG_WARNING, "[vmap] vpk pin fail cell=%u",
+            syslog(LOG_WARNING, "[vmap] vpk open fail cell=%u",
                 (unsigned)region_id);
         }
-        return NULL;
-    }
-    if (!slot_bind_ram(victim, region_id, ram, ram_sz)) {
-        vmap_vpk_heap_unpin(region_id);
         slot_clear(victim);
         return NULL;
     }
-    /* 解析完索引就 unpin：文件仍留在 heap，refs=0 才能给邻格腾地方。 */
-    vmap_vpk_heap_unpin(region_id);
     victim->lru = ++cache->lru_clock;
     return victim;
 }
@@ -491,6 +527,7 @@ vmap_tile_cache_t * vmap_tile_cache_create(void)
         return NULL;
     }
 
+    cache->style_id = (uint8_t)vmap_style_get_id();
     cache->zoom = -1;
     cache->pack_zoom = -1;
     cache->pack_id = 0xffff;
@@ -549,7 +586,7 @@ void vmap_tile_cache_set_dir(vmap_tile_cache_t * cache, const char * dir)
     if (dir) {
         if (vmap_map_catalog_load(dir) && vmap_map_catalog_is_regional()) {
             cache->packed = true;
-            LV_LOG_USER("vmap: grid cells → lonN/latN/x_y.vpk dir=%s", dir);
+            LV_LOG_INFO("vmap: grid cells → lonN/latN/x_y.vpk dir=%s", dir);
         }
     }
 }
@@ -665,6 +702,15 @@ static int load_from_flash(vmap_tile_cache_t * cache, int z, int x, int y,
         return -1;
     }
 
+    /* SD 判死期间不要发起文件读（2026-11-04）：驱动这时对每个块都立即 -EIO，
+     * 发起也只是白付一次 open + VFS 查找；更关键的是**判死之前**的那一段
+     * 重试阶梯 —— 用户看到的地图卡顿就出在这里。直接返回"这一片没有"，
+     * 上层按空片画，等后台复活后再自然补上。
+     * `sf32lb_sd_dead` 用弱符号：模拟器 / 单测链里没有 SD 驱动，此时恒健康。 */
+    if (sf32lb_sd_dead != NULL && sf32lb_sd_dead()) {
+        return -1;
+    }
+
     /* Grid: lonN/latN/x_y.vpk. Look up the cell that owns this tile's
      * center (same rule as pack_map.py). Do not fall through to VIDX / .vt. */
     if (vmap_map_catalog_is_regional()) {
@@ -697,11 +743,31 @@ static int load_from_flash(vmap_tile_cache_t * cache, int z, int x, int y,
         }
         {
             char path[VMAP_GRID_PATH_MAX];
+            bool ok = false;
 
             resolve_region_vpk(path, sizeof(path), cache->tile_dir,
                 slot->region_id);
-            if (!vmap_vpk_heap_copy(slot->region_id, path,
-                    VMAP_VPK_HDR_SIZE + re->offset, cache->staging, re->size)) {
+            /* 路由图常驻 heap 时（导航刚跑过）直接 memcpy，比再读 flash 快。 */
+            if (vmap_vpk_heap_has(slot->region_id)) {
+                ok = vmap_vpk_heap_copy(slot->region_id, path,
+                    VMAP_VPK_HDR_SIZE + re->offset, cache->staging, re->size);
+            }
+            if (!ok) {
+                if (slot->fp == NULL) {
+                    slot->fp = fopen(path, "rb");
+                }
+                if (slot->fp != NULL) {
+                    ok = fseek(slot->fp,
+                            (long)(VMAP_VPK_HDR_SIZE + re->offset), SEEK_SET) == 0
+                        && fread(cache->staging, 1, re->size, slot->fp)
+                            == (size_t)re->size;
+                    if (!ok) {
+                        fclose(slot->fp);
+                        slot->fp = NULL;
+                    }
+                }
+            }
+            if (!ok) {
                 return -1;
             }
         }
@@ -816,6 +882,30 @@ bool vmap_tile_cache_get(vmap_tile_cache_t * cache, int z, int x, int y,
 
     if (!cache || !out_tile || cache->tile_dir[0] == '\0' || !cache->staging) {
         return false;
+    }
+
+    /*
+     * 风格闸门（2026-11-04 改）：切主题**不再丢瓦片缓存**。
+     *
+     * 缓存里存的是 VTIL **几何**（layer/feature/coords），颜色是绘制时由
+     * `vmap_style_current()` 现取的（vmap_render.c: road_style_for / land /
+     * water），所以几何跟风格无关。原来的"清槽 + 丢 arena"不但白扔了已经
+     * 解析好的瓦片，还把一整屏瓦片变成"全部 cache miss" —— 一次主题切换、
+     * 一屏十几片、每片一次同步 FAT 读，正好撞上 SD 不应答时就是现场那个
+     * 十几秒的整机冻结（`[vmap] style changed -> tile cache dropped` 之后
+     * 紧跟着 `SLOW pump gap`）。
+     *
+     * 正确的换色动作是**整帧重绘**（画布上的像素才带颜色）：主题切换走
+     * `map_page_on_pm_theme()` → `vmap_view_render()`，且主题 id 没变时那条
+     * 路径本来就不重绘。这里只记一次 id 供日志/诊断，不碰缓存。
+     *
+     * 历史症状核对：2026-09-27 报的"夜间主题下白色轨迹线压在浅色地图上"
+     * 是**画布没重绘**，不是瓦片过期 —— 重绘路径修好后就不需要这个副作用了。
+     */
+    if (cache->style_id != (uint8_t)vmap_style_get_id()) {
+        cache->style_id = (uint8_t)vmap_style_get_id();
+        syslog(LOG_NOTICE, "[vmap] style changed -> keep tile cache (%s)\n",
+               vmap_style_current()->name);
     }
 
     if (z != cache->zoom) {

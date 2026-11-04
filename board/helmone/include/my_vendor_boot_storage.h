@@ -5,7 +5,7 @@
  * Boot storage selection for the app (NuttX) side.
  *
  * AUTO-GENERATED from boot_loader/storage.conf by
- * vendor/HelmOne/build_board.py before each `build`. Do NOT edit by
+ * <本固件树>/build_board.py before each `build`. Do NOT edit by
  * hand — change boot_loader/storage.conf (BOOT_STORAGE=nand|sd|emmc) and
  * rebuild.
  *

@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/include/sf32lb52_bd_addr.h
+ * vendor/HelmOne/chips/sf32lb52/include/sf32lb52_bd_addr.h
  *
  * Public BD_ADDR from eFuse UID (same algorithm as the BT controller NVDS).
  * HCI byte 0 is LSB. BLE and USB/MTP both use this so the -XXXX suffix

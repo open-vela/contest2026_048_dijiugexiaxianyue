@@ -1032,7 +1032,18 @@ static void track_paint_km_marker_labels(vmap_track_t * track, uint16_t from_km)
 
     lv_canvas_init_layer(canvas, &layer);
     lv_draw_label_dsc_init(&label_dsc);
-    label_dsc.color = lv_color_white();
+    /*
+     * 角标底浅就写黑字、底深就写白字。原来恒为白色 ⇒ outdoor（夜间）那份**白角标上白字**
+     * 根本看不见 —— 用户 2026-09-27 报的"里程碑数字和圆都是白色"。判据与角标取色同源
+     * （同一个 style->km_badge_*），用亮度阈值分档。
+     */
+    {
+        const vmap_style_t * style = vmap_style_current();
+        const unsigned luma = (unsigned)style->km_badge_r * 30u
+            + (unsigned)style->km_badge_g * 59u + (unsigned)style->km_badge_b * 11u;
+
+        label_dsc.color = (luma > 12800u) ? lv_color_black() : lv_color_white();
+    }
     label_dsc.font = track->font;
     label_dsc.align = LV_TEXT_ALIGN_CENTER;
     label_dsc.text_local = 1;
@@ -1216,16 +1227,13 @@ static bool track_paint_incremental(vmap_track_t * track)
 
 static void track_invalidate_canvas(const vmap_track_t * track)
 {
-    lv_obj_t * canvas;
-
     if (!track || !track->view) {
         return;
     }
 
-    canvas = vmap_view_get_obj(track->view);
-    if (canvas) {
-        lv_obj_invalidate(canvas);
-    }
+    /* 走 view 的统一入口而不是直接作废 canvas：航向朝上时 canvas 是隐藏的，
+     * 直接作废不会更新屏上的旋转缓冲 R（这里还要置 pending / 限频补烘）。 */
+    vmap_view_invalidate_canvas_area(track->view, 0, 0, 32767, 32767);
 }
 
 static void track_invalidate_dirty(const vmap_track_t * track,

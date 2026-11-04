@@ -17,6 +17,9 @@ void helm_shell_bind_keys(void);
 void helm_shell_refresh(void);
 /** @brief 地图重绘后把底栏/导航条提到画布前面。 */
 void helm_shell_raise_chrome(void);
+/** @brief 主界面入场动效：时钟块/状态列/操作条错峰淡入。
+ *  触发点两处（互斥）：页面出现（map_will_appear）与主题重建末尾（重建会换控件）。 */
+void helm_shell_enter_anim(void);
 /** @brief 被菜单等盖住：停仪表绘制/搜星动画，数据仍由 map_page 接收。 */
 void helm_shell_pause_for_cover(void);
 /** @brief 回到前台：先恢复数字，搜星页顶部折线延到转场后再画。 */
@@ -33,6 +36,17 @@ void helm_shell_continue_ride(float km, uint32_t sec, const float * lon,
 void helm_shell_ensure_ride(void);
 /** @brief 导航开始：切到地图页。不自动开始录像。 */
 void helm_shell_on_nav_started(void);
+/** @brief 通栏导航横幅此刻是否可见（地图据此决定是否下移半个横幅高）。 */
+bool helm_shell_nav_ban_shown(void);
+
+/** @brief 演示：直接显示指定页面（UI 线程）。名字：standby/ride/data/map/turn/climb。 */
+bool helm_shell_demo_page(const char * name);
+/** @brief 演示：清除页面锁，恢复正常轮转。 */
+void helm_shell_demo_page_clear(void);
+/** @brief 演示：强制导航横幅状态。0=off；1=直行,2=左转,3=偏航,4=到达,5=右转,6=掉头,7=重规划。 */
+void helm_shell_demo_banner(int mode);
+/** @brief 演示：显示/隐藏"保存"确认层。 */
+void helm_shell_demo_save(bool on);
 
 #ifdef __cplusplus
 }

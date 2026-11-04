@@ -152,6 +152,20 @@ static volatile uintptr_t g_wd_clip_bad;
 static volatile uintptr_t g_wd_clip_next;
 static volatile uintptr_t g_wd_clip_prev;
 static volatile unsigned g_wd_clip_walk;
+
+/** 链表快照：裁剪前把还在表上的前 N 个 wdog 节点记下来（2026-09-27 增）。
+ *
+ *  为什么光有 bad/next/prev 不够：那天现场坏节点的邻居"正好是工作队列自己的
+ *  定时器"——而 worker 的唤醒就靠它（`wd_start_abstick(&wqueue->timer, …,
+ *  work_timer_expired, …)` ⇒ `nxsem_post`），于是"队列里有活、worker 却在睡"
+ *  的丢唤醒现场就这么来的。要一眼看出"坏的是哪一类定时器、表上还剩谁"，
+ *  必须把整条表拍下来；`func` 一栏事后用 ELF 解出归属
+ *  （`work_timer_expired`=NuttX wqueue / `work_timeout`=zblue / `nxsem_timeout`=任务等待）。
+ *
+ *  节点布局（include/nuttx/wdog.h）：node.next, node.prev, arg, func, expired。 */
+#define WD_CLIP_SNAP 8u
+static volatile unsigned  g_wd_clip_snap_n;
+static volatile uintptr_t g_wd_clip_snap[WD_CLIP_SNAP][6];
 /** 裁剪时的判据细节：why 位掩码 + 两个反向指针的实际指向。
  *  1=node 不合法 2=next 不合法 4=prev 不合法 8=prev->next!=node 16=next->prev!=node
  *  32=走超限。**"邻居没指回来"就是重复挂链的签名**（2026-09-18 两次裁剪都是它）。 */
@@ -281,6 +295,16 @@ static volatile uint8_t g_wd_clip_drop_n;
 static volatile int16_t g_wd_clip_drop_pid[WD_CLIP_MAX_DROP];
 static char g_wd_clip_drop_name[WD_CLIP_MAX_DROP][12];
 
+/* wd_insert() also runs with interrupts disabled (and sometimes in an ISR).
+ * Keep its rare post-insert diagnostic until a task can report it. */
+static unsigned g_wd_insert_bad_count;
+static volatile bool g_wd_insert_bad_pending;
+static uintptr_t g_wd_insert_bad_wdog;
+static uintptr_t g_wd_insert_bad_pos;
+static uintptr_t g_wd_insert_bad_next;
+static uintptr_t g_wd_insert_bad_backlink;
+static uintptr_t g_wd_insert_bad_pc;
+
 static bool wd_insert(FAR struct wdog_s *wdog, clock_t expired,
                       wdentry_t wdentry, wdparm_t arg);
 
@@ -318,12 +342,18 @@ static inline_function bool wd_node_sane(FAR const struct list_node *node)
  * Name: wd_on_list
  *
  * Description:
- *   True if wdog's node has sane next/prev (safe to list_delete).
+ *   True if wdog's node has sane, reciprocal next/prev links
+ *   (safe to list_delete).
  ****************************************************************************/
 
 static inline_function bool wd_on_list(FAR const struct wdog_s *wdog)
 {
-  return wd_node_sane(wdog->node.next) && wd_node_sane(wdog->node.prev);
+  FAR const struct list_node *node = &wdog->node;
+
+  /* Valid RAM addresses are insufficient: stale links can point at live
+   * nodes belonging to another timer. list_delete() would overwrite both. */
+  return wd_node_sane(node->next) && wd_node_sane(node->prev) &&
+         node->prev->next == node && node->next->prev == node;
 }
 
 /****************************************************************************
@@ -391,6 +421,30 @@ static inline_function void wd_clip_list(FAR struct list_node *last_good,
   g_wd_clip_prev = prv;
   g_wd_clip_walk = walk;
   g_wd_clip_drop_n = 0;
+
+  /* 链表快照（裁剪前，趁表还没接回环形）：addr/next/prev/arg/func/expired。 */
+  {
+    FAR struct list_node *snap = list->next;
+    unsigned              i = 0;
+
+    while (snap != list && i < WD_CLIP_SNAP &&
+           wd_node_sane(snap) && wd_node_sane(snap->next))
+      {
+        FAR const uint32_t *raw = (FAR const uint32_t *)snap;
+
+        g_wd_clip_snap[i][0] = (uintptr_t)snap;
+        g_wd_clip_snap[i][1] = (uintptr_t)snap->next;
+        g_wd_clip_snap[i][2] = (uintptr_t)snap->prev;
+        g_wd_clip_snap[i][3] = (uintptr_t)raw[2];    /* arg */
+        g_wd_clip_snap[i][4] = (uintptr_t)raw[3];    /* func */
+        g_wd_clip_snap[i][5] = (uintptr_t)raw[4];    /* expired（tick） */
+
+        i++;
+        snap = snap->next;
+      }
+
+    g_wd_clip_snap_n = i;
+  }
 
   if (last_good == list || !wd_node_sane(last_good))
     {
@@ -588,12 +642,28 @@ static void wd_clip_report_owner(FAR const char *what, uintptr_t addr)
  * Name: wd_report_clips
  *
  * Description:
- *   Log outside the critical section (syslog is not CS-safe).
+ *   Called only from the diag task, outside watchdog and work-queue locks.
+ *   Leaving wd_start_abstick()'s own critical section is insufficient:
+ *   work_queue() may still hold its outer spinlock, or call from an ISR.
  ****************************************************************************/
 
 static inline_function void wd_report_clips(void)
 {
   uint32_t n = g_wd_list_clips;
+
+  if (g_wd_insert_bad_pending && !up_interrupt_context())
+    {
+      g_wd_insert_bad_pending = false;
+      syslog(LOG_ERR,
+             "wdog: INSERT LINK BAD(%u) wdog=%08lx pos=%08lx next=%08lx "
+             "next->prev=%08lx pc=%08lx\n",
+             g_wd_insert_bad_count,
+             (unsigned long)g_wd_insert_bad_wdog,
+             (unsigned long)g_wd_insert_bad_pos,
+             (unsigned long)g_wd_insert_bad_next,
+             (unsigned long)g_wd_insert_bad_backlink,
+             (unsigned long)g_wd_insert_bad_pc);
+    }
 
   if (g_wd_stale_unlinks != 0 && !up_interrupt_context())
     {
@@ -671,6 +741,26 @@ static inline_function void wd_report_clips(void)
 
       g_wd_clip_drop_n = 0;
 
+      /* **链表快照**：坏节点之外表上还有谁。`func` 一栏是归属判据
+       * （`work_timer_expired`=NuttX 工作队列的唤醒定时器 / `work_timeout`=zblue
+       * 自己的工作队列 / `nxsem_timeout`=任务在等超时）；`exp` 与稍后的
+       * `op START ticks=` 对得上就说明这个定时器"还在表上但永远不到期"。 */
+      for (i = 0; i < g_wd_clip_snap_n; i++)
+        {
+          syslog(LOG_ERR,
+                 "wdog: clip snap[%u] addr=%08lx next=%08lx prev=%08lx "
+                 "arg=%08lx func=%08lx exp=%lu\n",
+                 i,
+                 (unsigned long)g_wd_clip_snap[i][0],
+                 (unsigned long)g_wd_clip_snap[i][1],
+                 (unsigned long)g_wd_clip_snap[i][2],
+                 (unsigned long)g_wd_clip_snap[i][3],
+                 (unsigned long)g_wd_clip_snap[i][4],
+                 (unsigned long)g_wd_clip_snap[i][5]);
+        }
+
+      g_wd_clip_snap_n = 0;
+
       /* 裁剪现场的最后几次操作 —— 回答"第一个坏的到底是哪一步"。 */
       wd_op_dump();
     }
@@ -721,22 +811,33 @@ static inline_function clock_t wd_expiration(clock_t ticks)
   while (!list_is_empty(&g_wdactivelist))
     {
       FAR struct list_node *first = g_wdactivelist.next;
+      bool first_sane = wd_node_sane(first);
+      bool next_sane = first_sane && wd_node_sane(first->next);
+      bool prev_sane = first_sane && wd_node_sane(first->prev);
 
-      if (!wd_node_sane(first) || !wd_node_sane(first->next) ||
-          !wd_node_sane(first->prev))
+      /* list_delete() writes through both neighbours. A plausible address
+       * alone is not enough: an expired node with a stale backlink would
+       * overwrite another live timer before wd_insert() can detect it. */
+      if (!first_sane || !next_sane || !prev_sane ||
+          first->prev->next != first || first->next->prev != first)
         {
           uintptr_t nxt = 0;
           uintptr_t prv = 0;
 
-          if (wd_node_sane(first))
+          if (first_sane)
             {
               nxt = (uintptr_t)first->next;
               prv = (uintptr_t)first->prev;
             }
 
-          g_wd_clip_why = 64u;      /* 表头分支 */
-          g_wd_clip_pp = 0;
-          g_wd_clip_np = 0;
+          g_wd_clip_why = (uint8_t)(64u |
+                           (!first_sane ? 1u : 0u) |
+                           (!next_sane ? 2u : 0u) |
+                           (!prev_sane ? 4u : 0u) |
+                           (prev_sane && first->prev->next != first ? 8u : 0u) |
+                           (next_sane && first->next->prev != first ? 16u : 0u));
+          g_wd_clip_pp = prev_sane ? (uintptr_t)first->prev->next : 0;
+          g_wd_clip_np = next_sane ? (uintptr_t)first->next->prev : 0;
           wd_clip_list(&g_wdactivelist, (uintptr_t)first, nxt, prv, 0);
           g_wd_need_rescue = 1;
           wd_rescue_orphans();
@@ -855,7 +956,7 @@ static bool wd_unlink_by_walk(FAR struct wdog_s *wdog)
   for (node = list->next; node != list; node = node->next)
     {
       if (!wd_node_sane(node) || !wd_node_sane(node->next) ||
-          node->prev != prev || ++n > WD_WALK_MAX)
+          prev->next != node || ++n > WD_WALK_MAX)
         {
           return false;
         }
@@ -864,12 +965,24 @@ static bool wd_unlink_by_walk(FAR struct wdog_s *wdog)
         {
           FAR struct list_node *next = node->next;
 
+          /* The walk establishes the real predecessor even when node->prev
+           * is stale. The successor must still point back to this node. */
+          if (next == node || next->prev != node)
+            {
+              return false;
+            }
+
           prev->next = next;
           next->prev = prev;
           node->next = NULL;
           node->prev = NULL;
           WD_OP_ADD(WD_OP_UNLINK, wdog, 0);
           return true;
+        }
+
+      if (node->prev != prev || node->next->prev != node)
+        {
+          return false;
         }
 
       prev = node;
@@ -963,24 +1076,24 @@ static bool wd_insert(FAR struct wdog_s *wdog, clock_t expired,
   /* **插入后自检**：新挂上的这条链接必须双向一致。
    * 现场（2026-09-19）wdog 链表反复损坏，但"重复插入"防线从未报过，说明是别的路径
    * 把某个节点的 next/prev 写歪 —— 与其等 head 走到坏节点才 CLIP，不如在**写歪的那一次**
-   * 就报出来：不成立时把调用者 PC、pos、当前节点都打出来（限频，避免刷屏）。 */
+   * 就记录下来：不成立时留存调用者 PC、pos、当前节点，由 diag 线程
+   * 限频打印，不能在当前临界区里调用 syslog。 */
   if (wd_node_sane(pos) && wd_node_sane((FAR struct list_node *)wdog->node.next))
     {
       FAR struct list_node *nx = (FAR struct list_node *)wdog->node.next;
 
       if (nx->prev != &wdog->node)
         {
-          static unsigned s_bad_link;
-
-          if (s_bad_link < 8u)
+          if (g_wd_insert_bad_count < 8u)
             {
-              s_bad_link++;
-              syslog(LOG_ERR,
-                     "wdog: INSERT LINK BAD(%u) wdog=%08lx pos=%08lx next=%08lx "
-                     "next->prev=%08lx pc=%08lx\n",
-                     s_bad_link, (unsigned long)wdog, (unsigned long)pos,
-                     (unsigned long)nx, (unsigned long)nx->prev,
-                     (unsigned long)(uintptr_t)__builtin_return_address(0));
+              g_wd_insert_bad_count++;
+              g_wd_insert_bad_wdog = (uintptr_t)wdog;
+              g_wd_insert_bad_pos = (uintptr_t)pos;
+              g_wd_insert_bad_next = (uintptr_t)nx;
+              g_wd_insert_bad_backlink = (uintptr_t)nx->prev;
+              g_wd_insert_bad_pc =
+                (uintptr_t)__builtin_return_address(0);
+              g_wd_insert_bad_pending = true;
             }
         }
     }
@@ -1100,13 +1213,10 @@ int wd_start_abstick(FAR struct wdog_s *wdog, clock_t ticks,
           nxsched_reassess_timer();
         }
 
-      wd_report_clips();
 #else
       UNUSED(reassess);
 
       /* Check if the watchdog has been started. If so, delete it. */
-
-      WD_OP_ADD(WD_OP_START, wdog, ticks);
 
       if (WDOG_ISACTIVE(wdog))
         {
@@ -1128,7 +1238,6 @@ int wd_start_abstick(FAR struct wdog_s *wdog, clock_t ticks,
 
       leave_critical_section(flags);
 
-      wd_report_clips();
 #endif
       sched_note_wdog(NOTE_WDOG_START, wdentry,
                       (FAR void *)(uintptr_t)ticks);
@@ -1259,3 +1368,68 @@ void wd_timer(clock_t ticks)
   wd_expiration(ticks);
 }
 #endif /* CONFIG_SCHED_TICKLESS */
+
+/****************************************************************************
+ * Name: myvendor_wd_audit
+ *
+ * Description:
+ *   看门狗活动链表的**只读巡检**（由 diag 线程每拍调用）。
+ *
+ *   为什么要它：clip 只在"有人 wd_start/wd_cancel"那一刻才被发现，而现场要的
+ *   是**坏掉的那一拍**（好去它前面几行里找凶手）。2026-09-27 一整天才两次 clip，
+ *   靠 clip 等不去。这里每秒只做一件事：**环完整性**（每个节点的 next/prev 必须
+ *   互相指回；节点数有上限）。**只在"好→坏"或"坏→好"翻转时打一行**，正常情况
+ *   一个字都不打。关中断、有界遍历、只读 ⇒ 不改变被测行为。
+ *
+ ****************************************************************************/
+
+void myvendor_wd_audit(void)
+{
+  static bool           s_bad;
+  irqstate_t            flags;
+  FAR struct list_node *list = &g_wdactivelist;
+  FAR struct list_node *node;
+  FAR struct list_node *bad = NULL;
+  unsigned              n = 0;
+
+  flags = enter_critical_section();
+
+  node = list->next;
+  while (node != list && n < WD_WALK_MAX)
+    {
+      if (!wd_node_sane(node) || !wd_node_sane(node->next) ||
+          !wd_node_sane(node->prev) || node->next->prev != node ||
+          node->prev->next != node)
+        {
+          bad = node;
+          break;
+        }
+
+      node = node->next;
+      n++;
+    }
+
+  /* 走到上限还没回到表头：也算坏（成环 / 超长）。 */
+  if (bad == NULL && node != list)
+    {
+      bad = node;
+    }
+
+  leave_critical_section(flags);
+
+  /* This is the task-context reporting point for watchdog diagnostics.
+   * wd_start_abstick() can be reached with an outer work-queue lock held. */
+  wd_report_clips();
+
+  if (bad != NULL && !s_bad)
+    {
+      s_bad = true;
+      syslog(LOG_ERR, "wdog: audit broken (onset) node=%08lx n=%u\n",
+             (unsigned long)bad, n);
+    }
+  else if (bad == NULL && s_bad)
+    {
+      s_bad = false;
+      syslog(LOG_ERR, "wdog: audit ok again (n=%u)\n", n);
+    }
+}

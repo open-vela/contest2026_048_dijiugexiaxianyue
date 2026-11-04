@@ -30,6 +30,12 @@ void startup_page_finish(void);
  */
 void startup_page_sync_boot(void);
 
+/**
+ * @brief 换主题后重铺开机 splash 的底色（日=白底黑字 / 夜=黑底白字）。
+ * @details 由 `helm_theme_poll_apply()` 在 UI 循环顶调用；没在放 splash 时是空操作。
+ */
+void startup_page_theme_refresh(void);
+
 #ifdef __cplusplus
 }
 #endif

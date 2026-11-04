@@ -27,6 +27,14 @@ void bicycle_env_set_dem_m(float m, bool ok);
 /** @brief 开始 REC 时锚定爬升参考，避免把停放期间的气压漂记进去。 */
 void bicycle_env_hold_gain_ref(void);
 
+/**
+ * @brief 骑行结束：把最后没骑满一段的净高度变化结一次账。
+ *
+ * 由 `bicycle_runtime_set_recording(false)` 在清 recording 之前调用；
+ * 幂等，重复调用不会重复计入。
+ */
+void bicycle_env_flush_gain(void);
+
 bool bicycle_env_imu_valid(void);
 bool bicycle_env_baro_valid(void);
 float bicycle_env_raw_grade_pct(void);

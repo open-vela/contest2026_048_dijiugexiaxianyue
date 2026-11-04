@@ -589,10 +589,11 @@ void vmap_route_nav_update(vmap_route_nav_t * nav, double lon, double lat,
     nav->state.along_m = along;
     nav->state.remain_m = fmax(0.0, total - along);
 
-    /* 每拍把骑行者位置同步给 route：绘制用它把"已走过的那段"刷灰。
-     * **放在 nav 更新内部**，这样不管 UI 从哪条路径喂位置都生效
-     * （之前挂在某一条 UI 路径上，实际走的不是那条 → 走过的线还是蓝的）。 */
-    vmap_route_set_progress_pos(nav->route, lon, lat);
+    /* 进度点已由上面**同一次匹配**的 vmap_route_set_progress_match() 同步好了
+     * （anchor/progress_seg/progress_lon/lat/progress_valid 同源），绘制用它把
+     * "已走过的那段"刷灰。**不要再调 vmap_route_set_progress_pos()**：那是给
+     * "重规划换几何后重算"和"外部只给位置"用的；这里再调会从 progress_seg-1
+     * 一直扫到路线末尾（最多 2047 段）重算最近段，每拍白扫整条路线（实测 17 ms/次）。 */
 
     if (nav->state.remain_m <= VMAP_ROUTE_ARRIVE_M) {
         nav->state.arrived = true;

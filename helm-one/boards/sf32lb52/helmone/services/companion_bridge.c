@@ -66,6 +66,7 @@ struct companion_bridge_s
   uint8_t  sensor_mode;
   uint32_t sensor_scan_ms;
   uint32_t pair_secs;        /**< 配对窗口秒数（PAIR_OPEN 用）。 */
+  uint8_t  pair_unbind_slot; /**< PAIR_UNBIND：0xff=全部，否则 0..2 槽。 */
   char     pair_report[320]; /**< 配对/连接快照（companion 填、ctl 读）。 */
   uint32_t pair_report_gen;
   uint8_t  sensor_connect_idx;
@@ -101,6 +102,7 @@ static void bridge_init_once(void)
   pthread_mutex_init(&g_bridge.lock, NULL);
   g_bridge.sensor_scan_ms = COMPANION_TEST_SENSOR_SCAN_MS_DEFAULT;
   g_bridge.pair_secs = COMPANION_TEST_PAIR_OPEN_SECS_DEFAULT;
+  g_bridge.pair_unbind_slot = 0xffu;
   g_bridge.sensor_connect_kind = COMPANION_SENSOR_KIND_AUTO;
   g_bridge.policy_radio = true;
   g_bridge.policy_notif = true;
@@ -671,6 +673,14 @@ void companion_bridge_sensor_cmd_set_pair_secs(uint32_t secs)
   pthread_mutex_unlock(&g_bridge.lock);
 }
 
+void companion_bridge_sensor_cmd_set_pair_unbind_slot(uint8_t slot)
+{
+  bridge_init();
+  pthread_mutex_lock(&g_bridge.lock);
+  g_bridge.pair_unbind_slot = slot;
+  pthread_mutex_unlock(&g_bridge.lock);
+}
+
 /**
  * @brief 存一份 `ctl pair list` 的文本快照（由 **companion 线程**填）。
  *
@@ -727,6 +737,17 @@ uint32_t companion_bridge_test_pair_secs(void)
   bridge_init();
   pthread_mutex_lock(&g_bridge.lock);
   v = g_bridge.pair_secs;
+  pthread_mutex_unlock(&g_bridge.lock);
+  return v;
+}
+
+uint8_t companion_bridge_test_pair_unbind_slot(void)
+{
+  uint8_t v;
+
+  bridge_init();
+  pthread_mutex_lock(&g_bridge.lock);
+  v = g_bridge.pair_unbind_slot;
   pthread_mutex_unlock(&g_bridge.lock);
   return v;
 }
@@ -899,6 +920,35 @@ void companion_bridge_sensor_ui_get(struct companion_sensor_ui *out)
   pthread_mutex_lock(&g_bridge.lock);
   *out = g_bridge.sensor_ui;
   pthread_mutex_unlock(&g_bridge.lock);
+}
+
+bool companion_bridge_sensor_slot_bound(uint8_t kind)
+{
+  bool bound = false;
+
+  if (kind >= COMPANION_SENSOR_KIND_N)
+    {
+      return false;
+    }
+
+  bridge_init();
+  pthread_mutex_lock(&g_bridge.lock);
+  {
+    const uint8_t *a = g_bridge.sensor_ui.slot[kind].addr;
+    uint8_t i;
+
+    for (i = 0; i < COMPANION_SENSOR_ADDR_LEN; i++)
+      {
+        if (a[i] != 0u)
+          {
+            bound = true;
+            break;
+          }
+      }
+  }
+
+  pthread_mutex_unlock(&g_bridge.lock);
+  return bound;
 }
 
 /**
@@ -1143,6 +1193,67 @@ bool companion_bridge_policy_calls_only(void)
   return on;
 }
 
+/* ---------------------------------------------------------------------------
+ * 通知过滤（板级，2026-09-24）：防"常驻通知刷屏"把 UI 顶死
+ *
+ * 现场：**微信通话**通知是 ongoing 的，手机侧持续下发（状态/计时一变就一条），
+ * 设备端原先"来一条就塞 inbox + 投 pending"，于是 UI 每抽到一条就
+ * `lv_pm_notify_show_ex()` 重弹一次 modal（3 s 一次）⇒ 整块 UI 卡死。
+ *
+ * 两道闸（都只改"弹不弹 / 弹几次"，**inbox 列表仍然是最新状态**）：
+ *   ① **同键合并**：`type + title` 相同、且距上次看到 < NOTIF_MERGE_MS
+ *      ⇒ 就地更新 inbox 里那条（并提到队首），**不投 pending**（不重弹）；
+ *   ② **弹窗限流**：两条**不同**通知之间，pending 投递至少隔 NOTIF_POPUP_GAP_MS，
+ *      更密的只进 inbox、不弹（计 `throttled`）。
+ *
+ * 计数：`rx / merged / throttled / evicted`，经 `ctl cnt notif` 周期报出；
+ * `evicted`（inbox 满丢条目）由 diag 以 ERROR 直报（真丢通知），
+ * merged/throttled 是"过滤在工作"的证据，WARN 级限频报。
+ *
+ * **只在设备端做，app 不需要改**（协议里没有 id/ongoing 字段，只能用
+ * type+title 近似"同一条通知"，这也正是"常驻"能被识别出来的依据）。
+ */
+#define NOTIF_MERGE_MS      15000u /**< 同键多久内算"同一条的更新"。 */
+#define NOTIF_POPUP_GAP_MS    800u /**< 两次弹窗之间的最短间隔。 */
+
+static uint32_t g_notif_rx_n;
+static uint32_t g_notif_merged_n;
+static uint32_t g_notif_throttled_n;
+static uint32_t g_notif_evict_n;
+static uint32_t g_notif_last_seen_ms;  /**< 上次收到（任意）通知的时刻，管合并窗口。 */
+static uint32_t g_notif_last_popup_ms; /**< 上次投 pending（= 会弹）的时刻，管限流。 */
+static uint8_t  g_notif_last_type;     /**< 上次看到的 type，配合 title 做键。 */
+static char     g_notif_last_title[COMPANION_NOTIF_TITLE_MAX + 1];
+
+/** @brief 计数快照（`ctl cnt notif` / 异常判定用）。 */
+void companion_bridge_notif_stats(uint32_t *rx, uint32_t *merged,
+                                  uint32_t *throttled, uint32_t *evicted)
+{
+  pthread_mutex_lock(&g_bridge.lock);
+
+  if (rx != NULL)
+    {
+      *rx = g_notif_rx_n;
+    }
+
+  if (merged != NULL)
+    {
+      *merged = g_notif_merged_n;
+    }
+
+  if (throttled != NULL)
+    {
+      *throttled = g_notif_throttled_n;
+    }
+
+  if (evicted != NULL)
+    {
+      *evicted = g_notif_evict_n;
+    }
+
+  pthread_mutex_unlock(&g_bridge.lock);
+}
+
 static void notif_copy(struct companion_notif_item *dst,
                        const struct companion_notif_item *src)
 {
@@ -1154,7 +1265,10 @@ static void notif_copy(struct companion_notif_item *dst,
 
 void companion_bridge_notif_post(const struct companion_notif_item *item)
 {
-  uint8_t tail;
+  uint32_t now;
+  bool merge;
+  int found = -1;
+  uint8_t i;
 
   if (item == NULL)
     {
@@ -1167,33 +1281,96 @@ void companion_bridge_notif_post(const struct companion_notif_item *item)
       return;
     }
 
+  now = bridge_now_ms();
+
   pthread_mutex_lock(&g_bridge.lock);
 
-  if (g_bridge.inbox_n >= COMPANION_NOTIF_INBOX_MAX)
+  g_notif_rx_n++;
+
+  /* ① 是不是"同一条通知的又一次更新"（type+title 同键、在合并窗口内）。 */
+  merge = (g_notif_last_title[0] != '\0') &&
+          (item->type == g_notif_last_type) &&
+          (strcmp(item->title, g_notif_last_title) == 0) &&
+          ((int32_t)(now - g_notif_last_seen_ms) < (int32_t)NOTIF_MERGE_MS);
+
+  /* inbox：同键就地更新（并提到队首），否则照旧 push-front + 满则丢最旧。 */
+  for (i = 0; i < g_bridge.inbox_n; i++)
     {
-      g_bridge.inbox_n = COMPANION_NOTIF_INBOX_MAX - 1u;
+      if (g_bridge.inbox[i].type == item->type &&
+          strcmp(g_bridge.inbox[i].title, item->title) == 0)
+        {
+          found = (int)i;
+          break;
+        }
     }
 
-  if (g_bridge.inbox_n > 0)
+  if (found > 0)
     {
+      /* 上移到队首：先把这条挪出去，再整体后移，最后放回 [0]。 */
+      struct companion_notif_item tmp;
+
+      notif_copy(&tmp, &g_bridge.inbox[found]);
       memmove(&g_bridge.inbox[1], &g_bridge.inbox[0],
-              g_bridge.inbox_n * sizeof(g_bridge.inbox[0]));
+              (size_t)found * sizeof(g_bridge.inbox[0]));
+      notif_copy(&g_bridge.inbox[0], &tmp);
+      found = 0;
     }
 
-  notif_copy(&g_bridge.inbox[0], item);
-  g_bridge.inbox_n++;
-
-  if (g_bridge.pend_n >= COMPANION_NOTIF_QUEUE_MAX)
+  if (found == 0)
     {
-      g_bridge.pend_head = (uint8_t)((g_bridge.pend_head + 1u) %
-                                     COMPANION_NOTIF_QUEUE_MAX);
-      g_bridge.pend_n = COMPANION_NOTIF_QUEUE_MAX - 1u;
+      /* 同一条通知的新状态：只覆盖内容（body/icon 会变，type/title 不变）。 */
+      notif_copy(&g_bridge.inbox[0], item);
+    }
+  else
+    {
+      if (g_bridge.inbox_n >= COMPANION_NOTIF_INBOX_MAX)
+        {
+          g_bridge.inbox_n = COMPANION_NOTIF_INBOX_MAX - 1u;
+          g_notif_evict_n++;
+        }
+
+      if (g_bridge.inbox_n > 0)
+        {
+          memmove(&g_bridge.inbox[1], &g_bridge.inbox[0],
+                  g_bridge.inbox_n * sizeof(g_bridge.inbox[0]));
+        }
+
+      notif_copy(&g_bridge.inbox[0], item);
+      g_bridge.inbox_n++;
     }
 
-  tail = (uint8_t)((g_bridge.pend_head + g_bridge.pend_n) %
-                   COMPANION_NOTIF_QUEUE_MAX);
-  notif_copy(&g_bridge.pending[tail], item);
-  g_bridge.pend_n++;
+  /* ② pending（= 会弹窗的那条路）：合并窗口内 或 距上次弹太近 ⇒ 不投。 */
+  if (merge)
+    {
+      g_notif_merged_n++;
+    }
+  else if (g_notif_last_popup_ms != 0u &&
+           (int32_t)(now - g_notif_last_popup_ms) < (int32_t)NOTIF_POPUP_GAP_MS)
+    {
+      g_notif_throttled_n++;
+    }
+  else
+    {
+      uint8_t tail;
+
+      if (g_bridge.pend_n >= COMPANION_NOTIF_QUEUE_MAX)
+        {
+          g_bridge.pend_head = (uint8_t)((g_bridge.pend_head + 1u) %
+                                         COMPANION_NOTIF_QUEUE_MAX);
+          g_bridge.pend_n = COMPANION_NOTIF_QUEUE_MAX - 1u;
+        }
+
+      tail = (uint8_t)((g_bridge.pend_head + g_bridge.pend_n) %
+                       COMPANION_NOTIF_QUEUE_MAX);
+      notif_copy(&g_bridge.pending[tail], item);
+      g_bridge.pend_n++;
+
+      g_notif_last_popup_ms = now ? now : 1u;
+    }
+
+  g_notif_last_seen_ms = now ? now : 1u;
+  g_notif_last_type = item->type;
+  snprintf(g_notif_last_title, sizeof(g_notif_last_title), "%s", item->title);
 
   pthread_mutex_unlock(&g_bridge.lock);
 }

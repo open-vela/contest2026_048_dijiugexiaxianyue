@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 15 px
  * Bpp: 2
- * Opts: --size 15 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name ftest_mism2_15 -o /home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/fonts/ftest/ftest_mism2_15.c --font /usr/share/fonts/truetype/misans/MiSans-Medium.ttf --autohint-strong --symbols  0123456789.:/-%+BbEhikmnptKYxso★字体试验推荐当前量产传感器已连接骑行记录暂无下一套上长按返回适合小菜单半透反最大对比线稿同族屏中等思源黑粗米谷歌普惠苹方特强导航坐标点常用亮度日光设置蓝牙开启关闭固件码表速时间里程均海拔照像素
+ * Opts: --size 15 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name ftest_mism2_15 -o /home/jinsc/SDK/vela/openvela/vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/src/lvgl_page/fonts/ftest/ftest_mism2_15.c --font /usr/share/fonts/truetype/misans/MiSans-Medium.ttf --autohint-strong --symbols  0123456789.:/-%+BbEhikmnptKYxso★字体试验推荐当前量产传感器已连接骑行记录暂无下一套上长按返回适合小菜单半透反最大对比线稿同族屏中等思源黑粗米谷歌普惠苹方特强导航坐标点常用亮度日光设置蓝牙开启关闭固件码表速时间里程均海拔照像素
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

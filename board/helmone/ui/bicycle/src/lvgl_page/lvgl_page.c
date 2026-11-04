@@ -8,6 +8,7 @@
 
 #include "bicycle_page_anima.h"
 #include "bicycle_runtime.h"
+#include "helm_palette.h"
 #ifdef CONFIG_MYVENDOR_FACTORY_MODE
 #include "factory/factory_page.h"
 #endif
@@ -73,7 +74,7 @@ void lvgl_page_init(void)
     if (myvendor_is_factory()) {
 #ifdef CONFIG_MYVENDOR_FACTORY_MODE
         factory_page_register();
-        LV_LOG_USER("lvgl_page: factory page (no TTF / LiveMap)");
+        LV_LOG_INFO("lvgl_page: factory page (no TTF / LiveMap)");
         return;
 #else
         LV_LOG_ERROR("lvgl_page: factory image missing CONFIG_MYVENDOR_FACTORY_MODE");
@@ -87,11 +88,13 @@ void lvgl_page_init(void)
     helm_menu_page_register();
 
     lv_pm_theme_set(0);
+    /* 把 helm 调色板挂到 lv_pm 的主题框架上：主题一变就换表 + 整屏失效。 */
+    helm_palette_follow_theme_hook();
     lv_pm_i18n_set(LV_PM_I18N_DEFAULT_LOCALE);
     lv_pm_status_bar_set_height(VMAP_STATUSBAR_H);
     bicycle_status_bar_init();
 
-    LV_LOG_USER("lvgl_page: pages registered");
+    LV_LOG_INFO("lvgl_page: pages registered");
 }
 
 /**

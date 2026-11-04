@@ -8,7 +8,9 @@
 
 #include "bicycle_ride_gpx.h"
 
+#include "bicycle_env.h"
 #include "bicycle_runtime.h"
+#include "helm_icon.h"   /* HELM_ICO_GPX：通知横幅左侧图标 */
 #include "lvgl/lvgl.h"
 #include "gpx_ext_sensor.h"
 #include "gpx_record.h"
@@ -71,6 +73,8 @@ static bool s_salvage_done;
 static bool s_last_pos_from_mark;
 static bool s_pending_mark_clear;
 static bool s_pending_saved_log;
+static bool s_close_error_notified;
+static uint32_t s_close_retry_ms;
 static char s_pending_unlink[RIDE_GPX_PATH_MAX];
 /** @brief 下次 begin 追加已复制的文件，而不是新建空 GPX。 */
 static bool s_continue_pending;
@@ -241,7 +245,7 @@ static void ride_gpx_notify_recovered(void)
         return;
     }
 
-    if (lv_pm_notify_show("骑行", "已恢复未结束的记录", 3000)) {
+    if (lv_pm_notify_show_icon("骑行", "已恢复未结束的记录", HELM_ICO_GPX, 3000)) {
         s_recovered_pending = false;
     }
 }
@@ -828,6 +832,25 @@ static void ride_gpx_close_tick(lv_timer_t * t)
         return;
     }
 
+    if (s_rec != NULL && gpx_record_close_error(s_rec) != 0) {
+        uint32_t now = lv_tick_get();
+
+        if (!s_close_error_notified) {
+            s_close_error_notified = lv_pm_notify_show_icon("骑行", "保存失败，请检查存储",
+                                              HELM_ICO_GPX, 5000);
+        }
+
+        /* Preserve recovery marker and cache. Retry on the worker, never
+         * block LVGL; shutdown can proceed between attempts. */
+        if (t != NULL && (uint32_t)(now - s_close_retry_ms) >= 5000u) {
+            s_close_retry_ms = now;
+            (void)gpx_record_stop(s_rec);
+        }
+        return;
+    }
+
+    s_close_error_notified = false;
+    s_close_retry_ms = 0;
     if (s_pending_mark_clear) {
         ride_gpx_mark_clear();
         s_pending_mark_clear = false;
@@ -948,6 +971,11 @@ int bicycle_ride_gpx_begin(void)
     if (gpx_record_is_recording(s_rec)) {
         s_active = true;
         return 0;
+    }
+
+    if (gpx_record_is_closing(s_rec) ||
+        gpx_record_close_error(s_rec) != 0) {
+        return -EBUSY;
     }
 
     if (!append) {
@@ -1135,6 +1163,12 @@ int bicycle_ride_gpx_commit(char * path, size_t path_n)
 {
     int ret;
 
+    /* 骑行结束的"最后一段结账"（用户 2026-10-05）。正常走 KEY2 结束/暂停时
+     * `bicycle_runtime_set_recording(false)` 已经结过一次，这里是给**没经过
+     * 停录的收尾路径**兜底（关机前的 auto-save：helm_pwr_do_gpx 直接 commit）
+     * ——flush 幂等，结过账再调只挪参考点，不会重复计。 */
+    bicycle_env_flush_gain();
+
     if (!s_active || s_rec == NULL || !gpx_record_is_recording(s_rec)) {
         if (s_path[0] == '\0') {
             ret = bicycle_ride_gpx_begin();
@@ -1158,9 +1192,9 @@ int bicycle_ride_gpx_commit(char * path, size_t path_n)
  */
 void bicycle_ride_gpx_wait_idle(void)
 {
-    while (s_rec != NULL && gpx_record_is_closing(s_rec)) {
-        myvendor_watchdog_hw_pet();
-        usleep(20000);
+    if (s_rec != NULL && gpx_record_wait_close(s_rec) == -ETIMEDOUT) {
+        printf("ride gpx: close timeout, recovery marker retained\n");
+        return;
     }
 
     if (s_pending_mark_clear || s_pending_unlink[0] != '\0' ||

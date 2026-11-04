@@ -10,7 +10,7 @@ if(CONFIG_MYVENDOR_BLE_COMPANION)
       WARNING
         "MYVENDOR_BLE_COMPANION needs CONFIG_BLUETOOTH_BLE_SCAN=y. "
         "cmake_out/.config is stale versus configs/nsh/defconfig. "
-        "Run: cmake --build cmake_out/my_vendor_nsh --target resetconfig")
+        "Run: cmake --build cmake_out/helmone_nsh --target resetconfig")
   endif()
 
   set(OPENVELA_ROOT ${NUTTX_BOARD_ABS_DIR}/../../../../..)

@@ -1,0 +1,16 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 80d241361f3..0af66d82425 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -593,6 +593,11 @@ add_definitions(-D__NuttX__)
+ 
+ add_compile_definitions($<$<COMPILE_LANGUAGE:ASM>:__ASSEMBLY__>)
+ 
++# The SF32LB52 PSRAM MPU setting and every DMA user must agree on cache mode.
++if(CONFIG_MYVENDOR_PSRAM_CACHE_WB)
++  add_compile_definitions(PSRAM_CACHE_WB)
++endif()
++
+ set_property(
+   TARGET nuttx
+   APPEND

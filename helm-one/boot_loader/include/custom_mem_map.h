@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boot_loader/include/custom_mem_map.h
+ * vendor/HelmOne/boot_loader/include/custom_mem_map.h
  *
  * SiFli SDK-compatible memory map (sf32lb52-nano_a128r16).
  ****************************************************************************/

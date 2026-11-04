@@ -22,6 +22,25 @@
     #define font_rle LV_GLOBAL_DEFAULT()->font_fmt_rle
 #endif /*LV_USE_FONT_COMPRESSED*/
 
+/* A/B（2026-10-17）：展开缓存命中率高但 memcpy 成本≈原地展开，fetch 段无净收益，
+ * 且占 128KB PSRAM → 默认关闭。需要时用 -DLV_FONT_EXPAND_CACHE_BYTES=131072 打开。 */
+#ifndef LV_FONT_EXPAND_CACHE_BYTES
+    #define LV_FONT_EXPAND_CACHE_BYTES 0
+#endif
+
+#if LV_FONT_EXPAND_CACHE_BYTES > 0
+    #define FONT_EXPAND_CACHE_SLOTS 256
+#endif
+
+/* A/B: the label loop and draw_unit_draw_letter both call
+ * lv_font_get_glyph_dsc() for the same (font, letter, next) pair. A small
+ * direct-mapped cache skips the cmap/kern search on the second call.
+ * Long wrapped paragraphs use a few hundred distinct (letter, next) pairs,
+ * hence 512 slots (~24 kB). Set to 0 to disable. */
+#ifndef LV_FONT_DSC_CACHE_SLOTS
+    #define LV_FONT_DSC_CACHE_SLOTS 512
+#endif
+
 /**********************
  *      TYPEDEFS
  **********************/
@@ -29,6 +48,43 @@ typedef struct {
     uint32_t gid_left;
     uint32_t gid_right;
 } kern_pair_ref_t;
+
+#if LV_FONT_EXPAND_CACHE_BYTES > 0
+typedef struct {
+    const uint8_t * src;      /* source glyph bitmap (cache key) */
+    uint32_t hash;            /* hash of src + geometry (quick reject) */
+    uint32_t ofs;             /* offset of expanded bytes in the arena */
+    uint16_t w;
+    uint16_t h;
+    uint16_t stride_in;
+    uint16_t stride_out;
+    uint8_t bpp;
+    uint8_t valid;
+} font_expand_slot_t;
+
+static uint8_t * font_expand_arena;
+static uint32_t font_expand_used;
+static font_expand_slot_t font_expand_slots[FONT_EXPAND_CACHE_SLOTS];
+#endif
+
+#if LV_FONT_DSC_CACHE_SLOTS > 0
+typedef struct {
+    const lv_font_t * font;
+    uint32_t letter;
+    uint32_t letter_next;
+    lv_font_glyph_dsc_t dsc;
+} font_dsc_cache_entry_t;
+
+static font_dsc_cache_entry_t font_dsc_cache[LV_FONT_DSC_CACHE_SLOTS];
+#endif
+
+/* A/B counters, printed by the EPIC stats dump. */
+uint32_t lv_font_expand_cache_hit_cnt;
+uint32_t lv_font_expand_cache_miss_cnt;
+uint32_t lv_font_expand_cache_fail_cnt;
+uint32_t lv_font_expand_cache_used_bytes;
+uint32_t lv_font_dsc_cache_hit_cnt;
+uint32_t lv_font_dsc_cache_miss_cnt;
 
 /**********************
  *  STATIC PROTOTYPES
@@ -38,6 +94,14 @@ static int8_t get_kern_value(const lv_font_t * font, uint32_t gid_left, uint32_t
 static int unicode_list_compare(const void * ref, const void * element);
 static int kern_pair_8_compare(const void * ref, const void * element);
 static int kern_pair_16_compare(const void * ref, const void * element);
+
+#if LV_FONT_EXPAND_CACHE_BYTES > 0
+    static uint32_t font_expand_hash(const uint8_t * src, uint32_t w, uint32_t h, uint32_t stride_in, uint8_t bpp);
+    static bool font_expand_cache_lookup(const uint8_t * src, uint32_t w, uint32_t h, uint32_t stride_in,
+                                         uint32_t stride_out, uint8_t bpp, uint8_t * dst);
+    static void font_expand_cache_insert(const uint8_t * src, uint32_t w, uint32_t h, uint32_t stride_in,
+                                         uint32_t stride_out, uint8_t bpp, const uint8_t * expanded);
+#endif
 
 #if LV_USE_FONT_COMPRESSED
     static void decompress(const uint8_t * in, uint8_t * out, int32_t w, int32_t h, uint8_t bpp, bool prefilter);
@@ -108,10 +172,23 @@ const void * lv_font_get_bitmap_fmt_txt(lv_font_glyph_dsc_t * g_dsc, lv_draw_buf
 
     if(fdsc->bitmap_format == LV_FONT_FMT_TXT_PLAIN) {
         const uint8_t * bitmap_in = &fdsc->glyph_bitmap[gdsc->bitmap_index];
+#if LV_FONT_EXPAND_CACHE_BYTES > 0
+        const uint8_t * bitmap_in_start = bitmap_in;
+#endif
         uint8_t * bitmap_out_tmp = bitmap_out;
         int32_t i = 0;
         int32_t x, y;
         uint32_t stride_out = lv_draw_buf_width_to_stride(gdsc->box_w, LV_COLOR_FORMAT_A8);
+
+#if LV_FONT_EXPAND_CACHE_BYTES > 0
+        /* Repeated glyph? The expanded A8 bytes are already in the arena. */
+        if(bitmap_out && (fdsc->bpp == 1 || fdsc->bpp == 2 || fdsc->bpp == 4) &&
+           font_expand_cache_lookup(bitmap_in, gdsc->box_w, gdsc->box_h, stride_in, stride_out,
+                                    (uint8_t)fdsc->bpp, bitmap_out)) {
+            return draw_buf;
+        }
+#endif
+
         if(fdsc->bpp == 1) {
             for(y = 0; y < gdsc->box_h; y ++) {
                 uint16_t line_rem = stride_in != 0 ? stride_in : gdsc->box_w;
@@ -163,26 +240,71 @@ const void * lv_font_get_bitmap_fmt_txt(lv_font_glyph_dsc_t * g_dsc, lv_draw_buf
 
         }
         else if(fdsc->bpp == 4) {
-            for(y = 0; y < gdsc->box_h; y ++) {
-                uint16_t line_rem = stride_in != 0 ? stride_in : gdsc->box_w;
-                for(x = 0; x < gdsc->box_w; x++, i++) {
-                    i = i & 0x1;
-                    if(i == 0) {
-                        bitmap_out_tmp[x] = opa4_table[(*bitmap_in) >> 4];
+            /* Fast A4 -> A8 expansion, two pixels per input byte.
+             *
+             * Equivalence with the previous nibble-at-a-time loop:
+             *  - The old loop kept `i` across rows and only forced it to 0
+             *    when stride_in != 0.  With stride_in == 0 it therefore read
+             *    the font bitmap as one continuous nibble stream: a row of
+             *    odd width consumed the high nibble of the last byte and the
+             *    following row started at that byte's LOW nibble (no per-row
+             *    padding).  The generated Montserrat data confirms this:
+             *    bitmap_index deltas equal ceil(box_w * box_h / 2), not
+             *    ceil(box_w / 2) * box_h.
+             *  - Hence the two cases below:
+             *      stride_in != 0: every row starts on a byte boundary;
+             *        consume ceil(box_w/2) bytes, then skip to stride_in.
+             *      stride_in == 0: track nibble parity across rows.  If a row
+             *        starts on a low nibble, peel that pixel first, then
+             *        expand whole bytes; a trailing odd pixel only takes the
+             *        high nibble and leaves the byte for the next row.
+             *  - In both cases each pixel gets the same table lookup
+             *    (opa4_table[high] then opa4_table[low]) and the input
+             *    pointer advances by exactly the same number of bytes as
+             *    the old loop, so output bytes are bit-identical.
+             *  - stride_out handling is unchanged (one A8 row per box_h row).
+             */
+            uint32_t pairs = (uint32_t)gdsc->box_w >> 1; /* whole input bytes per row */
+            if(stride_in != 0) {
+                for(y = 0; y < gdsc->box_h; y ++) {
+                    const uint8_t * in_row = bitmap_in;
+                    uint8_t * out_row = bitmap_out_tmp;
+                    uint32_t xb;
+                    for(xb = 0; xb < pairs; xb++) {
+                        uint8_t b = in_row[xb];
+                        out_row[2 * xb + 0] = opa4_table[b >> 4];
+                        out_row[2 * xb + 1] = opa4_table[b & 0x0F];
                     }
-                    else if(i == 1) {
-                        bitmap_out_tmp[x] = opa4_table[(*bitmap_in) & 0xF];
-                        line_rem--;
+                    if(gdsc->box_w & 0x1U) {  /* odd width: last high nibble */
+                        out_row[2 * pairs] = opa4_table[in_row[pairs] >> 4];
+                    }
+                    bitmap_in = in_row + stride_in;
+                    bitmap_out_tmp += stride_out;
+                }
+            }
+            else {
+                uint32_t low_first = 0; /* 1: this row starts on a low nibble */
+                for(y = 0; y < gdsc->box_h; y ++) {
+                    uint8_t * out_row = bitmap_out_tmp;
+                    uint32_t xo = 0;
+                    if(low_first) {
+                        out_row[xo++] = opa4_table[*bitmap_in & 0x0F];
                         bitmap_in++;
                     }
+                    while(xo + 1U < (uint32_t)gdsc->box_w) {
+                        uint8_t b = *bitmap_in++;
+                        out_row[xo + 0] = opa4_table[b >> 4];
+                        out_row[xo + 1] = opa4_table[b & 0x0F];
+                        xo += 2;
+                    }
+                    if(xo < (uint32_t)gdsc->box_w) {
+                        /* Odd pixel: take the high nibble, keep the byte for
+                         * the next row's low nibble (continuous stream). */
+                        out_row[xo] = opa4_table[*bitmap_in >> 4];
+                    }
+                    low_first ^= (uint32_t)gdsc->box_w & 0x1U;
+                    bitmap_out_tmp += stride_out;
                 }
-
-                /*Handle stride*/
-                if(stride_in) {
-                    i = 0;  /*If there is a stride start from the next byte in the next line*/
-                    bitmap_in += line_rem;
-                }
-                bitmap_out_tmp += stride_out;
             }
         }
         else if(fdsc->bpp == 8) {
@@ -198,7 +320,17 @@ const void * lv_font_get_bitmap_fmt_txt(lv_font_glyph_dsc_t * g_dsc, lv_draw_buf
             }
         }
 
-        lv_draw_buf_flush_cache(draw_buf, NULL);
+#if LV_FONT_EXPAND_CACHE_BYTES > 0
+        /* Store the freshly expanded A8 rows for the next frame. */
+        if(bitmap_out && (fdsc->bpp == 1 || fdsc->bpp == 2 || fdsc->bpp == 4)) {
+            font_expand_cache_insert(bitmap_in_start, gdsc->box_w, gdsc->box_h, stride_in, stride_out,
+                                     (uint8_t)fdsc->bpp, bitmap_out);
+        }
+#endif
+
+        /*No cache maintenance here: CPU consumers are cache-coherent (same core),
+         * and hardware consumers (EPIC) flush their input layers themselves in
+         * lv_epic_blend(). Was: full-buffer dcache clean per glyph fetch.*/
         return draw_buf;
     }
     /*Handle compressed bitmap*/
@@ -222,6 +354,25 @@ const void * lv_font_get_bitmap_fmt_txt(lv_font_glyph_dsc_t * g_dsc, lv_draw_buf
 bool lv_font_get_glyph_dsc_fmt_txt(const lv_font_t * font, lv_font_glyph_dsc_t * dsc_out, uint32_t unicode_letter,
                                    uint32_t unicode_letter_next)
 {
+#if LV_FONT_DSC_CACHE_SLOTS > 0
+    const uint32_t cache_letter = unicode_letter;
+    uint32_t cache_idx = (uint32_t)(lv_uintptr_t)font >> 2;
+    cache_idx ^= cache_letter * 0x9E3779B1u;
+    cache_idx ^= unicode_letter_next * 0x85EBCA77u;
+    cache_idx ^= cache_idx >> 15;
+    cache_idx *= 0x7FEB352Du;
+    cache_idx ^= cache_idx >> 16;
+    cache_idx &= (LV_FONT_DSC_CACHE_SLOTS - 1);
+
+    font_dsc_cache_entry_t * cache_e = &font_dsc_cache[cache_idx];
+    if(cache_e->font == font && cache_e->letter == cache_letter && cache_e->letter_next == unicode_letter_next) {
+        lv_font_dsc_cache_hit_cnt++;
+        *dsc_out = cache_e->dsc;
+        return true;
+    }
+    lv_font_dsc_cache_miss_cnt++;
+#endif
+
     /*It fixes a strange compiler optimization issue: https://github.com/lvgl/lvgl/issues/4370*/
     bool is_tab = unicode_letter == '\t';
     if(is_tab) {
@@ -273,12 +424,99 @@ bool lv_font_get_glyph_dsc_fmt_txt(const lv_font_t * font, lv_font_glyph_dsc_t *
 
     if(is_tab) dsc_out->box_w = dsc_out->box_w * 2;
 
+#if LV_FONT_DSC_CACHE_SLOTS > 0
+    cache_e->font = font;
+    cache_e->letter = cache_letter;
+    cache_e->letter_next = unicode_letter_next;
+    cache_e->dsc = *dsc_out;
+#endif
+
     return true;
 }
 
 /**********************
  *   STATIC FUNCTIONS
  **********************/
+
+#if LV_FONT_EXPAND_CACHE_BYTES > 0
+static uint32_t font_expand_hash(const uint8_t * src, uint32_t w, uint32_t h, uint32_t stride_in, uint8_t bpp)
+{
+    uint32_t hsh = (uint32_t)(lv_uintptr_t)src >> 2;
+    hsh ^= w * 0x9E3779B1u;
+    hsh ^= h * 0x85EBCA77u;
+    hsh ^= stride_in * 0xC2B2AE3Du;
+    hsh ^= (uint32_t)bpp * 0x27D4EB2Fu;
+    hsh ^= hsh >> 16;
+    hsh *= 0x7FEB352Du;
+    hsh ^= hsh >> 15;
+    return hsh;
+}
+
+static bool font_expand_cache_lookup(const uint8_t * src, uint32_t w, uint32_t h, uint32_t stride_in,
+                                     uint32_t stride_out, uint8_t bpp, uint8_t * dst)
+{
+    uint32_t hsh = font_expand_hash(src, w, h, stride_in, bpp);
+    font_expand_slot_t * s = &font_expand_slots[hsh & (FONT_EXPAND_CACHE_SLOTS - 1)];
+
+    if(!s->valid || s->hash != hsh || s->src != src || s->w != w || s->h != h ||
+       s->stride_in != stride_in || s->bpp != bpp) {
+        lv_font_expand_cache_miss_cnt++;
+        return false;
+    }
+
+    lv_font_expand_cache_hit_cnt++;
+
+    if(s->stride_out == stride_out) {
+        lv_memcpy(dst, font_expand_arena + s->ofs, (size_t)stride_out * h);
+    }
+    else {
+        uint32_t row;
+        for(row = 0; row < h; row++) {
+            lv_memcpy(dst + row * stride_out, font_expand_arena + s->ofs + row * s->stride_out, w);
+        }
+    }
+    return true;
+}
+
+static void font_expand_cache_insert(const uint8_t * src, uint32_t w, uint32_t h, uint32_t stride_in,
+                                     uint32_t stride_out, uint8_t bpp, const uint8_t * expanded)
+{
+    if(font_expand_arena == NULL) {
+        font_expand_arena = lv_malloc(LV_FONT_EXPAND_CACHE_BYTES);
+        if(font_expand_arena == NULL) {
+            lv_font_expand_cache_fail_cnt++;
+            return; /*No heap: keep expanding every time*/
+        }
+    }
+
+    uint32_t size = stride_out * h;
+    if(size == 0 || size > (uint32_t)LV_FONT_EXPAND_CACHE_BYTES) return;
+
+    if(font_expand_used + size > (uint32_t)LV_FONT_EXPAND_CACHE_BYTES) {
+        /*Arena full: simple wrap. Invalidate every slot at once; text fonts
+         *need only a few KB, so this is a rare fallback.*/
+        lv_memzero(font_expand_slots, sizeof(font_expand_slots));
+        font_expand_used = 0;
+    }
+
+    uint32_t hsh = font_expand_hash(src, w, h, stride_in, bpp);
+    font_expand_slot_t * s = &font_expand_slots[hsh & (FONT_EXPAND_CACHE_SLOTS - 1)];
+
+    lv_memcpy(font_expand_arena + font_expand_used, expanded, size);
+    s->src = src;
+    s->hash = hsh;
+    s->ofs = font_expand_used;
+    s->w = (uint16_t)w;
+    s->h = (uint16_t)h;
+    s->stride_in = (uint16_t)stride_in;
+    s->stride_out = (uint16_t)stride_out;
+    s->bpp = bpp;
+    s->valid = 1;
+
+    font_expand_used += (size + 3u) & ~3u;
+    lv_font_expand_cache_used_bytes = font_expand_used;
+}
+#endif /*LV_FONT_EXPAND_CACHE_BYTES > 0*/
 
 static uint32_t get_glyph_dsc_id(const lv_font_t * font, uint32_t letter)
 {

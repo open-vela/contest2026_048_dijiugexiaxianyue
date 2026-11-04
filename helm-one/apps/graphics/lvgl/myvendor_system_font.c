@@ -1,11 +1,13 @@
-/****************************************************************************
- * vendor/my_vendor/apps/graphics/lvgl/myvendor_system_font.c
+/**
+ * @file myvendor_system_font.c
+ * @brief 系统 TTF 字体（PSRAM 常驻 + FreeType 渲染），与 `liblvgl` 链接、不在 bicycle 里。
  *
- * System TTF in PSRAM + FreeType (linked with liblvgl, not bicycle).
- * Face load matches SiFli SDK: FT_New_Memory_Face on the RAM buffer.
+ * 读取方式对齐 SiFli SDK：整份 TTF 读进 RAM 后 `FT_New_Memory_Face()`，
+ * 避免每条文字都去 FAT 卷上随机读。日志一律走 LVGL 日志（`LV_LOG_*`），
+ * 不直接调 `syslog()` —— 界面层与系统日志的边界见 docs/diag_log.md。
  *
  * SPDX-License-Identifier: Apache-2.0
- ****************************************************************************/
+ */
 
 #include "myvendor_system_font.h"
 #include "board_malloc.h"
@@ -27,7 +29,11 @@
 #endif
 
 #define MYVENDOR_FONT_PATH CONFIG_MYVENDOR_SYSTEM_FONT_DIR "/" CONFIG_MYVENDOR_SYSTEM_FONT_FILE
-#define MYVENDOR_FONT_CACHE_SLOTS 6
+/* 槽位是**只增不减**的（没有淘汰：满了直接返回 NULL，调用方回退位图）。
+ * 旧界面占 12/14/15/16/22 五档；新环形主界面再加 30（盘心模式名）与
+ * 36（地图浮层时速），6 槽在第 7 档就报 `system_font: cache full`。
+ * 每槽只多一个 lv_font + FreeType 字形缓存，扩到 8 留一档余量。 */
+#define MYVENDOR_FONT_CACHE_SLOTS 8
 #ifndef MYVENDOR_FONT_PRELOAD_CHUNK
 #define MYVENDOR_FONT_PRELOAD_CHUNK 32768u
 #endif
@@ -179,7 +185,7 @@ bool myvendor_system_font_preload_pump(void)
     s_preload_fd = -1;
     s_preload_done = true;
     s_preload_ok = true;
-    LV_LOG_USER(
+    LV_LOG_INFO(
         "system_font: PSRAM preload %u bytes @ %s",
         (unsigned)s_ttf_psram_size,
         MYVENDOR_FONT_PATH);
@@ -217,7 +223,7 @@ bool myvendor_system_font_lv_bind(void)
                                 (uint32_t)s_ttf_psram_size, "ttf");
 #endif
     s_lv_bound = true;
-    LV_LOG_USER("system_font: LVGL FreeType bind OK");
+    LV_LOG_INFO("system_font: LVGL FreeType bind OK");
     return true;
 #endif
 }
@@ -278,7 +284,7 @@ lv_font_t *myvendor_system_font_get(int32_t px)
     slot->px = px;
     slot->font = font;
     slot->refs = 1;
-    LV_LOG_USER("system_font: ready px=%d", (int)px);
+    LV_LOG_INFO("system_font: ready px=%d", (int)px);
     return font;
 #endif
 }

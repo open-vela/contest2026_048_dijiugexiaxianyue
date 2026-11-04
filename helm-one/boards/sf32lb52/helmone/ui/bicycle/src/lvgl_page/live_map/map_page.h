@@ -76,8 +76,21 @@ bool map_page_set_style_by_name(map_page_t * page, const char * name);
  */
 void map_page_redraw(map_page_t * page);
 
+/**
+ * @brief 显示/隐藏定位方向箭头（骑行者箭头）。
+ * @param page LiveMap。
+ * @param visible true 露出箭头；false 藏起来。
+ * @note 平时由导航路径自己管（`nav_stop` / `nav_from_gpx` 会打开，"只看轨迹"的
+ *       `map_page_show_gpx()` 会关掉）。规划导航（`map_page_nav_plan_begin()` /
+ *       `map_page_nav_trip_plan()`）起航时也会显式打开并置顶，避免上一轮"回放/只看轨迹"
+ *       留下的隐藏态带进坐标点导航（2026-10-18 修复）。
+ */
+void map_page_set_arrow_visible(map_page_t * page, bool visible);
+
 /** @brief 在 LVGL 线程应用缩放 ctl：in/out/reset/z,N/s,F；非法时返回 false。 */
 bool map_page_apply_zoom_cmd(map_page_t * page, const char * arg);
+/** @brief 航向朝上开关 ctl：on/off；非法时返回 false。 */
+bool map_page_apply_rot_cmd(map_page_t * page, const char * arg);
 /**
  * @brief 把当前 zoom/scale 写进 ctl 状态，供 NSH 查询。
  */
@@ -175,6 +188,20 @@ void map_page_set_map_ui_visible(map_page_t * page, bool visible);
 bool map_page_nav_active(const map_page_t * page);
 /** @brief 路线规划 worker 尚未完成。 */
 bool map_page_nav_planning(const map_page_t * page);
+/**
+ * @brief 地图是否已经画出过至少一帧、并且当前没有正在跑的渲染泵。
+ *
+ * @details 给演示/自动化用：换到新城市后要先等地图真的画出来再提交规划，
+ *          否则 `map_page_nav_plan()` 拿的是上一块显示区域的路由图。
+ */
+bool map_page_render_ready(const map_page_t * page);
+/**
+ * @brief 把地图直接搬到指定经纬度并整帧重绘（不等回放/跟车）。
+ *
+ * @details 演示换城市时用：900 km 外的新位置若靠"假 GPS 跟车"挪过去，
+ *          实测要 30 s 以上，期间提交规划会拿上一块区域的路由图。
+ */
+void map_page_center_on(map_page_t * page, double lon, double lat);
 /** @brief MCU 正在执行偏航重规划。 */
 bool map_page_nav_replanning(const map_page_t * page);
 /** @brief 轨迹回放 / 审阅模式。 */
@@ -199,6 +226,60 @@ bool map_page_nav_turn_info(const map_page_t * page,
 bool map_page_nav_status_text(const map_page_t * page, char * buf, size_t n);
 /** @brief 横幅「偏航」阈值（米）。返航 GPX 放宽，避免对向车道误报。 */
 double map_page_nav_off_warn_m(const map_page_t * page);
+/**
+ * @brief 到下一个转向点的距离（米）。
+ * @return 无转向信息（纯轨迹跟随、或前方无路口）时为 -1。
+ * @note  横幅"临近路口才悬挂"用它判阈值；与 `map_page_nav_turn_info()` 的距离文案同源。
+ */
+double map_page_nav_turn_dist_m(const map_page_t * page);
+/**
+ * @brief 剩余里程（米，含到终点的 display 口径）。
+ * @return 无导航（无路线 / 已结束）时为 -1。
+ * @note  顶栏右槽"距下一路口 / 剩余里程"用它 —— 横幅按显示策略大部分时间不挂，
+ *        这里补上那个空档的读数。
+ */
+double map_page_nav_remain_m(const map_page_t * page);
+/**
+ * @brief 本次导航的总里程（米，GPX 跟线的全长）。
+ * @return 不是 GPX 跟线、或长度未知时为 -1。
+ * @note  左下角"剩余 / 全程"两行里的全程用它。
+ */
+double map_page_nav_total_m(const map_page_t * page);
+/**
+ * @brief 当前**应用中的路线**全长（米）；无路线返回 -1。
+ *
+ * @details 剖面窗口/采样用的是这条 route 的坐标系；GPX 密集跟线时 route 只是
+ *          课程的一个窗口片，长度不等于课程全长。
+ */
+double map_page_nav_route_total_m(const map_page_t * page);
+/**
+ * @brief 当前已行进里程（米，沿路线方向）。
+ * @return 不是导航中为 0。
+ * @note  表盘页底部"前视窗口"的起点用它 —— 窗口按**距离**滚动，不按采样点跳。
+ */
+double map_page_nav_along_m(const map_page_t * page);
+/**
+ * @brief 采样路线 [from_m, from_m+span_m] 这一段的海拔剖面。
+ * @param out 输出海拔（未知点给 `VGRF_ELE_UNKNOWN`）。
+ * @return 采样点数（≤ cap）；无路线 / span 非法时为 0。
+ * @note  表盘页导航态只画**前方固定距离**（HELM_DIAL_NAV_SPAN_M），不像
+ *        `map_page_nav_profile_ele()` 那样把整条剩余路线压成 60 点。
+ */
+uint32_t map_page_nav_profile_span(const map_page_t * page, double from_m,
+    double span_m, int16_t * out, uint32_t cap);
+/**
+ * @brief 地图当前每像素多少米（按 Web Mercator：156543.03·cos(纬度)/2^zoom/scale）。
+ * @return 地图不可用时为 0。
+ * @note  右下角比例尺用它乘以标尺像素宽度，再取整成 1/2/5×10^k。
+ */
+double map_page_map_mpp(const map_page_t * page);
+/**
+ * @brief 顶部为常驻 UI（导航横幅）预留 px 高度：地图可见窗口下移并缩短 px，
+ *        同时把视图对象上移 px/2，使**跟随中心落在可见窗口的中心**。
+ * @param px 预留高度（0 = 铺满，未导航时用）
+ * @note  运行期改几何：容器移动/缩放是廉价的，视图本身尺寸不变（只挪窗口）。
+ */
+void map_page_set_banner_inset(map_page_t * page, int32_t px);
 /** @brief 打开 GPX：一次只加载前方 N km，接近窗口末端再动态续载。reverse 为反向。 */
 bool map_page_nav_from_gpx(map_page_t * page, const char * path, bool reverse);
 /** @brief 在地图上显示 GPX 轨迹（不导航、不模拟定位）。 */

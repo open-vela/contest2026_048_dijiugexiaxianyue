@@ -1,16 +1,30 @@
 # 补丁（相对各子仓根）
 
-这五份补丁覆盖**`vendor/my_vendor` 之外的全部改动**（2026-09-19 用 `repo status` 全树核对：
-除它们之外，`nuttx` / `packages` / 其它子仓都是干净的）。五份都已实测：
+这些补丁覆盖**`vendor/HelmOne` 之外的全部改动**（2026-09-19 用 `repo status` 全树核对，
+2026-10-17 迁移 LVGL 优化时复核并补入 nuttx 的 `PSRAM_CACHE_WB` 全局宏，
+2026-11-04 补入 LittleFS 写失败不再断言的 `lfs_prog_error`；除它们之外，
+`nuttx` / `packages` / 其它子仓都是干净的）。每份都已实测：
 **在各自仓库的 HEAD 上空打一遍，得到的文件与本机现状逐字节相同**。
+
+> ⚠️ **2026-09-24 起，前两份还多了一条路**：`scan.c` / `id.c` 的改动同时由板级
+> `vela_override/zblue/patch_*.py` 在**构建时**写进构建副本
+> （`cmake_out/<build>/myvendor_zblue/myvendor_scan.c` / `myvendor_id.c`），
+> 上游 git 因此保持不动（`git -C external/zblue/zblue status` 干净）。
+> 本目录的 `.patch` 是同一改动的另一份表达，**两份必须一致**：apply 本补丁后
+> `diff` 那份构建副本应为空（命令见 [zblue-scan-stop-null-ctx.md](../zblue-scan-stop-null-ctx.md) 的「验证」）。
+> 不一致的后果不是报错而是**静默退回旧版本** —— 构建脚本锚点不中时只打 CMake WARNING。
+> 改了脚本要重新导出：`python3 zcode/gen_zblue_pitch_patch.py scan|id`（只打印，不落盘）。
 
 | 文件 | 在哪个仓库执行 | 改的文件 | 说明文档 |
 |------|----------------|----------|----------|
-| [zblue-id-scan-eacces.patch](zblue-id-scan-eacces.patch) | `external/zblue/zblue` | `subsys/bluetooth/host/id.c` | [ble.md](../ble.md) |
-| [zblue-scan-stop-null-ctx.patch](zblue-scan-stop-null-ctx.patch) | `external/zblue/zblue` | `subsys/bluetooth/host/scan.c` | [zblue-scan-stop-null-ctx.md](../zblue-scan-stop-null-ctx.md)（panic 修复） |
+| [zblue-id-scan-eacces.patch](zblue-id-scan-eacces.patch) | `external/zblue/zblue` | `subsys/bluetooth/host/id.c` | [ble.md](../ble.md)（构建时脚本 `patch_id_scan_addr.py`） |
+| [zblue-scan-stop-null-ctx.patch](zblue-scan-stop-null-ctx.patch) | `external/zblue/zblue` | `subsys/bluetooth/host/scan.c` | [zblue-scan-stop-null-ctx.md](../zblue-scan-stop-null-ctx.md)（panic 修复；**4 处**判空，2026-09-24 补齐，构建时脚本 `patch_scan_stop_null.py`） |
 | [vela-hci-h4-rx-reopen.patch](vela-hci-h4-rx-reopen.patch) | `frameworks/connectivity/bluetooth` | `service/stacks/zephyr/hci_h4.c` | [ble-hci-h4-rx-reopen.md](../ble-hci-h4-rx-reopen.md) |
 | [apps-lvgl-myvendor-stack.patch](apps-lvgl-myvendor-stack.patch) | `apps` | `graphics/lvgl/CMakeLists.txt`、`graphics/lvgl/Makefile` | [lvgl.md](../lvgl.md) |
 | [apps-lvgl-kconfig.patch](apps-lvgl-kconfig.patch) | **`apps/graphics/lvgl/lvgl`**（它自己是个 project，不是 `apps`！） | `Kconfig` | [lvgl.md](../lvgl.md) |
+| [nuttx-kconfig-quote-blank.patch](nuttx-kconfig-quote-blank.patch) | `nuttx` | `cmake/nuttx_kconfig.cmake` | [nuttx-kconfig-quote-blank.md](../nuttx-kconfig-quote-blank.md)（CMake ≥3.23 不接受 `.config` 空行展开成零参数；**没有抽换件可用**，只能打补丁） |
+| [nuttx-psram-cache-wb.patch](nuttx-psram-cache-wb.patch) | `nuttx` | `CMakeLists.txt` | [psram_cache_wb_audit.md](../../psram_cache_wb_audit.md)（`PSRAM_CACHE_WB` 必须对 arch、board driver 与 apps 全体可见，按 `CONFIG_MYVENDOR_PSRAM_CACHE_WB` 开关；只给 `arch` 目标定义会漏掉 DMA 用户） |
+| [nuttx-lfs-prog-error.patch](nuttx-lfs-prog-error.patch) | `nuttx` | `fs/littlefs/CMakeLists.txt`、`fs/littlefs/lfs_prog_error.patch`（新增文件，构建期再打给 littlefs） | 暂无专文。症状链见 [sd_recovery.md](../../sd_recovery.md)：卡被判死后整盘返回 `-EIO`，而 `lfs_bd_flush()` 失败会把脏 pcache 留着，重试 commit 撞 `LFS_ASSERT(pcache->block == LFS_BLOCK_NULL)` 直接打死调用线程（普通 `open(O_CREAT)` 就能触发）；本补丁改为返回 `LFS_ERR_IO`，让调用方自行退栈 |
 
 > ⚠️ 最后一份的仓库是 **嵌套的 LVGL project**（manifest 里的 `apps_graphics_lvgl`），
 > 在 `apps` 仓库里执行会报"路径不在 HEAD 中"。它必须打，否则 config 生成出来的 `CONFIG_LV_*`
@@ -40,14 +54,14 @@ git -C external/zblue/zblue diff -- subsys/bluetooth/host/scan.c           # 本
 ## 打完之后怎么自查
 
 ```bash
-git -C <repo> diff -- <file> | diff - vendor/my_vendor/docs/pitch/patches/<patch>   # 与补丁应完全一致
-git -C <repo> apply --check -R vendor/my_vendor/docs/pitch/patches/<patch>          # 反向也干净 ⇒ 补丁与现状逐字相符
+git -C <repo> diff -- <file> | diff - vendor/HelmOne/docs/pitch/patches/<patch>   # 与补丁应完全一致
+git -C <repo> apply --check -R vendor/HelmOne/docs/pitch/patches/<patch>          # 反向也干净 ⇒ 补丁与现状逐字相符
 ```
 
 ## 不要动的东西
 
 - 官方 `apps/graphics/lvgl/lvgl/` 工作区：**`.c/.h` 保持上游原样**（本板 `CONFIG_MYVENDOR_LVGL_STACK=y`，
-  真正参与编译的 LVGL 在 `vendor/my_vendor/apps/graphics/lvgl/`，编译图中的对象都在
+  真正参与编译的 LVGL 在 `vendor/HelmOne/apps/graphics/lvgl/`，编译图中的对象都在
   `boards/exclude_board/myvendor_lvgl/` 下；见 [lvgl.md](../lvgl.md)）。
   2026-09-19 已把这棵树从实验残留（1768 改 / 799 删 / 2379 未跟踪）恢复为 checkout 原样，
   **但只有 `Kconfig` 必须留着 9.5 那版** —— config 生成走 `apps/graphics/lvgl/Kconfig`

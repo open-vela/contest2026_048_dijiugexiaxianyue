@@ -22,7 +22,7 @@
       {
         "path": "factory.bin",
         "ptab_img": "factory",
-        "comment": "cmake_out/my_vendor_nsh-factory/nuttx.flash.bin（build-all / build-factory；日常 flash 会跳过；NAND ptab 无此槽则忽略）"
+        "comment": "cmake_out/helmone_nsh-factory/nuttx.flash.bin（build-all / build-factory；日常 flash 会跳过；NAND ptab 无此槽则忽略）"
       },
       {
         "path": "fs_root.bin",

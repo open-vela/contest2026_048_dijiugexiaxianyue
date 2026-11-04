@@ -59,6 +59,7 @@
 #include "companion_bridge.h"
 #include "myvendor_identity.h"
 #include "myvendor_mono.h"
+#include "myvendor_gnss_uart.h"   /* 板级直连数据面（ISR 推环形 + 信号量） */
 #include "myvendor_watchdog.h"
 #include "board_malloc.h"
 
@@ -114,7 +115,19 @@
 #define GNSS_LINE_MAX       160
 #define GNSS_RX_BATCH       128
 #define GNSS_RETRY_MS       2000u
-#define GNSS_STACK_SIZE     10240
+
+/** 静止休眠期（已断电、fd 已关）读线程的轮询间隔。
+ *
+ *  休眠时读线程不再 poll 串口（PX4 式：fd 已 close），所以必须自己睡一下 ——
+ *  主循环是"一轮一个字节"的紧循环，不睡就是空转烧满 CPU。200 ms 是
+ *  "唤醒响应够快（人眼看不出延迟）"与"不烧 CPU"之间的取值：唤醒由
+ *  `g_idle_sleep` 翻假驱动，最坏多等一个 200 ms 就开始上电。 */
+#define GNSS_IDLE_NAP_MS     200u
+
+/* 读线程栈上限（单槽，见下面 g_gnss_stack_sram 的注释）：
+ * 实测水位 3,260 B，取 2.5× —— 栈底还有金丝雀 + MPU 只读页，
+ * 溢出会当场 fault 而不是静默写坏别人。 */
+#define GNSS_STACK_SIZE     8192
 #define GNSS_THREAD_PRIO    50
 #define GNSS_THREAD_STALL_MS 8000u
 #define GNSS_REAP_WAIT_MS   8000u
@@ -158,26 +171,39 @@
 #define GNSS_LINK_OK_MS     15000u
 #define GNSS_LINK_BAD_MS     5000u
 
-/* 读线程栈：**两个槽轮换**。
+/* 读线程栈：**单槽**。
  *
- * 为什么不是一块：`gnss_reader_stranded()` 判出"僵尸"时线程**还活着**（st=RUNNING
+ * 为什么当初是两块：`gnss_reader_stranded()` 判出"僵尸"时线程**还活着**（st=RUNNING
  * 卡在 poll 里、永远不退出、join 会永久阻塞）。旧代码判到僵尸后只 `return 0`，
  * `g_gnss_has_thread`/`g_gnss_stack_busy` 一个都没清，于是 spawn 永远被
  * `busy=1 has=1` 拒掉 —— 现场 2026-09-18 15:56：判成僵尸之后每 30 s 重复一次
  * `spawn refused busy=1 has=1`，GNSS 一直死到重启。
- * 僵尸收不回来就必然占着它那块栈，所以重生成只能换一块：用过的槽位进
- * `g_gnss_stack_zombie` 掩码，**本开机内永不复用**（代价 = 每个僵尸 10 KB，最多 2 个，
- * 之后再出现就明确拒生成并报错 —— 有界）。 */
-#define GNSS_STACK_SLOTS 2
-/* 读线程的栈**优先放 PSRAM**：SRAM 里 2×10 KB 太贵，而且这块内存一旦被写坏
- * 影响面很大（2026-09-19 n023 就是 gnss 的栈指针变成 0x78）。
- * PSRAM 分配失败才退回下面这块 SRAM 兜底（行为等同从前）。 */
+ * 僵尸收不回来就必然占着它那块栈，所以重生成只能换一块 —— 那是"槽位永不复用"
+ * 时代的设计。
+ *
+ * **2026-09-25 改成单槽**：`gnss_thread_spawn()` 现在会在重新生成前回收槽位
+ * （pid 已死、或被调度器丢掉，两种可回收情形，见那里的注释），所以不再需要
+ * 第二块备用栈来换。SRAM 账见 analysis/SRAM_BUDGET.md：这里是 32 KB → 8 KB。
+ *
+ * ⚠ 代价要讲清楚：**回收判据是唯一的恢复路径**。如果某次 stranded 线程
+ * "还活着、又判不出被调度器丢掉"，这个槽就收不回来，GNSS 会一直死到重启 ——
+ * 原来有第二块栈时这种情形还能再撑一次。所以判据若改动，先复验这一条。 */
+#define GNSS_STACK_SLOTS 1
+/* 这块 SRAM 是 g_gnss_stack[] 的兜底：从前的注释写"优先放 PSRAM"，但代码里
+ * 只有 `g_gnss_stack[s] = g_gnss_stack_sram[s]` 一条路径（PSRAM 优先从未实现），
+ * 实测水位 3,260 B（`test cpu -t 2`，见 analysis/SRAM_BUDGET.md）⇒ 按 2.5× 取 8 KB。 */
 static uint8_t g_gnss_stack_sram[GNSS_STACK_SLOTS][GNSS_STACK_SIZE]
     __attribute__((aligned(16)));
 static uint8_t *g_gnss_stack[GNSS_STACK_SLOTS];
 static uint8_t g_gnss_stack_slot;
 static uint32_t g_gnss_canary_tick;    /* 当前读线程用的槽位 */
 static uint8_t g_gnss_stack_zombie;  /* 位掩码：被僵尸占住的槽 */
+/* 每个被隔离槽位"当初放弃的是哪个线程"。用来判断它还活着没有 ——
+ * 只要确认它确实不在了，这个槽就可以回收（见 gnss_thread_spawn 的选槽处）。
+ * 原设计是"隔离后本开机内永不复用"，但槽位只有两个 ⇒ 两次 stranded 之后
+ * spawn 永久失败、GNSS 永久死、只有重启能救（2026-09-21 现场实证）。
+ * ⇒ 2026-09-25 起只剩**一个**槽，回收从"省着用的优化"变成**唯一**的复生路径。 */
+static pid_t g_gnss_zombie_pid[GNSS_STACK_SLOTS];
 static void gnss_reader_release_zombie(pid_t pid);   /* 定义在后面 */
 #define GNSS_UBX_PAY_MAX         2048u
 #define GNSS_EPH_INJECT_MAX      256u
@@ -446,7 +472,76 @@ static bool g_reap_giveup_logged;       /* 升级日志只打一次 */
 /** @brief diag 触发过的重启次数（上屏用，见 gnss_fill_health）。 */
 static uint32_t g_diag_restarts;
 static bool g_gnss_spawning;
-static struct pollfd g_uart_pfd;
+
+/** @brief 读者的 pollfd，**按栈槽各一份**（不跨线程共用）。
+ *
+ *  2026-09-23 修（转储 n587：`kind=assert` + `semaphore.h:1236`
+ *  `DEBUGASSERT(!NXSEM_IS_MUTEX(sem))` + `irq=1`，被打断的任务是 `gnss`）：
+ *
+ *  原来这里只有**一个** `static struct pollfd g_uart_pfd`，新旧两个读者共用，
+ *  而 `nuttx/fs/vfs/fs_poll.c` 的 `fs_poll_setup()` 每次调用都会**重置**同一份
+ *  pollfd 的内部字段 —— 那段代码自己的 `REVISIT` 原文就写着：
+ *
+ *      "In a multi-threaded environment, one use case might be to share a
+ *       single, array of struct pollfd in poll() calls on different threads.
+ *       That use case is not supportable here because the non-standard
+ *       internal fields get reset here on each call to poll() on each thread."
+ *
+ *  ⇒ 我们正好在用它明说不支持的用法。失效链：
+ *   1. 读者 A（槽 0）进 `poll()`：`fds->arg = semA`（semA 就在 `poll()` 内部
+ *      `fs_heap_malloc` 那块里，返回时 free），驱动把 `dev->fds[i]` 指向这份 pollfd；
+ *   2. A 被判 stranded（"lost by scheduler"）—— **它还在 poll 里**，那块内存还活着；
+ *   3. 新读者 B 起来，poll 同一份 pollfd ⇒ 内部字段被重置成 semB，
+ *      **A 的注册被顶掉**；
+ *   4. A 终于被调度、`poll()` 返回 ⇒ 它拆掉的是 **B 的**注册，并 free 掉自己那块
+ *      ⇒ 驱动手里那份注册的 `arg` 指向**已释放内存**；
+ *   5. USART2 **TX 完成中断**（`serial.c:2197 uart_datasent → uart_poll_notify
+ *      → poll_default_cb`）读到那一块被复用成互斥量的内存 ⇒ 断言 ⇒ 重启。
+ *
+ *  按线程隔离后 A、B 各用各的，第 3、4 步不再发生。
+ *  ⇒ 修法：**每个线程各持一份 pollfd**（见 `gnss_uart_pfd()`），从根上不存在
+ *  "两个读者共用一份"这件事，也不必假设槽有没有被复用。
+ *
+ *  为什么用 TLS 而不是"按槽分"：这条路能 poll 的函数不止读者一个 ——
+ *  `gnss_read_some → gnss_read_byte → {gnss_drain, gnss_ubx_read_frame}`，
+ *  而 `gnss_drain`/`gnss_ubx_read_frame` 全树各有 7 / 6 个调用点（含 eph 注入、
+ *  diag 那些**非读者线程**）。把槽号顺着这么多层穿下去既啰嗦又容易漏一处，
+ *  而漏一处就又变回共享。TLS 按"谁在 poll"天然隔离，调用点一处都不用改。
+ *
+ *  代价：每个 poll 过的线程多占一个 `struct pollfd`（16 B），且**不回收**
+ *  （线程数有限、都是长命线程）；分配失败时调用方退回非阻塞单次读。 */
+static pthread_key_t  g_uart_pfd_key;
+static pthread_once_t g_uart_pfd_once = PTHREAD_ONCE_INIT;
+
+static void gnss_uart_pfd_key_make(void)
+{
+  (void)pthread_key_create(&g_uart_pfd_key, NULL);
+}
+
+/** @brief 取**本线程**的 pollfd（首次调用时分配并挂到 TLS；失败返回 NULL）。 */
+static struct pollfd *gnss_uart_pfd(void)
+{
+  struct pollfd *pfd;
+
+  (void)pthread_once(&g_uart_pfd_once, gnss_uart_pfd_key_make);
+
+  pfd = (struct pollfd *)pthread_getspecific(g_uart_pfd_key);
+  if (pfd == NULL)
+    {
+      /* 用板级 SRAM 分配器（本文件已 include board_malloc.h）：16 B、长命，
+       * 随线程一起存活，不回收 —— poll 过的线程数有限，是可控的常量。 */
+      pfd = (struct pollfd *)board_malloc_sram(sizeof(*pfd));
+      if (pfd == NULL)
+        {
+          syslog(LOG_ERR, "gnss: pollfd alloc failed, poll disabled on this thread\n");
+          return NULL;
+        }
+
+      (void)pthread_setspecific(g_uart_pfd_key, pfd);
+    }
+
+  return pfd;
+}
 
 /**
  * @brief 唤醒信号的 handler：只负责打断阻塞，不做任何实质工作。
@@ -570,6 +665,12 @@ static struct minmea_date g_last_date =
 };
 
 #define GNSS_TIME_MIN_UNIX       1704067200  /* 2024-01-01 UTC */
+/** GPS 历元（1980-01-06 00:00 UTC）的 unix 秒。算"周内秒"**必须从它起算**：
+ *  unix 0 与 GPS 周起点相差 3 天（315964800 不是 604800 的整数倍，差 259200 s），
+ *  直接 `unix % 604800` 会把每个周的偏移算歪 3 天（主机侧校验器踩过这个坑）。 */
+#define GNSS_GPS_EPOCH_SEC       315964800
+/** 当前 GPS-UTC 闰秒（MGA-INI-TIME_UTC 的 leapS 也是这个值）。 */
+#define GNSS_LEAP_SEC            18
 /* 星历有效 2–4 h：既用来算"下次该同步"的提示（last+4 h），也用作**注入前的年龄
  * 门限**（见 gnss_eph_inject()：星历没过期就注入，过期才丢 EPH 帧）。
  *
@@ -978,6 +1079,30 @@ static int g_eph_last_skip;
 static int g_eph_last_badck;
 static int g_eph_last_bytes;
 static int g_eph_last_stale;  /* 因文件超龄丢掉的 EPH 帧，见 gnss_eph_inject() */
+
+/**
+ * @brief 最近一次"真的写出了一帧星历"的单调时刻（ms；0 = 从未）。
+ *
+ * @note 用户 2026-09-27：状态栏据此让**卫星图标黄灯闪烁**（判据：年龄 < 3 s）。
+ *       选"逐帧打点 + 短窗口"而不是"进入/退出标志"：注入函数里所有早退都走 `goto done`，
+ *       用标志就得在每个出口清、漏一个就一直闪；用帧时间戳则天然自愈（没有帧就不闪）。
+ */
+static volatile uint32_t g_eph_frame_ms;
+
+/**
+ * @brief 是否正在"星历下发"（最近 3 s 内真的写出去过帧）。
+ */
+bool myvendor_gnss_eph_active(void)
+{
+  const uint32_t now = (uint32_t)TICK2MSEC(clock_systime_ticks());
+
+  if (g_eph_frame_ms == 0u)
+    {
+      return false;
+    }
+
+  return (now - g_eph_frame_ms) < 3000u;
+}
 static uint32_t g_eph_last_cost_ms;
 /** 上次注入是否因 LittleFS 被占（BLE/MTP 正在写）而整段跳过。 */
 static bool g_eph_last_busy;
@@ -1237,12 +1362,22 @@ static void gnss_diag_why(const char *why, uint32_t extra)
                   }
               }
 
+            /* `self` / `blink` 是**给下一次复现准备的指纹**（2026-09-21 加）：
+             * 现场已两次读到"st=RUNNING 但不在就绪链上"（`on_rdy=0`），
+             * 而全树只有 6 处写 `TSTATE_TASK_RUNNING`、每一处都在把线程**放进**
+             * 链表的那一段里 ⇒ 说明它是**先被挂上、之后又被摘下来**的。
+             * 摘链是谁干的：`dq_rem()` 会把 flink/blink 都清成 NULL
+             * （对照：本板 wdog 表那次损坏现场也是 `00000000 00000000` 形状）；
+             * 只把 flink 指向自己则是另一种（自环）；两项都原样指向邻居则说明
+             * 它**还在某条链上**（那 on_rdy=0 就得另找解释）。
+             * 所以这三个指针一起看，才能把"从未挂上 / 被摘掉 / 还在别的链上"分开。 */
             syslog(LOG_WARNING,
-                   "gnss: diag tcb pid=%d st=%u lock=%d wait=%p wd=%u on_rdy=%d flink=%p\n",
-                   (int)tcb->pid, (unsigned)tcb->task_state,
+                   "gnss: diag tcb pid=%d self=%p st=%u lock=%d wait=%p wd=%u "
+                   "on_rdy=%d flink=%p blink=%p\n",
+                   (int)tcb->pid, (void *)tcb, (unsigned)tcb->task_state,
                    (int)tcb->lockcount, (void *)tcb->waitobj,
                    WDOG_ISACTIVE(&tcb->waitdog) ? 1u : 0u,
-                   on_rdy, (void *)tcb->flink);
+                   on_rdy, (void *)tcb->flink, (void *)tcb->blink);
           }
         else
           {
@@ -1679,12 +1814,12 @@ static void gnss_enable_zda(int fd)
   frame[9] = cka;
   frame[10] = ckb;
   {
-    ssize_t wr = write(fd, frame, sizeof(frame));
+    /* 发送也走板级直连（同一个 USART2 HAL 句柄，阻塞发小帧）。 */
+    int wr = myvendor_gnss_uart_write(frame, sizeof(frame));
 
-    if (wr != (ssize_t)sizeof(frame)) {
+    if (wr != 0) {
       gnss_link_add(&g_link.wr_fail);
-      syslog(LOG_WARNING, "gnss: zda enable wr=%d errno=%d\n",
-             (int)wr, errno);
+      syslog(LOG_WARNING, "gnss: zda enable wr=%d\n", wr);
     }
   }
 }
@@ -1700,7 +1835,22 @@ static void gnss_cfg_dump_signal(int fd);
 
 static int gnss_open(void)
 {
-  return open(CONFIG_BOARD_L96_GNSS_DEVPATH, O_RDWR | O_NONBLOCK);
+  int fd = open(CONFIG_BOARD_L96_GNSS_DEVPATH, O_RDWR | O_NONBLOCK);
+
+  if (fd < 0) {
+    return fd;
+  }
+
+  /** **UART 的"上电"仍由这次 open 完成**，但数据面从此走板级直连
+   *  （`myvendor_gnss_uart.c`）：驱动在这次 open 里做 HAL init + DMA 环形 +
+   *  IDLE 中断，并把收到的字节同时喂给板级环形（见 `sifli_uart_rx_put()` 的钩子）；
+   *  本服务**不再 poll、不再 read 这个 fd** —— 于是没有 pollfd 注册、
+   *  没有 tick 驱动的 poll 超时、没有 recv.lock 等待（n587/n588/n590 那族消失）。 */
+  if (myvendor_gnss_uart_start() != 0) {
+    syslog(LOG_WARNING, "gnss: uart direct start failed\n");
+  }
+
+  return fd;
 }
 
 static void gnss_link_reset(void)
@@ -1730,6 +1880,8 @@ static void gnss_fd_release(int *fd)
       g_uart_fd = -1;
     }
 
+    /* 先停直连数据面（读者会被唤醒并看到 0 字节），再关 fd（那会 uart_reset_sem）。 */
+    myvendor_gnss_uart_stop();
     close(*fd);
     *fd = -1;
   }
@@ -1774,13 +1926,9 @@ static void gnss_flush_host_rx(int fd)
     return;
   }
 
-  /* 切 VCC 时 USART2 仍 open，丢掉断电期间浮空 RX 攒下的字节。 */
-  while (loops++ < 32) {
-    n = (int)read(fd, dump, sizeof(dump));
-    if (n <= 0) {
-      break;
-    }
-  }
+  /* 切 VCC 时 USART2 仍 open，丢掉断电期间浮空 RX 攒下的字节。
+   * 直连数据面之后这一步是**原子**的：直接把环形读游标追平写游标。 */
+  myvendor_gnss_uart_flush();
 }
 
 static void gnss_reconfig_after_vcc(int fd, bool cycle)
@@ -1945,26 +2093,58 @@ static void gnss_snapshot_dead(void)
  *          diag kick 一定能把线程从 `nxsem_tickwait()` 里打断。
  *          见 docs/gnss_ble_diag_log.md §2.2 / §2.5。
  */
+/** @brief 周期报表用：**解析/链路侧**的计数（`ctl cnt gnss` 的第二行）。
+ *
+ *  为什么必须单列一条：`reader gap` 只说明"读得慢"，**分不出"没收到"还是
+ *  "收到但没解析出来"**。这两组计数一起看就分得开：
+ *    · `rd`/`byte` 不涨                ⇒ 根本没读到（模组/中断侧没数据）；
+ *    · `byte` 涨而 `nmea`/`ubx` 不涨 且 `bad`/`junk` 涨 ⇒ 收到了但**校验/解析异常**；
+ *    · `nmea`/`ubx`/`pvt` 正常涨       ⇒ 链路与解析都好，问题只在那几秒的节奏。
+ *  注：这些是"本开机累计"的 uint16（**到 0xffff 会饱和**），相邻两条相减就是增量；
+ *  真要看窗口值请用 `ctl gnss`（那里有 win_* 一套）。
+ */
+void myvendor_gnss_link_cnt_report(void)
+{
+  /* 周期报表 = INFO（信息级）；异常另有 ERROR 直报，不受 `ctl cnt` 开关影响。 */
+  syslog(LOG_INFO,
+         "gnss: cnt link rd=%u byte=%u nmea=%u bad=%u ubx=%u pvt=%u junk=%u "
+         "pub=%u wr_fail=%u gap_max=%u\n",
+         (unsigned)g_link.rd, (unsigned)g_link.byte, (unsigned)g_link.nmea,
+         (unsigned)g_link.nmea_bad, (unsigned)g_link.ubx, (unsigned)g_link.pvt,
+         (unsigned)g_link.junk, (unsigned)g_link.pub,
+         (unsigned)g_link.wr_fail, (unsigned)g_rd_gap_max_ms);
+}
+
+/** @brief 读路径已切到**板级直连数据面**（2026-09-24，`myvendor_gnss_uart.c`）。
+ *
+ *  运行期的"走的哪个驱动"由模块自己打：`gnss_uart: DRIVER=direct start(…)`
+ *  / `first-data` / `tick …`（带 rx/feed/drop/wait/eintr/tx 计数），而旧的
+ *  `gnss: DRIVER=poll …` 那一行**从此不再出现** —— 新旧成对可辨。
+ *
+ *  于是本函数本体不再有：pollfd 注册、`fds->arg` 指向已释放内存、tick 驱动的
+ *  poll 超时（n587/n588/n590 那族的三个必要条件一起消失）。 */
 static int gnss_read_some(int fd, char *buf, int max, int timeout_ms)
 {
   ssize_t n;
   int pr;
+  bool read_inline = false;
 
   if (buf == NULL || max <= 0) {
     return 0;
   }
 
-  if (timeout_ms <= 0 || timeout_ms > 1000) {
+  /* timeout_ms < 0 ⇒ 主读循环的"一直等"；>= 0 ⇒ 有界等待（旧的 poll 超时语义）。
+   * 负数不能被下面的钳位吞掉，所以先放行它。 */
+  if (timeout_ms >= 0 && (timeout_ms == 0 || timeout_ms > 1000)) {
     timeout_ms = 200;
   }
 
-  /* 静态 pollfd：TX 完成通知若赶上 teardown，也不会把 cb 读成栈上的 UBX key。 */
+  /* （旧的 TLS pollfd 与 poll 注册在这条路上已经不需要了：数据面走
+   *  `myvendor_gnss_uart` 的环形+信号量，不再把任何 pollfd 交给驱动。） */
 
-  memset(&g_uart_pfd, 0, sizeof(g_uart_pfd));
-  g_uart_pfd.fd = fd;
-  g_uart_pfd.events = POLLIN;
-  /* poll 与 read 分开打点：现场那次是"一次循环占 488 s"，光看心跳分不出卡在
-   * poll 本身还是 poll 返回之后的 read（tty 层可能阻塞）。 */
+  /* poll 与 read 分开打点：现场那次是"一次循环占 488 s"，光看心跳分不出卡在等待
+   * 本身还是等待之后的取数。直连之后两者合并，阶段名沿用 `read-poll*` 以免打断
+   * 既有日志对照。 */
   GNSS_PHASE("read-poll");
   /* 阻塞式 poll：线程真正睡在这里，由 UART RX 中断（或超时到点）唤醒。
    *
@@ -1995,7 +2175,65 @@ static int gnss_read_some(int fd, char *buf, int max, int timeout_ms)
 
     g_poll_n++;
     g_poll_enter_ms = t_poll ? t_poll : 1u;
-    pr = poll(&g_uart_pfd, 1, timeout_ms);
+    /** **板级直连数据面：把原来的 `poll()` 换成"等 + 取"一次调用**
+     *  （2026-09-24，`myvendor_gnss_uart.c`）。
+     *
+     *  ISR 把 USART2 收到的字节推环形并 `sem_post`，读者阻塞在这个信号量上；
+     *  diag 的 `SIGUSR1` 踢进来时模块返回 0（它不区分 EINTR），语义与旧的
+     *  "poll 超时、本轮无数据"完全一致 ⇒ 下游记账（`g_link.poll_to`、空读退避、
+     *  silence 判定）本来就不用改。
+     *
+     *  这里**不再注册 pollfd**：驱动侧从此没有指向本线程的注册，
+     *  `uart_datasent()`（TX 完成中断）也就没有回调可打 ——
+     *  n587/n588/n590 那条"陈旧注册 → `nxsem_get_value(已复用成 mutex 的内存)`"
+     *  的链**从缺了必要条件**（下面那段 `pfd->cb = NULL` 的对象仍是我们自己的
+     *  内存、且已不再被 poll 装过，纯属留档）。 */
+    {
+      uint32_t t_read = gnss_now_ms();
+
+      GNSS_PHASE("read-direct");
+      /** 两条语义都要保留（2026-09-24 现场教训）：
+       *    · 主读循环（timeout_ms < 0）→ **阻塞等**（不烧 CPU，靠 diag 的 SIGUSR1
+       *      提供周期记账）；
+       *    · 其它调用点（ACK 等待、`gnss_drain` 收尾）⇒ **有界** —— 它们原先靠
+       *      "poll 超时 + 非阻塞读"在 2 ms~几百 ms 后返回，若在这里改成阻塞等待，
+       *      配置/收尾流程会被拖到下一个字节才动（实测表现为开机后迟迟不定位）。 */
+      if (timeout_ms < 0) {
+        n = (ssize_t)myvendor_gnss_uart_read(buf, (size_t)max);
+      } else {
+        n = (ssize_t)myvendor_gnss_uart_read_timeout(buf, (size_t)max,
+                                                     (uint32_t)timeout_ms);
+      }
+      g_rd_read_ms += gnss_elapsed_ms(gnss_now_ms(), t_read);
+      pr = (n > 0) ? 1 : 0;
+      read_inline = true;
+    }
+
+    /** **poll() 一返回就把回调摘掉**（2026-09-23，修 n587 那条断言）。
+     *
+     *  `nuttx/fs/vfs/fs_poll.c:270 poll_notify()` 遍历驱动侧的注册表时
+     *  **只看 `fds != NULL` 和 `fds->cb != NULL`，不看 `fds->priv`** ——
+     *  也就是说：只要驱动那边还留着一个指向本 pollfd 的注册，之后每一次
+     *  `uart_datasent()`（USART2 **TX 完成中断**）都会回调进来。
+     *
+     *  而 `fs_poll_setup()` 把 `fds->arg` 设成 `poll()` 内部那块
+     *  `fs_heap_malloc` 的等待信号量，**`poll()` 返回时那块就被 free 了**。
+     *  于是"返回之后、下一次注册之前"这个窗口里，任何一次陈旧回调都会拿
+     *  已释放的 `arg` 去 `nxsem_get_value()` —— 那块内存一旦被复用成
+     *  `nxmutex_t`，count 字段带 mutex 位 ⇒
+     *  `DEBUGASSERT(!NXSEM_IS_MUTEX(sem))` ⇒ panic ⇒ 重启。
+     *  （现场两次都停在同一处：`gnss: rt 4 cfg-flush` 之后、`irq=1`。）
+     *
+     *  pollfd 是**我们自己**的内存（本线程一份、不释放），所以这里能单方面
+     *  把 `cb` 清成 NULL：`poll_notify()` 看到 `cb == NULL` 直接跳过，
+     *  陈旧注册就变成空操作。下一次 `poll()` 由 `fs_poll_setup()` 重新装回
+     *  `cb`，正常路径完全不受影响。
+     *
+     *  治的是"回调还能打进来"这个必要条件，不是把断言改成告警 —— 不掩盖问题。 */
+    /* 历史：这里原来清 `pfd->cb`/`pfd->priv`，用来掐断 n587 那条"陈旧 poll 注册
+     * 被 TX 完成中断回调"的链。直连数据面之后**根本不再有 poll 注册**，
+     * 这两行随之删除；上面那段注释留作来龙去脉。 */
+
     g_poll_last_ms = gnss_elapsed_ms(gnss_now_ms(), t_poll);
     g_poll_enter_ms = 0;
 
@@ -2016,6 +2254,7 @@ static int gnss_read_some(int fd, char *buf, int max, int timeout_ms)
    * 触发 harvest。空读才记 poll_to。
    */
   GNSS_PHASE("read-syscall");
+  if (!read_inline)
   {
     /* 自测：read() 自身耗时。这一项若在每窗口里顶起来（比如 5 次调用花掉
      * 上百毫秒），就说明 CPU 是在 uart_read 的 harvest 路径里烧掉的，
@@ -2024,15 +2263,15 @@ static int gnss_read_some(int fd, char *buf, int max, int timeout_ms)
 
     n = read(fd, buf, (size_t)max);
     g_rd_read_ms += gnss_elapsed_ms(gnss_now_ms(), t_read);
-
-    if (n > 0)
-      {
-        /* 真拿到数据：空读退避立刻归零（在唯一一处读数据的地方做，
-         * 所有调用方都覆盖得到）。 */
-        g_rd_empty_run = 0;
-        g_rd_backoff_n = 0;
-      }
   }
+
+  if (n > 0)
+    {
+      /* 真拿到数据：空读退避立刻归零（在唯一一处读数据的地方做，
+       * 所有调用方都覆盖得到）。 */
+      g_rd_empty_run = 0;
+      g_rd_backoff_n = 0;
+    }
 
   GNSS_PHASE("read-done");
   if (n < 0) {
@@ -2116,40 +2355,25 @@ static int gnss_write_all(int fd, const uint8_t *buf, int len)
   uint32_t t0 = gnss_now_ms();
 
   while (off < len) {
-    ssize_t n;
-
     gnss_heartbeat();
     if (g_diag_kick || g_gnss_stop) {
       return -EINTR;
     }
 
-    n = write(fd, buf + off, (size_t)(len - off));
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EINTR) {
-        if (gnss_elapsed_ms(gnss_now_ms(), t0) > 500u) {
-          gnss_link_add(&g_link.wr_fail);
-          syslog(LOG_WARNING, "gnss: uart write timeout off=%d/%d\n",
-                 off, len);
-          return -ETIMEDOUT;
-        }
+    /* 板级直连：一次调用把**剩余全发**（HAL 阻塞发整帧，返回 0 才是全发成功）。
+     * 旧的 EAGAIN/EINTR 重试在这里不再需要 —— 没有 NuttX 发送环、也没有它那把锁。 */
+    {
+      int wr = myvendor_gnss_uart_write(buf + off, (size_t)(len - off));
 
-        gnss_sleep_us(2000);
-        continue;
+      if (wr != 0) {
+        gnss_link_add(&g_link.wr_fail);
+        syslog(LOG_WARNING, "gnss: uart write fail off=%d/%d wr=%d\n",
+               off, len, wr);
+        return wr;
       }
-
-      gnss_link_add(&g_link.wr_fail);
-      syslog(LOG_WARNING, "gnss: uart write %d off=%d/%d\n",
-             errno, off, len);
-      return -errno;
     }
 
-    if (n == 0) {
-      gnss_link_add(&g_link.wr_fail);
-      syslog(LOG_WARNING, "gnss: uart write zero off=%d/%d\n", off, len);
-      return -EIO;
-    }
-
-    off += (int)n;
+    off = len;
     t0 = gnss_now_ms();
   }
 
@@ -3911,6 +4135,55 @@ static const char *gnss_eph_src(void)
  *  认不出来的一律当作"不会过期"，宁可多灌也不误杀；时间/位置辅助帧（id 0x40）
  *  和导航库帧（0x80）本来就不走这个判据。
  */
+/**
+ * @brief 从星历帧里取 `toe`（秒，周内）。
+ *
+ * 三套格式的偏移和单位都不同（这是最容易抄错的一栏）：
+ *   GPS/QZSS-EPH：offset 40，U2，**×16 s**；GAL-EPH：offset 50，U2，**×60 s**；
+ *   BDS-EPH：offset 24，U4，**×8 s**。已逐字段对照 pyubx2 的字段表核实。
+ *
+ * @return 周内秒；不是星历帧或长度不够时返回 -1。
+ */
+static int32_t gnss_ubx_eph_toe_s(uint8_t cls, uint8_t id, uint16_t plen,
+                                  const uint8_t *pl)
+{
+  uint32_t raw;
+
+  if (cls != 0x13u || pl == NULL) {
+    return -1;
+  }
+
+  if (id == 0x00u || id == 0x05u) {          /* MGA-GPS/QZSS-EPH */
+    if (plen < 42u) {
+      return -1;
+    }
+
+    raw = (uint32_t)pl[40] | ((uint32_t)pl[41] << 8);
+    return (int32_t)(raw * 16u);
+  }
+
+  if (id == 0x02u) {                         /* MGA-GAL-EPH */
+    if (plen < 52u) {
+      return -1;
+    }
+
+    raw = (uint32_t)pl[50] | ((uint32_t)pl[51] << 8);
+    return (int32_t)(raw * 60u);
+  }
+
+  if (id == 0x03u) {                         /* MGA-BDS-EPH */
+    if (plen < 28u) {
+      return -1;
+    }
+
+    raw = (uint32_t)pl[24] | ((uint32_t)pl[25] << 8) |
+          ((uint32_t)pl[26] << 16) | ((uint32_t)pl[27] << 24);
+    return (int32_t)(raw * 8u);
+  }
+
+  return -1;
+}
+
 static bool gnss_ubx_is_eph_frame(uint8_t cls, uint8_t id, uint16_t plen,
                                   const uint8_t *pl)
 {
@@ -3986,6 +4259,118 @@ static void gnss_eph_assist_fixup(uint16_t plen, uint8_t *pl, uint32_t age_s)
   }
 }
 
+/* ---- 注入回执（UBX-MGA-ACK）统计 ------------------------------------------
+ *
+ * 为什么要有：`eph done frames=100 badck=0 brk=eof` 只证明**我们把 100 帧完整写出
+ * 去了**，不证明**模组收下了**。模组对每一帧 MGA 都会回 `UBX-MGA-ACK`（0x13/0x60），
+ * 里面的 `infoCode` 才是"收没收"的判据：
+ *
+ *   0 accepted / 1 no-time（要先发 MGA-INI-TIME）/ 2 type-not-supported /
+ *   3 size-mismatch / 4 database-store-failed / 5 not-ready / 6 unknown-type
+ *
+ * 注入循环原来每帧前 `gnss_drain()`，把这些回执连同 NMEA 一起读掉丢了 —— 所以
+ * "模组到底收下了哪些帧"这件事从上线起就没被观测过。
+ *
+ * 起因：2026-09-27 用倒库做字节搜索，发现灌进去的 GAL/BDS 参数能在模组导航库里
+ * 找到（30/30、32/32），**GPS/QZSS 一条都找不到（0/31、0/5）**，而且在"注入后 5 秒
+ * 就倒库、没有覆盖时间"的条件下稳定复现；同时两个独立来源（pyubx2 字段表、
+ * ubx-mga 参考实现）都证实 App 的四个星座打包偏移无误，LNAV 子帧流也不存在。
+ * 剩下的唯一判据就是这些 infoCode。
+ * ------------------------------------------------------------------------- */
+#define GNSS_ACK_INFO_ACCEPTED 0u
+#define GNSS_ACK_KIND_MAX      8u
+
+/** `pl[0]`：1 = UBX-MGA-ACK-DATA0（受理），0 = UBX-MGA-NAK-DATA0（不受理）。
+ *  两者**字段布局相同**（type/version/infoCode/msgId/payloadStart），所以只有这一个
+ *  字节能区分"模组答复是 ACK 还是 NAK"——不记它就没法解释 infoCode 的来源。 */
+#define GNSS_ACK_TYPE_ACK      1u
+
+static uint16_t g_eph_ack_ok[GNSS_ACK_KIND_MAX];
+static uint16_t g_eph_ack_bad[GNSS_ACK_KIND_MAX];
+static uint8_t  g_eph_ack_last[GNSS_ACK_KIND_MAX];
+static uint8_t  g_eph_ack_last_type[GNSS_ACK_KIND_MAX];
+static uint16_t g_eph_ack_other;
+
+static void gnss_eph_ack_note(uint8_t ack_type, uint8_t msg_id, uint8_t code)
+{
+  if (msg_id >= GNSS_ACK_KIND_MAX) {
+    g_eph_ack_other++;
+    return;
+  }
+
+  if (ack_type == GNSS_ACK_TYPE_ACK && code == GNSS_ACK_INFO_ACCEPTED) {
+    g_eph_ack_ok[msg_id]++;
+  } else {
+    g_eph_ack_bad[msg_id]++;
+    g_eph_ack_last[msg_id] = code;
+    g_eph_ack_last_type[msg_id] = ack_type;
+  }
+}
+
+/**
+ * @brief 读掉待收字节，顺手统计 MGA-ACK。
+ *
+ * 取代注入循环里原来的 `gnss_drain()`：一样起"清空待收"的作用，但不再把最重要的
+ * 回执一起丢掉。读到没有完整帧为止（每轮最多等 ms 毫秒）。
+ */
+static void gnss_eph_ack_sweep(int fd, int rounds, int ms)
+{
+  int i;
+
+  for (i = 0; i < rounds; i++) {
+    uint8_t cls = 0;
+    uint8_t id = 0;
+    uint16_t plen = 0;
+
+    if (gnss_ubx_read_frame(fd, &cls, &id, &plen, ms) <= 0) {
+      break;
+    }
+
+    /* MGA-ACK/NAK-DATA0 载荷：type(0) version(1) infoCode(2) msgId(3) payloadStart(4..7) */
+    if (cls == 0x13u && id == 0x60u && plen >= 8u) {
+      gnss_eph_ack_note(s_ubx_pl[0], s_ubx_pl[3], s_ubx_pl[2]);
+    }
+  }
+}
+
+static void gnss_eph_ack_reset(void)
+{
+  memset(g_eph_ack_ok, 0, sizeof(g_eph_ack_ok));
+  memset(g_eph_ack_bad, 0, sizeof(g_eph_ack_bad));
+  memset(g_eph_ack_last, 0, sizeof(g_eph_ack_last));
+  memset(g_eph_ack_last_type, 0, sizeof(g_eph_ack_last_type));
+  g_eph_ack_other = 0;
+}
+
+static void gnss_eph_ack_report(void)
+{
+  syslog(LOG_WARNING,
+         "gnss: mga ack gps=%u/%u qzss=%u/%u gal=%u/%u bds=%u/%u other=%u "
+         "(ok/bad)\n",
+         (unsigned)g_eph_ack_ok[0x00], (unsigned)g_eph_ack_bad[0x00],
+         (unsigned)g_eph_ack_ok[0x05], (unsigned)g_eph_ack_bad[0x05],
+         (unsigned)g_eph_ack_ok[0x02], (unsigned)g_eph_ack_bad[0x02],
+         (unsigned)g_eph_ack_ok[0x03], (unsigned)g_eph_ack_bad[0x03],
+         (unsigned)g_eph_ack_other);
+
+  if (g_eph_ack_bad[0x00] != 0u || g_eph_ack_bad[0x05] != 0u ||
+      g_eph_ack_bad[0x02] != 0u || g_eph_ack_bad[0x03] != 0u) {
+    /* 每个星座打**最后一个被拒的** (type/infoCode)：
+     *   type：1 = ACK-DATA0，0 = NAK-DATA0
+     *   infoCode：1 no-time / 2 type-unsupported / 3 size-mismatch /
+     *             4 database-store-failed / 5 not-ready / 6 unknown-type
+     * 另外注意：ACK 覆盖不全（实测 154 帧 DBD 只回 40 个、98 帧星历回 92 个），
+     * 且 INI（时间/位置）帧**完全不回执** ⇒ 别拿这里的计数当帧数。 */
+    syslog(LOG_WARNING,
+           "gnss: mga ack rejected gps=%u/%u qzss=%u/%u gal=%u/%u bds=%u/%u "
+           "(type/info)\n",
+           (unsigned)g_eph_ack_last_type[0x00], (unsigned)g_eph_ack_last[0x00],
+           (unsigned)g_eph_ack_last_type[0x05], (unsigned)g_eph_ack_last[0x05],
+           (unsigned)g_eph_ack_last_type[0x02], (unsigned)g_eph_ack_last[0x02],
+           (unsigned)g_eph_ack_last_type[0x03], (unsigned)g_eph_ack_last[0x03]);
+  }
+}
+
 static void gnss_eph_inject(int uartfd)
 {
   /* 真有灌注在跑（不管谁触发的）就说明"需要星历"这件事已经满足了。 */
@@ -4007,6 +4392,8 @@ static void gnss_eph_inject(int uartfd)
   bool dbd = false;
   bool eph_stale = false;
   bool drop_ini_time = false;
+  bool toe_checked = false;   /* 帧内 toe ↔ 文件名 的一致性只查第一帧星历 */
+  uint32_t tow_doc = 0;       /* 文件名里的 UTC 换算成 GPS 周内秒 */
   uint32_t assist_age_s = GNSS_EPH_ASSIST_AGE_MAX;
 
   /* 诊断：注入取证。这些变量只被 syslog 读取，不影响注入行为。 */
@@ -4032,6 +4419,8 @@ static void gnss_eph_inject(int uartfd)
 
   /* 每次注入重新计。早退（mtp busy / 无文件）时保持 0，调用方据此不会误判。 */
   g_eph_last_stale = 0;
+  /* 回执统计同样每次注入重开（见 gnss_eph_ack_report 的说明）。 */
+  gnss_eph_ack_reset();
 
 #ifdef CONFIG_MYVENDOR_MTP_SIMPLE
   if (myvendor_mtp_lfs_quiesce()) {
@@ -4157,6 +4546,12 @@ static void gnss_eph_inject(int uartfd)
     if (now_t >= (time_t)GNSS_TIME_MIN_UNIX &&
         now_t <= (time_t)0xffffffffu) {
       now_s = (uint32_t)now_t;
+    }
+
+    if (utc >= (uint32_t)GNSS_TIME_MIN_UNIX) {
+      /* 文件名 → GPS 周内秒（下面"帧内 toe 互校"要用）。**从 GPS 历元起算**。 */
+      tow_doc = (uint32_t)(((uint64_t)utc + GNSS_LEAP_SEC - GNSS_GPS_EPOCH_SEC)
+                           % 604800u);
     }
 
     if (utc >= (uint32_t)GNSS_TIME_MIN_UNIX && now_s != 0) {
@@ -4324,7 +4719,40 @@ static void gnss_eph_inject(int uartfd)
       continue;
     }
 
-    gnss_drain(uartfd);
+    /* 一次性闸门：拿**帧内 toe** 和**文件名里的 UTC** 互校（只查第一帧星历）。
+     *
+     * 为什么不能只看文件名：`eph age` 用的就是文件名/mtime，所以"旧内容配新名字"
+     * —— App 用了缓存的旧星历、手机时钟错、下到的 BRDC 不是当天 —— 能整份通过年龄
+     * 门限。帧内 toe 才是数据自己的时间。判据取 2 h：toe 本来就在 2 h 网格上，
+     * 生成时刻离最近网格点最多 1 h，留一倍余量。 */
+    if (!toe_checked && tow_doc != 0u) {
+      int32_t toe_s = gnss_ubx_eph_toe_s(cls, id, plen, s_ubx_pl);
+
+      if (toe_s >= 0) {
+        int32_t d = (int32_t)((int64_t)tow_doc - (int64_t)toe_s);
+
+        toe_checked = true;
+        if (d > 302400) {
+          d -= 604800;
+        } else if (d < -302400) {
+          d += 604800;
+        }
+
+        if (d < 0) {
+          d = -d;
+        }
+
+        if (d > 7200) {
+          syslog(LOG_WARNING,
+                 "gnss: eph toe mismatch %s: name_tow=%lu toe=%ld diff=%ld s "
+                 "(内容与文件名的时间不符 —— 旧星历配了新名字？)\n",
+                 path, (unsigned long)tow_doc, (long)toe_s, (long)d);
+        }
+      }
+    }
+
+    /* 清空待收 + 收走上一帧的回执（原来是 gnss_drain，把回执一起丢了）。 */
+    gnss_eph_ack_sweep(uartfd, 64, 2);
     if (dbd) {
       if (gnss_ubx_send_pl(uartfd, cls, id, plen) < 0) {
         brk = "send-dbd-fail";
@@ -4342,6 +4770,12 @@ static void gnss_eph_inject(int uartfd)
     }
 
     frames++;
+    /* 星历下发的"正在发生"标记（状态栏卫星图标黄闪用）：**逐帧**打点，见 g_eph_frame_ms。 */
+    g_eph_frame_ms = (uint32_t)TICK2MSEC(clock_systime_ticks());
+    if (g_eph_frame_ms == 0u)
+      {
+        g_eph_frame_ms = 1u;
+      }
 #ifdef CONFIG_MYVENDOR_GNSS_LOG
     if ((frames % 50) == 0) {
       GNSS_LOG("eph inject %d %s frames %s",
@@ -4363,8 +4797,11 @@ static void gnss_eph_inject(int uartfd)
   }
 
   close(fd);
+  /* 收尾再扫一次：最后一帧的回执往往在循环退出之后才到。 */
   gnss_sleep_ms(20);
+  gnss_eph_ack_sweep(uartfd, 32, 20);
   gnss_drain(uartfd);
+  gnss_eph_ack_report();
   syslog(LOG_INFO, "gnss: injected %d %s frames from %s\n",
          frames, dbd ? "DBD" : "MGA", path);
 
@@ -5294,7 +5731,8 @@ static void *gnss_thread(void *arg)
   uint8_t pvt_pay[GNSS_PVT_LEN];   /* 只给 PVT 解码/入库用（见 rx_st==4） */
   size_t cnt = 0;
   bool discard = false;
-  int fd = -1;
+  /* restart 路径会留下仍 open 的 USART2（避免 uart_reset_sem）；继承它。 */
+  int fd = g_uart_fd;
   int rxn = 0;
   int rxi = 0;
   uint8_t rx_st = 0;
@@ -5311,7 +5749,10 @@ static void *gnss_thread(void *arg)
   uint32_t first_fix_ms = 0;
   bool pkt_open = false;
 
+  /* pollfd 现在是**按线程**取的（`gnss_uart_pfd()`），不再需要用参数传槽号；
+   * 线程身份本身就把 pollfd 隔离开了，也就没有"两个读者共用一份"这件事。 */
   (void)arg;
+
   memset(&acc, 0, sizeof(acc));
   g_boot_ms = gnss_now_ms();
   last_nmea_ms = g_boot_ms;
@@ -5501,7 +5942,81 @@ static void *gnss_thread(void *arg)
       break;
     }
 
-    /* USART2 对齐 NSH：先 open，之后一直 poll。低功耗只切模组 VCC。 */
+    /** ── 电源 / 串口时序：**PX4 式 open / close**（2026-09-23 改）────────────
+     *
+     *  原做法是"先 open，之后一直 poll；低功耗只切模组 VCC"：休眠时把 fd
+     *  **抱着**、让读线程继续 `poll()` 一个**已经断电的 UART**，指望唤醒后那个
+     *  poll 自己回来。现场（`202609231720` / `202609231852`）就是它不回来：
+     *  `phase=read-poll`、`in_poll=106835 ms`、`shutdown_n=0`（整个上电周期
+     *  **一次 close 都没发生过**），线程被"计时基准坏掉后不再到期的 poll"钉死
+     *  ⇒ 心跳停 ⇒ 判僵尸 ⇒ 只能重启救。
+     *
+     *  改成 PX4 的 GPS 时序：**一个线程拥有 fd；要停就先退出读循环、再 close；
+     *  要开就重新 open**。close 只发生在**循环边界**（这一刻没有 poll 在途），
+     *  所以不会撞上 `uart_close()` 最后一次 close 干的那三件事
+     *  （`uart_detach` 摘中断 / `uart_shutdown` 关 UART / `uart_reset_sem`
+     *  reset `recv.lock`）—— 那正是 `gnss_fd_release()` 注释里
+     *  "运行中 close 会把 recv.lock 搞坏"所禁的情形，**循环边界的 close
+     *  不在此列**（PX4 也是这么做的）。
+     *
+     *  顺序：**先停读 → 再 close → 最后断电**；唤醒反过来
+     *  **先上电 → 稳定 → 再 open**（由下面 `fd < 0` 那一段落，保持单一入口）。
+     */
+    if (g_idle_sleep) {
+      if (fd >= 0) {
+        gnss_module_park();       /* 断 VCC + 释放 pin（不动 fd） */
+        gnss_fd_release(&fd);     /* ← 循环边界 close：此刻没有 poll 在途 */
+        g_idle_parked = true;
+        /* **不清 g_eph_injected**：模块有备份电源，park 只关 VCC、不丢星历，
+         * 唤醒后没必要重灌（重灌 = 读 9.8 KB LFS + 106 帧 UBX，而且正好打断
+         * 它刚开始的定位）。真要重灌由"换了源文件"或"模块时间不正常"触发。 */
+        g_eph_wake_defer_ms = gnss_now_ms();
+        /* park 是自家窗口：唤醒后那条 `reader gap N s` 不该当告警
+         * （不灌星历的那次没人设这个标记，于是它按丢字节报了）。 */
+        g_rd_selfblock_ms = gnss_now_ms();
+        syslog(LOG_INFO, "gnss: idle sleep, " GNSS_MOD_PN
+               " VCC off PA43, fd closed (PX4-style open/close)\n");
+      }
+
+      /* 已断电、fd 已关：**只等唤醒，不碰串口、不 poll**。
+       * 这里必须真睡一下 —— 主循环是"一轮一个字节"的紧循环，不睡会空转烧满 CPU。 */
+      gnss_sleep_ms(GNSS_IDLE_NAP_MS);
+
+      /** **休眠期照样喂心跳。**
+       *
+       *  diag 的 kick 判据是"进度源（= 本心跳）多久没动"（`myvendor_diag.c`
+       *  的 `kick = !moved && !held && age >= stall_ms`）。休眠时读线程**按设计
+       *  什么都不做**，心跳自然不动 ⇒ 每 2 s 被 kick 一次（现场 `202609231911`
+       *  三轮休眠里 `kick gnss-reader` 5 次）。而 kick 会把 `g_diag_kick` 置上，
+       *  唤醒后立刻被消费成一次**多余的 VCC recover**（`PX4-style open` 计数多出来
+       *  的那几次），等于每次唤醒都白穿插一个 3.5 s 的断电重来，正好打断模块
+       *  刚恢复的定位。
+       *
+       *  走 `myvendor_diag_watch_hold()` 那条路不行：它的上限是
+       *  `DIAG_WATCH_HOLD_MAX_MS`（10 s），长睡必然过期。而心跳的语义本来就是
+       *  "这个线程在正常运转"——休眠是它**该做**的事，所以这里喂心跳不是掩盖，
+       *  是把"活着且在睡"如实报给 diag。 */
+      gnss_heartbeat();
+      continue;
+    }
+
+    if (g_idle_parked) {
+      unsigned on_ms = (unsigned)CONFIG_BOARD_L96_GNSS_PWR_DELAY_MS;
+
+      g_idle_parked = false;
+      syslog(LOG_INFO, "gnss: idle wake, " GNSS_MOD_PN
+             " VCC on PA43 (settle %u ms, then open)\n", on_ms);
+      GNSS_LOG("idle wake hold=%d eph_inj=%d fails=%u fd=%d",
+               g_wake_hold_ms != 0 ? 1 : 0,
+               g_eph_injected ? 1 : 0,
+               (unsigned)g_uart_fails, fd);
+      sf32lb52_l96_uart_pins();
+      (void)sf32lb52_l96_power(true);
+      gnss_sleep_ms(on_ms);
+      g_mod_pwr = true;
+      /* 不在这里 open：落到下面的 `fd < 0` 路径开，保持单一入口。 */
+    }
+
     if (fd < 0) {
       bool cycle = false;
 
@@ -5511,17 +6026,13 @@ static void *gnss_thread(void *arg)
        * 稳定时间就不够了。两个出口各自 release（见下面两处）。 */
       myvendor_diag_watch_hold(pthread_self(), true);
 
-      if (g_idle_sleep) {
-        sf32lb52_l96_uart_pins();
+      cycle = (g_uart_fails >= GNSS_PWR_FAILS);
+      gnss_module_ensure();
+      if (cycle) {
+        gnss_module_power_cycle();
+        g_uart_fails = 0;
       } else {
-        cycle = (g_uart_fails >= GNSS_PWR_FAILS);
-        gnss_module_ensure();
-        if (cycle) {
-          gnss_module_power_cycle();
-          g_uart_fails = 0;
-        } else {
-          sf32lb52_l96_uart_pins();
-        }
+        sf32lb52_l96_uart_pins();
       }
 
       fd = gnss_open();
@@ -5538,55 +6049,12 @@ static void *gnss_thread(void *arg)
 
       myvendor_diag_watch_hold(pthread_self(), false);    /* 出口二：串口已开 */
       gnss_rt_mark("uart-open");
-      if (g_idle_sleep) {
-        gnss_module_park();
-        /* **不清 g_eph_injected**：模块有备份电源，park 只关 VCC、不丢星历，
-         * 唤醒后没必要重灌（重灌 = 读 9.8 KB LFS + 106 帧 UBX，而且正好打断
-         * 它刚开始的定位）。真要重灌由"换了源文件"或"模块时间不正常"触发。 */
-        g_eph_wake_defer_ms = gnss_now_ms();
-        /* park 是自家窗口：唤醒后那条 `reader gap N s` 不该当告警
-         * （不灌星历的那次没人设这个标记，于是它按丢字节报了）。 */
-        g_rd_selfblock_ms = gnss_now_ms();
-        g_idle_parked = true;
-      } else {
-        gnss_reconfig_after_vcc(fd, cycle);
-      }
+      gnss_reconfig_after_vcc(fd, cycle);
 
-      syslog(LOG_INFO, "gnss: open %s @ %d%s (" GNSS_MOD_PN ", UART hold)\n",
+      syslog(LOG_INFO, "gnss: open %s @ %d%s (" GNSS_MOD_PN
+             ", PX4-style open/close)\n",
              CONFIG_BOARD_L96_GNSS_DEVPATH, CONFIG_BOARD_L96_GNSS_BAUD,
-             g_idle_parked ? " idle" : (cycle ? " (pwr)" : ""));
-      goto rx_fresh;
-    }
-
-    if (g_idle_sleep) {
-      if (!g_idle_parked) {
-        GNSS_LOG("idle sleep park fd=%d silent=%u eph=%d",
-                 fd, (unsigned)gnss_elapsed_ms(gnss_now_ms(), g_nmea_life_ms),
-                 g_eph_busy ? 1 : 0);
-        gnss_module_park();
-        /* 同上一处：park 不清闩锁 —— 模块的备份电源保着星历。 */
-        g_eph_wake_defer_ms = gnss_now_ms();
-        g_rd_selfblock_ms = gnss_now_ms();
-        g_idle_parked = true;
-        syslog(LOG_INFO, "gnss: idle sleep, " GNSS_MOD_PN
-               " VCC off PA43 (USART2 hold like NSH)\n");
-        goto rx_fresh;
-      }
-    } else if (g_idle_parked) {
-      unsigned on_ms = (unsigned)CONFIG_BOARD_L96_GNSS_PWR_DELAY_MS;
-
-      g_idle_parked = false;
-      syslog(LOG_INFO, "gnss: idle wake, " GNSS_MOD_PN
-             " VCC on PA43 (settle %u ms, USART2 hold)\n", on_ms);
-      GNSS_LOG("idle wake hold=%d eph_inj=%d fails=%u fd=%d",
-               g_wake_hold_ms != 0 ? 1 : 0,
-               g_eph_injected ? 1 : 0,
-               (unsigned)g_uart_fails, fd);
-      sf32lb52_l96_uart_pins();
-      (void)sf32lb52_l96_power(true);
-      gnss_sleep_ms(on_ms);
-      g_mod_pwr = true;
-      gnss_reconfig_after_vcc(fd, false);
+             cycle ? " (pwr)" : "");
       goto rx_fresh;
     }
 
@@ -5709,7 +6177,8 @@ rx_run:
 
     if (rxi >= rxn) {
       GNSS_PHASE("uart-read");
-      rc = gnss_read_some(fd, rx, GNSS_RX_BATCH, 200);
+      /* 主读循环：-1 = 一直等（有数据才返回；周期记账由 diag 的 SIGUSR1 提供）。 */
+      rc = gnss_read_some(fd, rx, GNSS_RX_BATCH, -1);
       if (rc < 0) {
         if (g_idle_parked) {
           GNSS_LOG("idle uart read %d errno=%d (USART2 hold)", rc, errno);
@@ -5739,6 +6208,21 @@ rx_run:
          * 所以档位是 0/10/20/40/80 ms，最多给 NMEA 突发加约 80 ms 延迟 ——
          * 相对 1 Hz 的报文周期可以接受，而 CPU 从 ~15% 掉到 ~1%。
          * 驱动侧的真正修法（让 poll 与 read 一致）是另一件事，这里先止血。 */
+        /* 空转期间必须给看门狗一个"驱动还活着"的信号。
+         *
+         * 退避用的是 usleep()，而 poll 超时与 usleep **都走 tick** —— 计时基准一被打断
+         * （本平台已多次记录），两者会一起退化成"立刻返回"，这里就成了上面说的那种
+         * ~1.4 kHz 紧自旋（现场 `poll_n=26267 in_poll=19198 ms`）。
+         * 读线程 pri=50：高于 IDLE(0) ⇒ 饿死 idle 心跳；低于 UI(100) ⇒ UI 照常 pet；
+         * 而这条路径原先一个 pet 都不发 ⇒ work 心跳一起停。于是 `wdt_should_feed()`
+         * 的 `cpu_ok` 恒假、喂狗被否决、15 s 后硬件复位 —— n576/n577/n578 那三份
+         * `kind=wdt` 就是这个签名（idle 10.6~12.1 s、work 10.6~11.8 s、ui 10~40 ms、cfsr=0）。
+         *
+         * 所以这里补上 work_beat，**不是放宽喂狗条件**：work_beat 的语义正是"某驱动在
+         * 忙等但系统还活着"（同文件 dbd 导出循环就是这么写的）。整机真卡死时没人 pet，
+         * 照样复位；读线程自己另有 diag 的 `stall=1500 ms` 看门狗负责重启。 */
+        myvendor_watchdog_work_beat();
+
         if (g_rd_empty_run < UINT32_MAX) {
           g_rd_empty_run++;
         }
@@ -5805,9 +6289,32 @@ rx_run:
             }
 
             if (!self) {
+              /* 报**实际生效**的那个环与它的丢字节计数（2026-09-24 更正）。
+               *
+               * 原先这条打的是 `rx buf %u B` = `CONFIG_UART_BUFSZ`(1536) + 硬编码
+               * `~800 B/s` —— 那是**旧 NuttX 串口环**的常量；数据面切到
+               * `myvendor_gnss_uart` 的 8 KB 直连环之后，1536 与它一点关系都没有，
+               * 反而会让人以为"GNSS 缓存不够"（现场就这么被误导过一次）。
+               * 判"丢没丢字节"只看 `drop`：它 >0 会另有 ERROR 直报。
+               *
+               * 再加两个**自上次报以来的增量**（`rx+/feed+`）—— 下一次出现时
+               * 它能直接指认是哪一侧静默：
+               *   · `feed+0`（ISR 一次都没喂）⇒ **模组/中断侧**没数据（RF 或模组忙）；
+               *   · `feed+N` 而 `rx+0`  ⇒ 数据进来了、读者没用上 ⇒ 主机侧交接问题。
+               * 两种原因的修法完全不同，先分叉再动手。 */
+              static uint32_t s_gap_rx_seen;
+              static uint32_t s_gap_feed_seen;
+              struct myvendor_gnss_uart_stats st;
+
+              myvendor_gnss_uart_stats(&st);
               syslog(LOG_WARNING,
-                   "gnss: reader gap %u ms (rx buf %u B, ~%u B/s)\n",
-                   (unsigned)gap, (unsigned)CONFIG_UART_BUFSZ, 800u);
+                   "gnss: reader gap %u ms (direct ring %u B, drop=%lu wait=%lu, since-last rx+%lu feed+%lu)\n",
+                   (unsigned)gap, (unsigned)MYVENDOR_GNSS_UART_RING,
+                   (unsigned long)st.rx_drop, (unsigned long)st.wait_n,
+                   (unsigned long)(st.rx_bytes - s_gap_rx_seen),
+                   (unsigned long)(st.feed_n - s_gap_feed_seen));
+              s_gap_rx_seen = st.rx_bytes;
+              s_gap_feed_seen = st.feed_n;
             } else if (!g_rd_selfblock_logged) {
               /* 只报一次（开机后第一条）：确认"是自家窗口"这件事，同时把第一次
                * 被吞掉的间隔数字留下来，免得后面没人知道它有多长。 */
@@ -6212,23 +6719,135 @@ static bool gnss_reader_stranded(pid_t pid)
       return false;
     }
 
+  /* 与 `gnss_reader_lost()` 同口径：整段在 `sched_lock()` 里做 —— 既让遍历到
+   * 的就绪链是稳定快照，也保证"判完到调用方动手"之间没人把它挂回去。 */
+  sched_lock();
   tcb = nxsched_get_tcb(pid);   /* 必须与 put 成对 */
   if (tcb == NULL)
     {
+      sched_unlock();
       return false;
     }
 
-  if (tcb->task_state == TSTATE_TASK_RUNNING && tcb->waitobj == NULL &&
+  /** ⚠ 2026-09-23 `st=2` 这第三种形态：**状态标 READYTORUN、却不在就绪链上**。
+   *
+   *  原来这里（以及 `gnss_reader_lost()`）只认 `st == TSTATE_TASK_RUNNING`，
+   *  于是这种 reader 两个判据都不认 ⇒ reap 走 `reader not exited` 直接
+   *  `-EBUSY`（**不 release zombie**）⇒ spawn 永远被 `stack_busy=1` 拒
+   *  ⇒ `gnss_reader_lost()` 那条回收**根本到不了** ⇒ GNSS 死到重启。
+   *
+   *  现场（固件 `202609231852`，uptime 370→540 s）：静止休眠把模块电关掉、
+   *  唤醒后再没回来，`diag tcb pid=9 … st=2 lock=0 wait=0 wd=0 on_rdy=0`、
+   *  `hb_age` 一路涨、`kick gnss-reader` 的 kicks 计到 30+，
+   *  全程没有 `reclaim zombie stack slot` / `no free reader stack` 任何一条
+   *  —— 也就是**两条恢复路都被这一个状态卡住**。
+   *
+   *  为什么 `st=2 && on_rdy=0` 一定不可达：NuttX 里
+   *  `TSTATE_TASK_READYTORUN` 的字面定义就是"TCB is in the ready to run
+   *  list"（`TSTATE_TASK_PENDING` 才是"ready 但不在任何表里"）。
+   *  标着 2 又不在链上 = 自相矛盾，没有任何唤醒路径能再碰到它。
+   *
+   *  **牙齿那一半必须一起上**：光放宽状态会误伤真在跑的线程，所以下面照
+   *  `gnss_reader_lost()` 补"不在 `this_task()` 起头的就绪链上" 这条。
+   *
+   *  自证伪：若放宽后出现"两具 reader 交替说话"（HCI/NMEA 行里两套 pid
+   *  交错，或 `g_rd_loop_seq` 两边都在涨）⇒ 说明被隔离的那具其实还会被
+   *  调度 ⇒ 撤回本次放宽。 */
+  if ((tcb->task_state == TSTATE_TASK_RUNNING ||
+       tcb->task_state == TSTATE_TASK_READYTORUN) &&
+      tcb->waitobj == NULL &&
       tcb->lockcount == 0 && !WDOG_ISACTIVE(&tcb->waitdog))
     {
-      stranded = true;
+      FAR struct tcb_s *t = this_task();
+      int hops;
+
+      stranded = true;   /* 先假设丢了；在链上就翻案 */
+      for (hops = 0; t != NULL && hops < 64; hops++, t = t->flink)
+        {
+          if (t == tcb)
+            {
+              stranded = false;
+              break;
+            }
+        }
+    }
+
+  if (stranded)
+    {
       syslog(LOG_ERR,
-             "gnss: reader stranded (st=%u wait=0 wd=0 lock=0) — treat as zombie\n",
+             "gnss: reader stranded (st=%u wait=0 wd=0 lock=0 on_rdy=0) — treat as zombie\n",
              (unsigned)tcb->task_state);
     }
 
   nxsched_put_tcb(tcb);
+  sched_unlock();
   return stranded;
+}
+
+/* 「被调度器丢掉」的判据 —— 比 `gnss_reader_stranded()` 更硬的一条。
+ *
+ * 2026-09-21 实测的终态：读线程 pid=106 把自己的一次 `poll()` 留在半路
+ * （`g_poll_enter_ms` 一直非 0、`g_rd_loop_seq`/`g_poll_n` 冻住、in_poll 一路涨
+ * 到 3.07 h），TCB 现场是 `st=3 wait=0 wd=0 lock=0` **且 `on_rdy=0`** ——
+ * 也就是源码注释里点名的"现场第 4 次"签名：唤醒路径已经跑完（waitobj 清、
+ * 状态标回 RUNNING），但**没有谁把它挂回就绪链**。这种线程没有任何唤醒路径
+ * 能够再碰到它（它的 waitlist 成员资格已解掉，没有任何 sem 持有它的引用），
+ * 所以它永远不会再被调度、它的栈也永远不会再被踩。
+ *
+ * 判据口径（必须与"还活着的等待者"分开，否则就是在抢一个真的在跑的线程的栈）：
+ *   - `st == RUNNING`：不是 WAIT_SEM/WAIT_SIG（那类线程会被正常唤醒）；
+ *   - `waitobj == NULL && !WDOG_ISACTIVE(waitdog) && lockcount == 0`：
+ *     不挂在任何 sem/watchdog/临界区上；
+ *   - 不在 `this_task()` 起头的就绪链上：没有后续调度机会。
+ * 前三条单独出现**还不够**（正常 park 在驱动里的线程也是这个签名，见
+ * gnss_reader_stranded 的注释），所以第四条才是这条判据的牙齿。
+ *
+ * 整段在 `sched_lock()` 里做：既让遍历到的链是稳定快照，也顺带保证
+ * 判完到调用方动手之间没有别人把这个线程挂回去。 */
+static bool gnss_reader_lost(pid_t pid)
+{
+  FAR struct tcb_s *tcb;
+  bool lost = false;
+
+  if (pid <= 0)
+    {
+      return false;
+    }
+
+  sched_lock();
+  tcb = nxsched_get_tcb(pid);   /* 必须与 put 成对 */
+  /* 状态放宽到 `READYTORUN`：2026-09-23 实测到 `st=2`（字面定义就是
+   * "TCB is in the ready to run list"）却 `on_rdy=0` 的形态 —— 标着在链上、
+   * 实际不在，没有任何唤醒路径能再碰到它。放宽是安全的：**牙齿在下面那条
+   * "不在就绪链上"**，真在跑/真在表里的线程照样翻案。详见
+   * `gnss_reader_stranded()` 里同日的注释。 */
+  if (tcb != NULL && tcb->pid == pid &&
+      (tcb->task_state == TSTATE_TASK_RUNNING ||
+       tcb->task_state == TSTATE_TASK_READYTORUN) &&
+      tcb->waitobj == NULL &&
+      tcb->lockcount == 0 && !WDOG_ISACTIVE(&tcb->waitdog))
+    {
+      FAR struct tcb_s *t = this_task();
+      int hops;
+
+      lost = true;   /* 先假设丢了；在链上就翻案 */
+      for (hops = 0; t != NULL && hops < 64; hops++, t = t->flink)
+        {
+          if (t == tcb)
+            {
+              lost = false;
+              break;
+            }
+        }
+    }
+
+  if (tcb != NULL)
+    {
+      nxsched_put_tcb(tcb);
+    }
+
+  sched_unlock();
+  return lost;
 }
 
 static int gnss_thread_reap(unsigned wait_ms)
@@ -6413,6 +7032,7 @@ static void gnss_reader_release_zombie(pid_t pid)
   uint8_t mask = (uint8_t)(1u << g_gnss_stack_slot);
 
   g_gnss_stack_zombie |= mask;
+  g_gnss_zombie_pid[g_gnss_stack_slot] = pid;   /* 回收时要用它判"走没走" */
   g_gnss_has_thread = false;
   g_gnss_stack_busy = false;
   g_gnss_pid = (pid_t)-1;
@@ -6449,11 +7069,41 @@ static int gnss_thread_spawn(void)
       if ((g_gnss_stack_zombie & (1u << s)) == 0u) {
         break;
       }
+
+      /* 两种可回收情形 —— 只认第一种是不够的，2026-09-21 实机就是被第二种卡住的：
+       *
+       *   ① pid 已死（`gnss_pid_alive()` 明确说不在了）；
+       *   ② pid 还在，但**被调度器丢了**（`gnss_reader_lost()`：st=RUNNING、
+       *      不挂任何 sem/wdog/锁、且不在就绪链上）。这种线程永远不可能再被
+       *      调度，它的栈永远不会再被踩；只按 ① 判就会把它当"还活着"而拒绝回收
+       *      —— 实测 pid=106 就这么把槽位占死 3.07 h（`zombie=0x03`、
+       *      每 30 s 重试一次 `ret=-12`），GPS 到关机都不回来。
+       *
+       * pid 可能被复用的顾虑仍在，但 ② 不是靠 pid 判活，是靠"这个线程还能不能
+       * 被调度"判的 —— 复用出来的新线程只要在跑就在就绪链上，② 自然不成立。 */
+      if (g_gnss_zombie_pid[s] != 0 &&
+          (!gnss_pid_alive(g_gnss_zombie_pid[s]) ||
+           gnss_reader_lost(g_gnss_zombie_pid[s]))) {
+        bool alive = gnss_pid_alive(g_gnss_zombie_pid[s]);
+
+        syslog(LOG_WARNING,
+               "gnss: reclaim zombie stack slot %u (pid=%d %s)\n",
+               s, (int)g_gnss_zombie_pid[s],
+               alive ? "lost by scheduler (unreachable)" : "confirmed gone");
+        g_gnss_zombie_pid[s] = 0;
+        g_gnss_stack_zombie &= (uint8_t)~(1u << s);
+        break;
+      }
     }
 
     if (s >= GNSS_STACK_SLOTS) {
-      syslog(LOG_ERR, "gnss: no free reader stack (zombie=0x%02x)\n",
-             (unsigned)g_gnss_stack_zombie);
+      /* 单槽之后这条就是终态：唯一的槽被一个"还活着又判不出丢了"的线程占着，
+       * 每次重试都会走到这里。**判据字符串保持原样**（巡检 grep
+       * `no free reader stack`），后面补上占槽的 pid 便于现场定位。 */
+      syslog(LOG_ERR,
+             "gnss: no free reader stack (zombie=0x%02x slot0_pid=%d)"
+             " -- GNSS down until reboot\n",
+             (unsigned)g_gnss_stack_zombie, (int)g_gnss_zombie_pid[0]);
       g_gnss_spawning = false;
       g_gnss_stack_busy = false;
       return -ENOMEM;
@@ -6462,9 +7112,9 @@ static int gnss_thread_spawn(void)
     g_gnss_stack_slot = (uint8_t)s;
   }
 
-  /* 栈留 SRAM：实测水位 stk=3428/10160（34%），没有理由搬 PSRAM —— 要搬的是
-   * **大缓冲**（UBX payload / eph dump / DBD 已经是 PSRAM 了）。
-   * 这里只保留指针数组结构，方便以后按需切换。 */
+  /* 栈留 SRAM：实测水位 3,260/8,112（40%，2026-09-25 `test cpu -t 2`），
+   * 没有理由搬 PSRAM —— 要搬的是**大缓冲**（UBX payload / eph dump / DBD
+   * 已经是 PSRAM 了）。这里只保留指针数组结构，方便以后按需切换。 */
   if (g_gnss_stack[g_gnss_stack_slot] == NULL) {
     g_gnss_stack[g_gnss_stack_slot] = g_gnss_stack_sram[g_gnss_stack_slot];
   }
@@ -6548,11 +7198,23 @@ static int gnss_thread_restart(void)
     return ret;
   }
 
+  /* 读线程已退出后**故意不 close USART2**。
+   *
+   * 以前这里 close → 最后一次 close 走 uart_reset_sem() → 强行
+   * nxmutex_reset(recv/xmit.lock)。若此时还有等待者（半路 poll、或
+   * 另一条路径误 open），那些 nxmutex_lock 会永远醒不来；读线程 pri=50
+   * 又高于 IDLE，空转/卡锁会饿死 idle+work 心跳，IWDT 15 s 后复位
+   * （WDT 现场 n576/n583/n585：idle/work 过期、ui 仍新鲜、companion
+   * 卡在别的 mutex 上等）。NSH 对 console 也是进程在才关。
+   *
+   * 新读线程在 fd<0 时会自己 open；这里把仍有效的 g_uart_fd 留给它
+   * 继承（见 gnss_thread 入口对 g_uart_fd 的接管）。 */
   fd = g_uart_fd;
-  g_uart_fd = -1;
-  if (fd >= 0) {
-    /* 读线程已退出，对标 NSH 进程结束才关 console fd。 */
-    (void)close(fd);
+  if (fd < 0) {
+    syslog(LOG_WARNING, "gnss: restart: USART2 already closed\n");
+  } else {
+    syslog(LOG_INFO, "gnss: restart: keep USART2 fd=%d for next reader\n",
+           fd);
   }
 
   g_uart_fails = GNSS_PWR_FAILS;

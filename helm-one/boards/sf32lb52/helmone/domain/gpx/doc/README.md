@@ -11,5 +11,5 @@
 
 相关：
 
-- [companion_recording.md](../../../../../docs/ble/companion_recording.md) — 记录与展示分离、App / BLE 方案
-- [companion_proto.h](../../include/companion_proto.h) — BLE Companion 协议常量
+- [companion_recording.md](../../../../../../docs/ble/companion_recording.md) — 记录与展示分离、App / BLE 方案
+- [companion_proto.h](../../../include/companion_proto.h) — BLE Companion 协议常量

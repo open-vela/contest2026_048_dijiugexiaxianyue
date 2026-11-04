@@ -1,8 +1,8 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/lcd_spi2.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/lcd_spi2.c
  *
  * Dedicated SPI2 for ST7789 (PA37-PA42). Self-contained; does not use or
- * modify vendor/my_vendor/chips/sf32lb52/sifli_spi.c (SPI1 general bus).
+ * modify vendor/HelmOne/chips/sf32lb52/sifli_spi.c (SPI1 general bus).
  *
  * 后续剔除：Helm One 已改 NV3031A，不再使用本文件。
  *

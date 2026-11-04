@@ -34,6 +34,16 @@ void myvendor_coredump_init(void);
 void myvendor_coredump_wdt(void);
 
 /**
+ * @brief 运行期周期性清理入口（线程上下文；内部限频，默认 10 分钟）。
+ *
+ * @details 补上"不重启也清"这条路：崩溃路径的裁剪只在写新 dump 时跑，开机那次
+ *          也只在开机跑 —— 长时间不重启、期间只有 soft dump 时目录会只涨不落
+ *          （2026-09-25 用户反馈 diag 与 coredump 都在累加）。按最小序号/最老戳
+ *          删到 `CONFIG_MYVENDOR_COREDUMP_KEEP` 个；失败由 `prune stuck` 出声。
+ */
+void myvendor_coredump_prune(void);
+
+/**
  * @brief 把 LVGL 片内条带交给崩溃路径（LCD 分配成功后调用）。
  *
  * 指针记在 SRAM；HardFault 里先停 LCDC/EPIC DMA，再把条带当 note /
@@ -56,6 +66,10 @@ static inline void myvendor_coredump_init(void)
 }
 
 static inline void myvendor_coredump_wdt(void)
+{
+}
+
+static inline void myvendor_coredump_prune(void)
 {
 }
 

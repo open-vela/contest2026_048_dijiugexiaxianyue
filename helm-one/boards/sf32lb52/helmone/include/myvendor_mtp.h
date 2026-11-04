@@ -143,6 +143,19 @@ void myvendor_mtp_lfs_release(const char *who);
 bool myvendor_mtp_lfs_quiesce(void);
 
 /**
+ * @brief 设备 UI 是否停在 MTP 传输页 —— `myvendor_mtp_lfs_quiesce()` 为真的
+ *        两个成因里"**确实与 MTP 有关**"的那一个。
+ *
+ * @details quiesce 为真有两个成因：① 本函数（UI 停在传输页）；② 别人拿着有效的
+ *          LFS hold（`transfer_backend` 的手机 BLE 文件传输、GNSS 星历注入都是），
+ *          后者与 MTP 毫无关系。调用方要**如实**描述"在等什么"时必须靠本函数区分
+ *          —— 否则骑行时（手机在传文件）会把"等传输让位"误报成"正在关闭 MTP"。
+ *
+ * @return true 表示 UI 正停在传输页。
+ */
+bool myvendor_mtp_page_active(void);
+
+/**
  * @brief 把 #myvendor_mtp_lfs_quiesce 为真的**具体成因**格式化出来。
  *
  * @details

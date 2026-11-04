@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/sensor/mmc5983ma.h
+ * vendor/HelmOne/boards/sf32lb52/drivers/sensor/mmc5983ma.h
  *
  * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/

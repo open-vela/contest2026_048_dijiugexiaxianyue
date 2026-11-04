@@ -25,7 +25,6 @@ extern "C" {
 #if LV_USE_SIFLI_EPIC
 #include "../../sw/lv_draw_sw.h"
 #include "../../lv_draw_private.h"
-#include "../../../stdlib/lv_string.h"
 #include "lv_sifli_epic_cfg.h"
 
 /*********************

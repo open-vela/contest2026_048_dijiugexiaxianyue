@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/my_vendor/test/test_gnss.c
+ * vendor/HelmOne/boards/sf32lb52/helmone/test/test_gnss.c
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -753,11 +753,11 @@ static FAR const char *gnss_mga_info(uint8_t code)
       case 1:
         return "no-time";
       case 2:
-        return "bad-version";
+        return "type-not-supported";
       case 3:
         return "size-mismatch";
       case 4:
-        return "not-stored";
+        return "db-store-failed";
       case 5:
         return "not-ready";
       case 6:

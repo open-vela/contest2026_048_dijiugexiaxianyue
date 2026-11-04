@@ -1,6 +1,6 @@
 /**
  * @file lcd_recover_main.c
- * @brief NSH 命令 lcd_recover：手动重启 ui_flush 刷新管道。
+ * @brief NSH 命令 lcd_recover：轻量检查/触发一次全屏重绘（无 worker）。
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -21,7 +21,7 @@
 static void lcd_recover_usage(void)
 {
   printf("Usage: lcd_recover [status]\n");
-  printf("  lcd_recover         reopen /dev/lcd0, restart ui_flush\n");
+  printf("  lcd_recover         wait in-flight DMA, queue a full redraw\n");
   printf("  lcd_recover status  print flush pipe busy flag and stats\n");
   printf("Note: bicycle_ui must be running for LVGL full-screen refresh after recover.\n");
 }
@@ -55,7 +55,7 @@ static void lcd_recover_print_status(void)
 }
 
 /**
- * @brief NSH 命令 lcd_recover：手动重启 ui_flush 刷新管道。
+ * @brief NSH 命令 lcd_recover：轻量检查/触发一次全屏重绘（无 worker）。
  * @param argc 参数个数。
  * @param argv 参数向量。
  * @return 成功/失败退出码。
@@ -89,7 +89,7 @@ int main(int argc, FAR char *argv[])
       return 1;
     }
 
-  printf("lcd_recover: restarting ui_flush pipe ...\n");
+  printf("lcd_recover: lightweight recover (IRQ flush path) ...\n");
   ret = myvendor_lcd_disp_trigger_recover();
 
   if (ret == 0)

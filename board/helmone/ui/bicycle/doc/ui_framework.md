@@ -193,7 +193,7 @@ LiveMap ↔ UsbTransfer 使用 **不同** GPU 动画（depth / zoom），但各�
 
 `lv_pm_notify_show_hold` 会刷新 overlay chrome；bottom 卡片须 `LV_OBJ_FLAG_FLOATING` + 底部对齐（`overlay_bottom_layout_card`），否则 notify 出现后 bottom 可能错位到左上角。
 
-完整文案表与偏航算法见 [docs/osm/ROUTING.md](../../../../../docs/osm/ROUTING.md) §界面提示、§偏航检测。
+完整文案表与偏航算法见 [docs/osm/ROUTING.md](../../../../../../docs/osm/ROUTING.md) §界面提示、§偏航检测。
 
 ---
 

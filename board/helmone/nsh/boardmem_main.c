@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/my_vendor/src/boardmem_main.c
+ * vendor/HelmOne/boards/sf32lb52/helmone/src/boardmem_main.c
  *
  * NSH 内置命令 boardmem：打印板级内存堆用量与 PSRAM 物理布局。
  *

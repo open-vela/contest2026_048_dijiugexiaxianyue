@@ -32,11 +32,26 @@ typedef struct {
     bool on;
     bool sel;
     bool progress_on;
+    /** @brief 整行底色覆盖：配色试验页要展示"选中时整行是什么样"。
+     *  @note 必须由 helm_row_set 每行清零 —— items 数组跨页复用，残留会漏到别的页。 */
+    bool bg_set;
+    uint32_t bg_color;
+    /** @brief 这行的底色偏深 ⇒ 次级文字（副标题/右值）用浅色而不是 MUTE。
+     *  @details 选中块也是一块深底，两者共用同一个开关：选中时由 helm_widget.c 按 mix 置位。 */
+    bool bg_dark;
     bool live;                    /**< 只改文案/进度条，不滚动、不重光标。 */
 } helm_item_t;
 
 lv_obj_t * helm_label(lv_obj_t * parent, const lv_font_t * font, uint32_t color,
                       const char * txt);
+/** @brief 打桩：绘制任务回调（统计 fill 方角/圆角、label、img 等）。
+ *  @note DRAW_TASK_ADDED 只发给**正在绘制的那个对象**且它得带
+ *        LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS ⇒ 想让分类数字真实，必须逐对象挂。 */
+void helm_ui_task_cb(lv_event_t * e);
+/** @brief 整页行建完之后调一次：滚动到选中行 + 落光标（见 helm_mitem_create 注释）。 */
+void helm_mitem_list_built(lv_obj_t * list, int sel);
+/** @brief 记录数缓存失效（开机/进页面/骑行结束后各一次，见 helm_menu.c）。 */
+void helm_gpx_count_invalidate(void);
 void helm_style_paper(lv_obj_t * obj);
 void helm_style_scr(lv_obj_t * obj);
 /** @brief 暖纸卡片：场地底上的数字面 / 列表行衬底。 */
@@ -44,6 +59,8 @@ void helm_style_card(lv_obj_t * obj);
 
 lv_obj_t * helm_mhead_create(lv_obj_t * parent, const char * title);
 void helm_mhead_set(lv_obj_t * head, const char * title);
+/** @brief 换主题后重设页头样式（颜色是建页时烘进样式的，`helm_mhead_set` 只改文案）。 */
+void helm_mhead_reapply(lv_obj_t * head);
 /** @brief 顶栏标题字体。GPX 文件名用 TTF，其它页回到点阵。 */
 void helm_mhead_set_font(lv_obj_t * head, const lv_font_t * font);
 

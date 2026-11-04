@@ -6,6 +6,7 @@
 #ifndef VMAP_STYLE_H
 #define VMAP_STYLE_H
 
+#include "vmap_format.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -15,10 +16,34 @@ extern "C" {
 
 #define VMAP_STYLE_ROAD_CLASSES 8
 
+/*
+ * 板端只有 z14 瓦片（`docs/map/STYLE.md` §7「z14 单层数据」），放大只是把 z14
+ * 几何按 `scale` 线性放大 —— 于是"当前 zoom = 14 + log2(scale)"。可见性判定
+ * 按 STYLE.md §3 的"从哪个 zoom 开始画"折成 **scale 阈值**（2^(z-14)）：
+ *   道路  z6 / z9 / z11 / z12.5 / z13.5 / z14.5
+ *         ⇒ scale 0.004 / 0.031 / 0.125 / 0.354 / 0.707 / 1.414
+ *   用地  z12.5 / z15 ⇒ scale 0.354 / 2.0
+ * 设备默认 scale = 1.69（VMAP_DEFAULT_SCALE）⇒ service 已出、商务/工业不出。
+ */
+#define VMAP_STYLE_ZOOM 14u
+
+/** @brief scale × 1000（整数比较用；scale 是 z14 瓦片的线性倍率）。 */
+static inline int32_t vmap_style_scale_milli(float scale)
+{
+    if (!(scale > 0.0f)) {
+        return 1000;
+    }
+
+    return (int32_t)(scale * 1000.0f + 0.5f);
+}
+
 typedef enum {
     VMAP_STYLE_CLASSIC = 0,
     VMAP_STYLE_NAV,
+    /** @brief 白天户外盘（terrain）：暖底、绿更重、棕步道（STYLE.md §2 terrain）。 */
     VMAP_STYLE_OUTDOOR,
+    /** @brief 夜间盘（night）：深色底 + 深色道路（STYLE.md §2 night）。 */
+    VMAP_STYLE_NIGHT,
     VMAP_STYLE_COUNT
 } vmap_style_id_t;
 
@@ -26,8 +51,59 @@ typedef struct {
     uint8_t r;
     uint8_t g;
     uint8_t b;
+    /** @brief 芯宽，**1/10 设备像素**（z14 1× 基准，STYLE.md §3）。
+     *
+     * 原来这里是整像素，表达不了 4.2 / 3.6 / 3.0 / 2.6 / 2.2 / 1.7 / 1.4 的
+     * 宽度阶梯（整像素会把相邻两级压成同一级）。唯一读取点是
+     * `vmap_render.c` 的 `road_core_px()`，用整数换算成设备像素，不引入浮点。
+     */
     uint8_t w;
+    uint8_t cr;     /**< 壳色 r（STYLE.md §2「路壳」；path 无壳，等于芯色） */
+    uint8_t cg;     /**< 壳色 g */
+    uint8_t cb;     /**< 壳色 b */
 } vmap_style_road_t;
+
+/**
+ * @brief 该等级道路在当前缩放下是否绘制（STYLE.md §3 最后一列）。
+ * @param cls  道路等级（VMAP_ROAD_*）。
+ * @param scale z14 瓦片的线性倍率（`vmap_view_set_scale`）。
+ * @return true 绘制。
+ */
+static inline bool vmap_style_road_visible(uint8_t cls, float scale)
+{
+    static const uint16_t k_min_scale_milli[VMAP_STYLE_ROAD_CLASSES] = {
+        0u, 4u, 31u, 125u, 354u, 707u, 1414u, 707u,
+    };
+
+    if (cls == 0u || cls >= VMAP_STYLE_ROAD_CLASSES) {
+        return false;
+    }
+
+    return vmap_style_scale_milli(scale) >= (int32_t)k_min_scale_milli[cls];
+}
+
+/**
+ * @brief 该用地类型在当前缩放下是否绘制（STYLE.md §5.4）。
+ * @param attr  VMAP_LAND_*。
+ * @param scale z14 瓦片的线性倍率。
+ * @return true 绘制。
+ */
+static inline bool vmap_style_land_visible(uint8_t attr, float scale)
+{
+    switch (attr) {
+    case VMAP_LAND_COMMERCIAL:
+    case VMAP_LAND_INDUSTRIAL:
+        /* z15 起：设备默认 scale 1.69 < 2.0 ⇒ 商务/工业默认不出现。 */
+        return vmap_style_scale_milli(scale) >= 2000;
+    case VMAP_LAND_RESIDENTIAL:
+    case VMAP_LAND_EDU:
+    case VMAP_LAND_PARK:
+        return vmap_style_scale_milli(scale) >= 354;      /* z12.5 */
+    default:
+        /* 未知类型保持旧行为（按住宅色画出来），不要静默丢数据。 */
+        return true;
+    }
+}
 
 typedef struct {
     const char * name;
@@ -79,6 +155,10 @@ typedef struct {
     uint32_t lbl_water;
     uint32_t lbl_poi;
     uint32_t lbl_road;
+    /** @brief 标签描边 halo 色（STYLE.md §2「描边 halo」：日光白、夜间近黑）。 */
+    uint32_t lbl_halo;
+    /** @brief 描边不透明度（0–255）。 */
+    uint8_t  lbl_halo_opa;
 
     /* LVGL chrome (0xRRGGBB, opa 0–255). */
     uint32_t ui_root_bg;

@@ -10,6 +10,7 @@
 #include <nuttx/arch.h>
 #include <nuttx/irq.h>
 #include <nuttx/spinlock.h>
+#include <arch/arm_m/nvicpri.h>
 
 #include "bf0_hal.h"
 #include "sfconfig.h"
@@ -29,7 +30,19 @@ int LCPU2HCPU_IRQHandler(int irq, FAR void *context, FAR void *arg);
 static inline void os_interrupt_start(IRQn_Type irq_number, uint32_t priority,
                                       uint32_t sub_priority)
 {
-    HAL_NVIC_SetPriority(irq_number, priority, sub_priority);
+    uint32_t encoded = NVIC_EncodePriority(NVIC_GetPriorityGrouping(),
+                                           priority, sub_priority);
+    const uint32_t min_kernel_prio =
+        NVIC_SYSH_DISABLE_PRIORITY >> (8U - __NVIC_PRIO_BITS);
+
+    /* The mailbox callback can queue HPWORK, which starts/cancels watchdogs.
+     * It must not preempt NuttX's BASEPRI critical sections. */
+    if (encoded < min_kernel_prio)
+    {
+        encoded = min_kernel_prio;
+    }
+
+    NVIC_SetPriority(irq_number, encoded);
     irq_attach(NX_IRQ(irq_number), LCPU2HCPU_IRQHandler, NULL);
     up_enable_irq(NX_IRQ(irq_number));
 }

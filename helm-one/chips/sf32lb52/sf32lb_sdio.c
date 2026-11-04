@@ -59,6 +59,7 @@
 #include <nuttx/kmalloc.h>
 #include <nuttx/mtd/mtd.h>
 #include <nuttx/mutex.h>
+#include <nuttx/sched.h>
 #include <nuttx/atomic.h>
 
 #include <sched.h>
@@ -203,20 +204,38 @@ static uint16_t g_sd_rca;
 static uint32_t g_sd_bus_hz = SF32LB_SD_TRAN_CLOCK_HZ;
 static FAR struct mtd_dev_s *g_sd_mtd;
 static FAR struct mtd_dev_s *g_sd_fat_mtd;
-static bool    g_sd_dead;       /* 4-try + reinit still failing; fast-EIO */
+/* 判死标志。**跨线程访问**（UI 线程查闸门、复活任务清判死），所以读一律走
+ * `sf32lb_sd_dead()` 的原子读、写一律 `__atomic_store_n` —— 单核上字节访问
+ * 不会撕裂，但这不能替代同步语义（Codex R1 P2-5）。 */
+static bool    g_sd_dead;       /* 判死：I/O 立即 -EIO，复活交给后台 */
 static bool    g_sd_reinit_used;
 static bool    g_sd_dat0_poll;  /* DSR bit0 tracks DAT0 after identify    */
 static uint32_t g_sd_last_sr;   /* SR (or R1) at the last cmd/data error  */
+static uint32_t g_sd_call_first_sr; /* 本次块 I/O 第一次失败时的 SR（判死日志用）*/
+static bool    g_sd_call_first_valid;
 
 /* /mnt/lfs 是否是只读挂上的（读写挂载失败后的降级结果）。见
  * sf32lb_sd_lfs_readonly()：写盘的用户据此跳过，别反复撞 -EACCES。 */
 static bool g_lfs_readonly;
 
+/* 后台复活任务。判死后的硬复位（接口下电 200 ms + 全量 identify，卡不应答
+ * 时要数秒）**不能**留在调用者线程上；这个任务只做这一件事。
+ * 栈由内核分配（`task_create`），不用静态栈 —— 静态栈会被下一个任务在
+ * 前一个任务还没完全退出时复用（Codex R1 P1-2）。
+ *
+ * 优先级：NuttX 里**数值越大优先级越高**（IDLE=0、LPWORK=100、HPWORK=224）。
+ * UI（bicycle）是 100，所以复活任务压到 90 —— 低于 UI 才不会在硬复位期间
+ * 抢渲染，又高于 IDLE，UI 每轮 10 ms 的 sleep 足够它跑完。 */
+#define SF32LB_SD_REVIVE_STACK    3072
+#define SF32LB_SD_REVIVE_PRIO     90
+
 /* 判死/复活状态。见 sd1_dead_fail_fast() 与 sd1_hard_reset()。 */
-static uint16_t g_sd_dead_mute;      /* 连续多少次重识别失败（mute）      */
+static uint16_t g_sd_dead_mute;      /* 连续多少次复活失败（mute）        */
 static uint64_t g_sd_dead_since_us;  /* 判死时刻                          */
-static uint64_t g_sd_dead_try_us;    /* 上次硬复位尝试时刻                */
-static uint32_t g_sd_dead_tries;     /* 硬复位尝试次数（日志用，不回绕）  */
+static uint64_t g_sd_dead_try_us;    /* 上次复活尝试时刻                  */
+static uint32_t g_sd_dead_tries;     /* 复活尝试次数（日志用，不回绕）    */
+static volatile bool g_sd_revive_active;  /* 复活任务在跑（防重入）       */
+static volatile uint32_t g_sd_revive_next_ms; /* 下次允许起任务的时刻（mono ms）*/
 
 /* Staging buffer keeps SD FIFO 32-bit accesses word-aligned regardless of the
  * caller buffer alignment.
@@ -454,16 +473,47 @@ static void sd1_init(void)
 #define SF32LB_SD_WRITE_WAIT_US   500000ull
 #define SF32LB_SD_WRITE_MAX_US    2000000ull
 
+/* ACMD41（上电完成）等待的协作化参数，见 sf32lb_sd_identify()。
+ * YIELD：正常卡 <100 ms 完成，超过这个值就认定"卡不响应"，改成 1 ms 有界休眠，
+ *        让 idle / iwdg_feed 这类低优先级任务能跑（原来是纯自旋）。
+ * MAX  ：总上限。到点放弃并返回 -EIO，让上层快速失败；否则一次重识别能把
+ *        整机拖到看门狗复位（现场 18.4 s）。 */
+#define SF32LB_SD_ACMD41_YIELD_US 200000ull
+#define SF32LB_SD_ACMD41_MAX_US   5000000ull
+
 /* 判死与复活。卡完全不应答时，一轮读失败要走 4 次重试 + 丢到 6 MHz +
  * 一次完整重识别，每个块 2~4 秒；所有文件系统调用者都卡在这上面，UI 心跳
- * 一停看门狗就不喂了 —— 这是"卡死后整机跟着死"的真实链路。所以连续几次
- * 重识别都失败后就判死，改为立即 -EIO 快速失败，只按周期做一次硬复位升级。
+ * 一停看门狗就不喂了 —— 这是"卡死后整机跟着死"的真实链路。
+ *
+ * 现在的分工：
+ *   - 调用者（可能是 UI 线程）只跑**便宜的解卡**（CMD12+CMD13）与有限重试，
+ *     超预算 / 解不开就判死，本次 I/O 立即 -EIO；
+ *   - 判死后的硬复位 + 全量 identify 由**后台任务** `sd_revive` 做（数秒级），
+ *     成功立即清判死，下一次 I/O 就恢复正常。
  * 芯片上没有 SD 供电控制（SYSCR_SDNAND 只是 AHB 地址映射选择 SD2/MPI3，
  * PMUC 里没有任何 SD/NAND 电源位），断电之外只有这一档更接近冷启动的动作。
  */
-#define SF32LB_SD_DEAD_AFTER      3u
+#define SF32LB_SD_DEAD_AFTER      2u
 #define SF32LB_SD_DEAD_RETRY_MS   30000u
+#define SF32LB_SD_DEAD_RETRY_FAST_MS 5000u
 #define SF32LB_SD_HARD_DOWN_MS    200u
+
+/* 单次 I/O 调用（一个块/一次多块传输）的**硬时间预算**。
+ *
+ * 为什么要有：卡不应答时，重试阶梯是 1 次初读 + 3 次 24 MHz + 1 次 6 MHz，
+ * 每步都可能等满 CMD/DATA 超时；再叠加一次全量重识别就是数秒。这些调用
+ * **跑在 UI 线程上**（地图瓦片、GPX、设置都从 UI 走文件系统），于是屏幕和
+ * 看门狗一起停摆 —— 现场 14 s 卡顿就是这么来的。
+ *
+ * 现在：重试阶梯里每一步之前都查预算，超了就按判死处理（立即 -EIO，上层画
+ * 空片），重识别由后台任务去做。400 ms 是"用户察觉不到"与"一次偶发抖动仍能
+ * 自愈"的折中：单次 512 B 读的完整阶梯在健康卡上远小于此。
+ */
+#define SF32LB_SD_CALL_BUDGET_US  400000ull
+
+/* 写路径的预算。写有合法的 2 s DAT0 program 等待（`SF32LB_SD_BUSY_US`），
+ * 400 ms 会把健康卡误判死；2.5 s 只是把"卡死"这一档也变成有界。 */
+#define SF32LB_SD_WRITE_BUDGET_US 2500000ull
 
 /* Extra attempts per 512 B block on a CRC/timeout before giving up.  A single
  * block read/write is idempotent (CMD17/CMD24 to the same address), so a
@@ -506,10 +556,82 @@ static uint64_t sd1_mono_us(void)
   return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
 }
 
+/*
+ * 当前块 I/O 调用的**绝对截止时刻**（0 = 不限）。
+ *
+ * 光在重试之间查预算不够：一次 mute 读的耗时大头在**底层收尾**里 ——
+ * `stop:` 分支的 CMD12 + `sd1_recover_after_error()`（内含 1×CMD12 +
+ * 3×(CMD13+CMD12)），以及解卡里的 `sd1_wait_dat0(2 s)`。这些都要用同一个
+ * deadline 截断，读才有真正的墙钟上限（Codex R1/R2 P1-3）。
+ *
+ * 只在 `bread` / `bwrite` / `erase` 这三个块 I/O 入口设置与清除；`g_sd_lock`
+ * 保证同一时刻只有一个持有者，所以单变量足够。
+ */
+static uint64_t g_sd_deadline_us;
+
+static void sd1_deadline_set(uint32_t budget_us)
+{
+  g_sd_deadline_us = sd1_mono_us() + budget_us;
+}
+
+static void sd1_deadline_clear(void)
+{
+  g_sd_deadline_us = 0;
+}
+
+/** 把一次等待截到剩余预算（没有预算时原样返回）。 */
+static uint64_t sd1_deadline_cap(uint64_t timeout_us)
+{
+  uint64_t now;
+  uint64_t left;
+
+  if (g_sd_deadline_us == 0)
+    {
+      return timeout_us;
+    }
+
+  now = sd1_mono_us();
+  if (now >= g_sd_deadline_us)
+    {
+      return 1;
+    }
+
+  left = g_sd_deadline_us - now;
+  return left < timeout_us ? left : timeout_us;
+}
+
+/** 预算是否已经用光（无预算时恒 false）。 */
+static bool sd1_deadline_passed(void)
+{
+  return g_sd_deadline_us != 0 && sd1_mono_us() >= g_sd_deadline_us;
+}
+
+/*
+ * 记录一次失败时的 SR。**第一次**失败的值单独保存在 `g_sd_call_first_sr`：
+ * 后面的 CMD12/解卡会覆盖 `g_sd_last_sr`，判死日志要报的是原始故障
+ *（Codex R3/R4 P2-R1-10）。
+ */
+static void sd1_note_fail_sr(uint32_t sr)
+{
+  g_sd_last_sr = sr;
+
+  if (g_sd_call_first_valid)
+    {
+      return;
+    }
+
+  g_sd_call_first_sr = sr;
+  g_sd_call_first_valid = true;
+}
+
 static uint8_t sd1_wait_card_idle(void);
 static int sf32lb_sd_identify(void);
 static int sf32lb_sd_cmd12(void);
 static bool sd1_dead_fail_fast(void);
+static bool sd1_budget_spent(uint64_t t0, uint32_t budget_us);
+static void sd1_declare_dead(const char * why);
+static void sd1_schedule_revive(void);
+static int sd1_revive_task(int argc, FAR char * argv);
 
 /* Clear command flags only.  Boot never writes SR before CCR; HAL_SDMMC_SET_CMD
  * also wipes DATA_* which races sd1_setup_read() (DPSM already running).
@@ -523,13 +645,15 @@ static void sd1_clr_cmd_int(void)
 
 static uint8_t sd1_wait_cmd(void)
 {
-  uint64_t deadline = sd1_mono_us() + SF32LB_SD_WAIT_US;
+  /* 单条命令的应答也要受块 I/O 预算约束：mute 卡上第一次 CMD17 就等满
+   * 50 ms，四次重试光这一项就是 200 ms（Codex R3 P1-3）。 */
+  uint64_t deadline = sd1_mono_us() + sd1_deadline_cap(SF32LB_SD_WAIT_US);
 
   while ((hwp_sdmmc1->SR & (SD_SR_CMD_DONE | SD_SR_CMD_TIMEOUT)) == 0)
     {
       if (sd1_mono_us() >= deadline)
         {
-          g_sd_last_sr = hwp_sdmmc1->SR;
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
           hwp_sdmmc1->SR = 0xffffffff;
           g_sd_diag.cmd_timeout++;
           return SD_TIMEOUT;
@@ -539,13 +663,14 @@ static uint8_t sd1_wait_cmd(void)
   hwp_sdmmc1->SR = SD_SR_CMD_DONE;
   if (hwp_sdmmc1->SR & SD_SR_CMD_TIMEOUT)
     {
-      g_sd_last_sr = hwp_sdmmc1->SR;
+      sd1_note_fail_sr(hwp_sdmmc1->SR);
       g_sd_diag.cmd_timeout++;
       return SD_TIMEOUT;
     }
 
   if (hwp_sdmmc1->SR & SD_SR_CMD_RSP_CRC)
     {
+      sd1_note_fail_sr(hwp_sdmmc1->SR);
       return SD_CRCERR;
     }
 
@@ -646,12 +771,13 @@ static uint8_t sd1_wait_read(void)
 {
   uint32_t mask = SD_SR_DATA_DONE | SD_SR_DATA_TIMEOUT | SD_SR_DATA_CRC |
                   SD_SR_FIFO_OVERRUN;
-  uint64_t deadline = sd1_mono_us() + SF32LB_SD_WAIT_US;
+  uint64_t deadline = sd1_mono_us() + sd1_deadline_cap(SF32LB_SD_WAIT_US);
 
   while ((hwp_sdmmc1->SR & mask) == 0)
     {
       if (sd1_mono_us() >= deadline)
         {
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
           hwp_sdmmc1->SR = 0xffffffff;
           g_sd_diag.rd_timeout++;
           return SD_TIMEOUT;
@@ -661,12 +787,14 @@ static uint8_t sd1_wait_read(void)
   hwp_sdmmc1->SR = SD_SR_DATA_DONE;
   if (hwp_sdmmc1->SR & SD_SR_DATA_TIMEOUT)
     {
+      sd1_note_fail_sr(hwp_sdmmc1->SR);
       g_sd_diag.rd_timeout++;
       return SD_TIMEOUT;
     }
 
   if (hwp_sdmmc1->SR & (SD_SR_DATA_CRC | SD_SR_FIFO_OVERRUN))
     {
+      sd1_note_fail_sr(hwp_sdmmc1->SR);
       g_sd_diag.rd_crc++;
       return SD_CRCERR;
     }
@@ -740,7 +868,7 @@ static uint8_t sd1_wait_dat0(uint64_t timeout_us)
       return SD_SUCCESS;
     }
 
-  deadline = sd1_mono_us() + timeout_us;
+  deadline = sd1_mono_us() + sd1_deadline_cap(timeout_us);
   next_yield = sd1_mono_us() + 1000u;
   while (!sd1_dat0_ready())
     {
@@ -748,7 +876,7 @@ static uint8_t sd1_wait_dat0(uint64_t timeout_us)
 
       if (now >= deadline)
         {
-          g_sd_last_sr = hwp_sdmmc1->SR;
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
           g_sd_diag.dat0_to++;
           return SD_TIMEOUT;
         }
@@ -768,14 +896,14 @@ static uint8_t sd1_wait_write(void)
 
   uint32_t mask = SD_SR_DATA_DONE | SD_SR_DATA_TIMEOUT | SD_SR_DATA_CRC |
                   SD_SR_FIFO_UNDERRUN;
-  uint64_t deadline = sd1_mono_us() + SF32LB_SD_WRITE_MAX_US;
+  uint64_t deadline = sd1_mono_us() + sd1_deadline_cap(SF32LB_SD_WRITE_MAX_US);
   uint64_t next_yield = sd1_mono_us() + 1000u;
 
   while ((hwp_sdmmc1->SR & mask) == 0)
     {
       if (sd1_mono_us() >= deadline)
         {
-          g_sd_last_sr = hwp_sdmmc1->SR;
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
           hwp_sdmmc1->DCR = 0;
           hwp_sdmmc1->SR = 0xffffffff;
           g_sd_diag.wr_timeout++;
@@ -789,14 +917,14 @@ static uint8_t sd1_wait_write(void)
   hwp_sdmmc1->SR = SD_SR_DATA_DONE;
   if (hwp_sdmmc1->SR & SD_SR_DATA_TIMEOUT)
     {
-      g_sd_last_sr = hwp_sdmmc1->SR;
+      sd1_note_fail_sr(hwp_sdmmc1->SR);
       g_sd_diag.wr_timeout++;
       return SD_TIMEOUT;
     }
 
   if (hwp_sdmmc1->SR & (SD_SR_DATA_CRC | SD_SR_FIFO_UNDERRUN))
     {
-      g_sd_last_sr = hwp_sdmmc1->SR;
+      sd1_note_fail_sr(hwp_sdmmc1->SR);
       g_sd_diag.wr_crc++;
       return SD_CRCERR;
     }
@@ -818,13 +946,14 @@ static uint8_t sd1_wait_write(void)
 
 static uint8_t sd1_wait_card_idle(void)
 {
-  uint64_t deadline = sd1_mono_us() + SF32LB_SD_BUSY_US;
+  uint64_t deadline = sd1_mono_us() + sd1_deadline_cap(SF32LB_SD_BUSY_US);
   uint64_t next_yield = sd1_mono_us() + 1000u;
 
   while ((hwp_sdmmc1->SR & SD_SR_DATA_BUSY) != 0)
     {
       if (sd1_mono_us() >= deadline)
         {
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
           return SD_TIMEOUT;
         }
 
@@ -1060,24 +1189,67 @@ static int sf32lb_sd_identify(void)
   /* ACMD41 with HCS=1; wait for power-up (busy bit 31). */
 
   cmd_arg = 0x40ff8000;
-  while (1)
-    {
-      HAL_Delay_us(20);
-      cmd_result = sd1_send_acmd(41, cmd_arg, rca);
-      if (cmd_result == SD_TIMEOUT)
-        {
-          syslog(LOG_ERR, "ERROR: SD ACMD41 timeout\n");
-          return -EIO;
-        }
+  {
+    /* 现场（2026-11-04，5.5 小时长测 + WDT dump n042）：卡变哑后这里会**纯自旋**
+     * 十几秒（实测一次完整重识别 18.4 s），期间 idle 与 iwdg_feed(prio180) 都跑
+     * 不到 ⇒ 三路心跳同时过期 ⇒ 15 s 硬件看门狗复位。
+     *
+     * 正常卡 100 ms 内就上电完成，所以：
+     *   · 前 200 ms 保持原 `HAL_Delay_us(20)` 节奏 —— 开机时序一字不变；
+     *   · 超过 200 ms 判定"卡不响应"，改 1 ms 有界休眠（让出 CPU，低优先级任务
+     *     能跑）+ 一条日志；
+     *   · 总耗时上限 SF32LB_SD_ACMD41_MAX_US 后放弃并返回 -EIO，让上层
+     *     （FAT/LFS/地图）快速失败，而不是把整机拖死。 */
+    const uint64_t acmd41_t0 = sd1_mono_us();
+    bool acmd41_yielding = false;
 
-      sd1_get_rsp(&rsp_idx, &rsp[0], &rsp[1], &rsp[2], &rsp[3]);
-      if ((rsp[0] & 0x80000000) != 0)
-        {
-          break;
-        }
+    while (1)
+      {
+        const uint64_t acmd41_spent = sd1_mono_us() - acmd41_t0;
 
-      HAL_Delay_us(2);
-    }
+        if (acmd41_spent >= SF32LB_SD_ACMD41_MAX_US)
+          {
+            syslog(LOG_ERR, "ERROR: SD ACMD41 gave up after %lu ms\n",
+                   (unsigned long)(acmd41_spent / 1000u));
+            return -EIO;
+          }
+
+        if (acmd41_spent >= SF32LB_SD_ACMD41_YIELD_US)
+          {
+            if (!acmd41_yielding)
+              {
+                acmd41_yielding = true;
+                syslog(LOG_WARNING,
+                       "SD: ACMD41 slow >%lums, yield to scheduler (card mute?)\n",
+                       (unsigned long)(SF32LB_SD_ACMD41_YIELD_US / 1000u));
+              }
+
+            usleep(1000);
+          }
+        else
+          {
+            HAL_Delay_us(20);
+          }
+
+        cmd_result = sd1_send_acmd(41, cmd_arg, rca);
+        if (cmd_result == SD_TIMEOUT)
+          {
+            syslog(LOG_ERR, "ERROR: SD ACMD41 timeout\n");
+            return -EIO;
+          }
+
+        sd1_get_rsp(&rsp_idx, &rsp[0], &rsp[1], &rsp[2], &rsp[3]);
+        if ((rsp[0] & 0x80000000) != 0)
+          {
+            break;
+          }
+
+        if (!acmd41_yielding)
+          {
+            HAL_Delay_us(2);
+          }
+      }
+  }
 
   /* CMD2 ALL_SEND_CID */
 
@@ -1323,7 +1495,7 @@ static int sf32lb_sd_program_staged(uint64_t card_byte_addr)
 
   if ((r1 & SF32LB_SD_R1_STATE_MASK) == SF32LB_SD_R1_STATE_PRG)
     {
-      g_sd_last_sr = r1;
+      sd1_note_fail_sr(r1);
       (void)sd1_wait_dat0(SF32LB_SD_WRITE_MAX_US);
       return -EIO;
     }
@@ -1426,6 +1598,13 @@ static int sd1_unstick_data(uint32_t *r1_out, bool *mute_out)
       *mute_out = false;
     }
 
+  /* 预算已用光就别再解卡：这里最多要发 7 条命令 + 三次 2 s 的 DAT0 等待，
+   * 是"400 ms 预算变成 890 ms"的主因（Codex R1/R2 P1-3）。 */
+  if (sd1_deadline_passed())
+    {
+      return -EIO;
+    }
+
   if (g_sd_dma && g_sd_dmah.State != HAL_DMA_STATE_READY)
     {
       (void)HAL_DMA_Abort(&g_sd_dmah);
@@ -1456,6 +1635,11 @@ static int sd1_unstick_data(uint32_t *r1_out, bool *mute_out)
 
   for (i = 0; i < 3; i++)
     {
+      if (sd1_deadline_passed())
+        {
+          return -EIO;
+        }
+
       ret = sd1_cmd13(&r1);
       if (ret != OK)
         {
@@ -1535,125 +1719,67 @@ static void sd1_recover_after_error(void)
 
 /**
  * @brief 重试耗尽后的最后手段：优先 CMD12+CMD13 回 TRAN。
+ * @param t0        本次 I/O 调用的起始时刻（`sd1_mono_us()`）。
+ * @param budget_us 该方向的预算（读 400 ms / 写 2.5 s）。
  * @return 0 已可再读写；负 errno。
  * @note 只有卡已经 IDLE 才允许 CMD0/CMD8。DATA 态发 CMD8 会把一次读失败
  *       放大成整卡 1 Hz 僵死。
+ *
+ *       预算已经用光时**连解卡也不做**：`sd1_unstick_data()` 自己要做
+ *       CMD12 + 3×CMD13，mute 卡上每条都要等满 50 ms 软件超时（≈200 ms，
+ *       实测把 400 ms 预算拖到 890 ms）。这块数据反正不要了，直接判死，
+ *       由后台复活任务去解卡（Codex R1 P1-3）。
  */
-static int sd1_reinit_card(void)
+static int sd1_reinit_card(uint64_t t0, uint32_t budget_us)
 {
-  static uint64_t last_us;
-  static uint16_t mute_n;
-  uint64_t now = sd1_mono_us();
   uint32_t r1 = 0;
   bool mute = false;
   int ret;
+
+  if (sd1_budget_spent(t0, budget_us))
+    {
+      sd1_declare_dead("call budget before unstick");
+      return -EIO;
+    }
 
   ret = sd1_unstick_data(&r1, &mute);
   if (ret == OK)
     {
       syslog(LOG_WARNING, "SD: recovered to TRAN (skip re-identify r1=0x%lx)\n",
              (unsigned long)r1);
-      mute_n = 0;
       return 0;
     }
 
-  /* 两条路都允许完整重新识别（CMD0/CMD8 + 全量 identify）：
+  /* 到这里说明卡连"回到 TRAN"都做不到：要么 mute（CMD13 三次全无应答），
+   * 要么已经掉回 IDLE 但 CMD13 应答了。
    *
-   *   - -ENOTCONN：CMD13 应答且状态就是 IDLE，已**证明**卡在 idle，安全；
-   *   - mute：CMD13 三次全无响应，r1 从未被写入。现场日志打的
-   *     `r1=0x0 st=0` 属于这种，**不代表"卡在 idle 态"** —— 旧代码把它当
-   *     "无法判定"而拒绝重识别，结果是永久不回退（现场：SD 异常后无法恢复，
-   *     只能重启，且重启后仍然是坏的）。
+   * **绝不在这里内联 identify**。完整重识别 = CMD0/CMD8 + ACMD41 + 全量参数
+   * 协商，卡不应答时要 2~10 秒（现场日志实测一次 18.4 s）。这条调用链跑在
+   * **UI 线程**上（地图瓦片 / GPX / 设置都从 UI 走文件系统），一次重识别就是
+   * 一次整机冻结，看门狗跟着停喂 —— 用户看到的"卡死后只能关机"。
    *
-   * 为什么 mute 时该重识别：卡彻底不应答，通常是被复位回了 IDLE（掉电/欠压、
-   * 卡自身复位、总线被拉低），而重新识别正是唯一能把它拉回来的动作。文件头
-   * 担心的"DATA 态发 CMD8 会放大失败"在这里不成立 —— sd1_unstick_data 已经
-   * 先发过 CMD12（STOP_TRANSMISSION，就是退出 DATA 态的命令），identify 内部
-   * 又以 CMD0 GO_IDLE 开头。
-   *
-   * 安全性：sf32lb_sd_identify() 本来就在运行时被调用（下面的 -ENOTCONN 分支
-   * 和 mount 路径），不需要 baremetal 模式、不需要关中断；只是耗时，所以
-   * 统一限频到 1 s 一次，并累计 mute_n 便于从日志判断"重识别到底有没有用"。
+   * 现在改成：判死 + 起后台复活任务，本次 I/O 立即 -EIO，上层画空片。判死
+   * 窗口内的后续 I/O 同样立即失败，不会每个块再付一次完整重试阶梯。
    */
   if (ret != -ENOTCONN && !mute)
     {
-      /* 停在 data/rcv/prg 等非 TRAN 非 IDLE 态：保持原判定，禁止全量识别。 */
+      /* 停在 data/rcv/prg 等非 TRAN 非 IDLE 态：保持原判定，不做全量识别
+       *（DATA 态发 CMD8 会把一次读失败放大成整卡僵死）；但同样判死，
+       * 交给后台硬复位 —— 硬复位是接口级下电，对卡的状态没有要求。 */
       syslog(LOG_ERR,
-             "SD: stuck in non-TRAN state r1=0x%lx st=%u (cmd13=ok), "
-             "skip re-identify\n",
+             "SD: stuck in non-TRAN state r1=0x%lx st=%u (cmd13=ok); "
+             "defer hard reset to background\n",
              (unsigned long)r1, sd1_r1_state(r1));
+      sd1_declare_dead("stuck non-TRAN");
       return -EIO;
     }
 
-  if (last_us != 0 && (now - last_us) < 1000000ull)
-    {
-      return -EAGAIN;
-    }
-
-  last_us = now;
-  if (mute)
-    {
-      mute_n++;
-    }
-
-  syslog(LOG_WARNING,
-         "SD: re-identify (%s) r1=0x%lx cmd13_mute=%d mute_n=%u clk=%ukHz\n",
+  syslog(LOG_ERR,
+         "SD: unstick failed (%s) r1=0x%lx; defer re-identify to background\n",
          mute ? "card mute, CMD13 no response" : "card idle after I/O fail",
-         (unsigned long)r1, mute ? 1 : 0, (unsigned)mute_n,
-         (unsigned)(g_sd_bus_hz / 1000));
-
-  ret = sf32lb_sd_identify();
-  if (ret == 0)
-    {
-      sd1_set_clock(SF32LB_SD_RETRY_CLOCK_HZ);
-      g_sd_bus_hz = SF32LB_SD_RETRY_CLOCK_HZ;
-      syslog(LOG_WARNING, "SD: re-identify OK (after %u mute tries)\n",
-             (unsigned)mute_n);
-      mute_n = 0;
-      g_sd_dead_mute = 0;
-    }
-  else
-    {
-      /* identify 会先切到 400 kHz 的识别时钟，失败路径上它不会自己切回来。
-       * 不补这一下，卡就永远停在 400 kHz：之后每次重试都慢 60 倍，整条
-       * 文件系统链路跟着一起卡。日志里的 `clk=` 也会跟着说谎。
-       */
-      sd1_set_clock(g_sd_bus_hz);
-
-      /* 判死：连续几次重识别都失败就别再每块都试了。一轮 2~4 秒的重试会把
-       * 所有文件系统调用者卡住，UI 心跳一停看门狗就不喂 —— 那才是"卡死后
-       * 只能关机"的直接原因。判死之后 -EIO 立即返回，只按周期试硬复位。
-       */
-      if (mute)
-        {
-          if (g_sd_dead_mute < 0xffffu)
-            {
-              g_sd_dead_mute++;
-            }
-        }
-      else
-        {
-          g_sd_dead_mute = 0;
-        }
-
-      syslog(LOG_ERR,
-             "SD: re-identify FAILED ret=%d mute_n=%u clk=%ukHz dead_run=%u (bus clock restored)\n",
-             ret, (unsigned)mute_n, (unsigned)(g_sd_bus_hz / 1000),
-             (unsigned)g_sd_dead_mute);
-
-      if (!g_sd_dead && g_sd_dead_mute >= SF32LB_SD_DEAD_AFTER)
-        {
-          g_sd_dead = true;
-          g_sd_dead_since_us = sd1_mono_us();
-          g_sd_dead_try_us = g_sd_dead_since_us;
-          syslog(LOG_ERR,
-                 "SD: declared DEAD after %u failed re-identify (mute_n=%u); fast -EIO from now on, hard reset every %u ms\n",
-                 (unsigned)g_sd_dead_mute, (unsigned)mute_n,
-                 (unsigned)SF32LB_SD_DEAD_RETRY_MS);
-        }
-    }
-
-  return ret;
+         (unsigned long)r1);
+  sd1_declare_dead(mute ? "card mute" : "lost TRAN");
+  return -EIO;
 }
 
 /* 把 SR 的错误位解成人能读的名字，对齐官方驱动的分类
@@ -1726,11 +1852,32 @@ static const char *sd1_sr_why(uint32_t sr)
   return "noerr_idle";
 }
 
+/**
+ * @brief 单次 I/O 调用的时间预算是否已经用光。
+ *
+ * @details 只在**重试之间**查，不会打断一次正常的传输。用光就按判死处理：
+ *          这块（这一批）数据不要了，上层画空片/报错，重识别交给后台。
+ *
+ *          读写用不同预算：读是 UI 路径（瓦片/GPX），400 ms 就够；写本来就有
+ *          合法的 2 s DAT0-program 等待（`SF32LB_SD_BUSY_US`），用 400 ms 会把
+ *          健康卡误判死，所以写给 2.5 s —— 仍是有界，只是界更宽。
+ */
+static bool sd1_budget_spent(uint64_t t0, uint32_t budget_us)
+{
+  return (sd1_mono_us() - t0) > budget_us;
+}
+
+#define SD1_READ_BUDGET_US   ((uint32_t)SF32LB_SD_CALL_BUDGET_US)
+#define SD1_WRITE_BUDGET_US  ((uint32_t)SF32LB_SD_WRITE_BUDGET_US)
+
 static int sf32lb_sd_read_block_retry(uint64_t card_byte_addr,
                                       FAR uint8_t *dst)
 {
+  uint64_t t0 = sd1_mono_us();
   int ret;
   int t;
+
+  g_sd_call_first_valid = false;
 
   if (sd1_dead_fail_fast())
     {
@@ -1751,8 +1898,22 @@ static int sf32lb_sd_read_block_retry(uint64_t card_byte_addr,
 
   for (t = 1; t <= SF32LB_SD_IO_RETRIES; t++)
     {
+      if (sd1_budget_spent(t0, SD1_READ_BUDGET_US))
+        {
+          sd1_declare_dead("read budget");
+          return -EIO;
+        }
+
       g_sd_diag.rd_retry++;
       sd1_recover_after_error();
+
+      /* 收尾本身也可能把预算吃光（Codex R3 P1-3）：重放前再查一次。 */
+      if (sd1_budget_spent(t0, SD1_READ_BUDGET_US))
+        {
+          sd1_declare_dead("read budget after recover");
+          return -EIO;
+        }
+
       ret = sf32lb_sd_read_block(card_byte_addr, dst);
       if (ret >= 0)
         {
@@ -1762,6 +1923,12 @@ static int sf32lb_sd_read_block_retry(uint64_t card_byte_addr,
                  (unsigned)(g_sd_bus_hz / 1000), t);
           return ret;
         }
+    }
+
+  if (sd1_budget_spent(t0, SD1_READ_BUDGET_US))
+    {
+      sd1_declare_dead("read budget");
+      return -EIO;
     }
 
   sd1_set_clock(SF32LB_SD_RETRY_CLOCK_HZ);
@@ -1794,8 +1961,15 @@ static int sf32lb_sd_read_block_retry(uint64_t card_byte_addr,
          (unsigned long)g_sd_last_sr, sd1_sr_why(g_sd_last_sr),
          (unsigned long)g_sd_diag.rd_retry,
          (unsigned long)g_sd_diag.rd_fail);
-  if (sd1_reinit_card() == 0)
+  if (sd1_reinit_card(t0, SD1_READ_BUDGET_US) == 0)
     {
+      /* 解卡本身也可能把预算耗尽（Codex R4 P1-3）：重放前再查一次。 */
+      if (sd1_budget_spent(t0, SD1_READ_BUDGET_US))
+        {
+          sd1_declare_dead("read budget before replay");
+          return -EIO;
+        }
+
       ret = sf32lb_sd_read_block(card_byte_addr, dst);
       if (ret >= 0)
         {
@@ -1813,8 +1987,11 @@ static int sf32lb_sd_write_block_retry(uint64_t card_byte_addr,
                                        FAR const uint8_t *src)
 {
   uint32_t crc0 = g_sd_diag.wr_crc;
+  uint64_t t0 = sd1_mono_us();
   int ret;
   int t;
+
+  g_sd_call_first_valid = false;
 
   if (sd1_dead_fail_fast())
     {
@@ -1827,6 +2004,7 @@ static int sf32lb_sd_write_block_retry(uint64_t card_byte_addr,
       sd1_restore_tran_clock();
       return ret;
     }
+
 
   /* CRC: sampling glitch → drop the clock.  Timeout: DAT0-busy / aborted
    * program; downclocking does not help and the old "stay at 6 MHz" path
@@ -1841,8 +2019,21 @@ static int sf32lb_sd_write_block_retry(uint64_t card_byte_addr,
 
   for (t = 1; t <= SF32LB_SD_IO_RETRIES; t++)
     {
+      if (sd1_budget_spent(t0, SD1_WRITE_BUDGET_US))
+        {
+          sd1_declare_dead("write budget");
+          return -EIO;
+        }
+
       g_sd_diag.wr_retry++;
       sd1_recover_after_error();
+
+      if (sd1_budget_spent(t0, SD1_WRITE_BUDGET_US))
+        {
+          sd1_declare_dead("write budget after recover");
+          return -EIO;
+        }
+
       ret = sf32lb_sd_write_block(card_byte_addr, src);
       if (ret >= 0)
         {
@@ -1873,15 +2064,24 @@ static int sf32lb_sd_write_block_retry(uint64_t card_byte_addr,
   else
     {
       g_sd_diag.wr_fail++;
-      syslog(LOG_ERR,
+      /* 2026-09-25（口径：可恢复异常→WARN）：后面紧跟重放/重识别，数据不丢、卡片能
+       * 自己醒过来 ⇒ 降为 WARNING。真正的终态失败（`SD: declared DEAD`、
+       * `LFS: mounted READ-ONLY`）仍是 ERROR。 */
+      syslog(LOG_WARNING,
              "SD: write addr=0x%llx FAILED after %d tries "
              "(rca=0x%04x clk=%u kHz sr=0x%lx)\n",
              (unsigned long long)card_byte_addr, SF32LB_SD_IO_RETRIES + 1,
              g_sd_rca, (unsigned)(g_sd_bus_hz / 1000),
              (unsigned long)g_sd_last_sr);
       sf32lb_sd_diag_dump("write-fail");
-      if (sd1_reinit_card() == 0)
+      if (sd1_reinit_card(t0, SD1_WRITE_BUDGET_US) == 0)
         {
+          if (sd1_budget_spent(t0, SD1_WRITE_BUDGET_US))
+            {
+              sd1_declare_dead("write budget before replay");
+              return -EIO;
+            }
+
           ret = sf32lb_sd_write_block(card_byte_addr, src);
           if (ret >= 0)
             {
@@ -1929,8 +2129,18 @@ static uint8_t sf32lb_sd_dma_wait(FAR DMA_HandleTypeDef *hdma, bool is_write,
 
   while ((hdma->DmaBaseAddress->ISR & tc) == 0)
     {
+      /* 预算要在**等待过程中**复查：`dma_to` 是进函数时截的，传输前的
+       * DATA_BUSY 等待已经吃掉一截，这里再一次性等满就会超支（Codex R4 P1-3）。 */
+      if (sd1_deadline_passed())
+        {
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
+          (void)HAL_DMA_Abort(hdma);
+          return SD_TIMEOUT;
+        }
+
       if ((hdma->DmaBaseAddress->ISR & te) != 0)
         {
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
           (void)HAL_DMA_Abort(hdma);
           if (is_write)
             {
@@ -1946,6 +2156,7 @@ static uint8_t sf32lb_sd_dma_wait(FAR DMA_HandleTypeDef *hdma, bool is_write,
 
       if ((hwp_sdmmc1->SR & err_mask) != 0)
         {
+          sd1_note_fail_sr(hwp_sdmmc1->SR);
           (void)HAL_DMA_Abort(hdma);
           if ((hwp_sdmmc1->SR & SD_SR_DATA_TIMEOUT) != 0)
             {
@@ -1991,6 +2202,7 @@ static uint8_t sf32lb_sd_dma_wait(FAR DMA_HandleTypeDef *hdma, bool is_write,
 
   if (HAL_DMA_PollForTransfer(hdma, HAL_DMA_FULL_TRANSFER, 0) != HAL_OK)
     {
+      sd1_note_fail_sr(hwp_sdmmc1->SR);
       (void)HAL_DMA_Abort(hdma);
       if (is_write)
         {
@@ -2044,7 +2256,10 @@ static int sf32lb_sd_rt_xfer(bool is_write, uint64_t card_byte_addr,
 
   cmd = is_write ? (nblocks > 1 ? 25 : 24) : (nblocks > 1 ? 18 : 17);
   dir = is_write ? 0 : SD_DCR_R_WN;
-  dma_to = is_write ? SF32LB_SD_WRITE_WAIT_US : 200000ull;
+  /* DMA 阶段也要截到剩余预算：数据错误/超时下这里原本能等 200 ms（读）或
+   * 2 s（写），是"400 ms 预算"之外的又一个缺口（Codex R3 P1-3）。 */
+  dma_to = is_write ? sd1_deadline_cap(SF32LB_SD_WRITE_WAIT_US)
+                    : sd1_deadline_cap(200000ull);
 
   hwp_sdmmc1->DCR = 0;
   (void)sd1_wait_card_idle();
@@ -2116,7 +2331,7 @@ static int sf32lb_sd_rt_xfer(bool is_write, uint64_t card_byte_addr,
       if ((r1 & SF32LB_SD_R1_STATE_MASK) == SF32LB_SD_R1_STATE_PRG)
         {
           (void)HAL_DMA_Abort(hdma);
-          g_sd_last_sr = r1;
+          sd1_note_fail_sr(r1);
           (void)sd1_wait_dat0(SF32LB_SD_WRITE_MAX_US);
           goto stop;
         }
@@ -2201,8 +2416,11 @@ stop:
 static int sf32lb_sd_rt_xfer_retry(bool is_write, uint64_t card_byte_addr,
                                    FAR uint8_t *buf, uint32_t nblocks)
 {
+  uint64_t t0 = sd1_mono_us();
   int ret;
   int t;
+
+  g_sd_call_first_valid = false;
   uint8_t cmd = is_write ? (nblocks > 1 ? 25 : 24) :
                 (nblocks > 1 ? 18 : 17);
 
@@ -2222,8 +2440,16 @@ static int sf32lb_sd_rt_xfer_retry(bool is_write, uint64_t card_byte_addr,
       return ret;
     }
 
+
   for (t = 1; t <= SF32LB_SD_IO_RETRIES; t++)
     {
+      if (sd1_budget_spent(t0, is_write ? SD1_WRITE_BUDGET_US
+                                     : SD1_READ_BUDGET_US))
+        {
+          sd1_declare_dead(is_write ? "xfer write budget" : "xfer read budget");
+          return -EIO;
+        }
+
       if (is_write)
         {
           g_sd_diag.wr_retry++;
@@ -2234,6 +2460,15 @@ static int sf32lb_sd_rt_xfer_retry(bool is_write, uint64_t card_byte_addr,
         }
 
       sd1_recover_after_error();
+
+      if (sd1_budget_spent(t0, is_write ? SD1_WRITE_BUDGET_US
+                                       : SD1_READ_BUDGET_US))
+        {
+          sd1_declare_dead(is_write ? "xfer write budget after recover"
+                                    : "xfer read budget after recover");
+          return -EIO;
+        }
+
       ret = sf32lb_sd_rt_xfer(is_write, card_byte_addr, buf, nblocks);
       if (ret >= 0)
         {
@@ -2246,6 +2481,13 @@ static int sf32lb_sd_rt_xfer_retry(bool is_write, uint64_t card_byte_addr,
                  (unsigned)(g_sd_bus_hz / 1000), t);
           return ret;
         }
+    }
+
+  if (sd1_budget_spent(t0, is_write ? SD1_WRITE_BUDGET_US
+                                 : SD1_READ_BUDGET_US))
+    {
+      sd1_declare_dead(is_write ? "xfer write budget" : "xfer read budget");
+      return -EIO;
     }
 
   sd1_set_clock(SF32LB_SD_RETRY_CLOCK_HZ);
@@ -2282,12 +2524,25 @@ static int sf32lb_sd_rt_xfer_retry(bool is_write, uint64_t card_byte_addr,
       g_sd_diag.rd_fail++;
     }
 
-  syslog(LOG_ERR, "SD: CMD%u addr=0x%llx n=%lu FAILED after %d tries (rca=0x%04x sr=0x%08lx why=%s)\n",
+  /* 2026-09-25（口径：可恢复异常→WARN）：下一行就是 `sd1_reinit_card()` + 原样重放，
+   * 实测卡片能恢复、数据不丢 ⇒ 降为 WARNING。终态失败仍由 `SD: declared DEAD` /
+   * `LFS: mounted READ-ONLY` 以 ERROR 报出。 */
+  syslog(LOG_WARNING,
+         "SD: CMD%u addr=0x%llx n=%lu FAILED after %d tries (rca=0x%04x sr=0x%08lx why=%s)\n",
          cmd, (unsigned long long)card_byte_addr, (unsigned long)nblocks,
          SF32LB_SD_IO_RETRIES + 1, g_sd_rca,
          (unsigned long)g_sd_last_sr, sd1_sr_why(g_sd_last_sr));
-  if (sd1_reinit_card() == 0)
+  if (sd1_reinit_card(t0, is_write ? SD1_WRITE_BUDGET_US
+                                 : SD1_READ_BUDGET_US) == 0)
     {
+      if (sd1_budget_spent(t0, is_write ? SD1_WRITE_BUDGET_US
+                                       : SD1_READ_BUDGET_US))
+        {
+          sd1_declare_dead(is_write ? "xfer write budget before replay"
+                                    : "xfer read budget before replay");
+          return -EIO;
+        }
+
       ret = sf32lb_sd_rt_xfer(is_write, card_byte_addr, buf, nblocks);
       if (ret >= 0)
         {
@@ -2312,6 +2567,15 @@ static int sf32lb_sd_read_region(uint64_t byte_off, FAR uint8_t *buf,
       uint32_t n = len / SD_HW_BLOCK_SIZE;
       uint32_t i;
 
+      /* 一次 region 读可能跨多批（每批最多 8 块）：批与批之间也要查预算，
+       * 否则 400 ms 只是"每批"的上限（Codex R3 P1-3）。批间超时同样要判死，
+       * 否则调用者拿到 -EIO 却没有后台复活（Codex R4 P1-3）。 */
+      if (sd1_deadline_passed())
+        {
+          sd1_declare_dead("region budget");
+          return -EIO;
+        }
+
       if (n > SF32LB_SD_CMD18_MAX_BLOCKS)
         {
           n = SF32LB_SD_CMD18_MAX_BLOCKS;
@@ -2325,7 +2589,7 @@ static int sf32lb_sd_read_region(uint64_t byte_off, FAR uint8_t *buf,
               /* 判死期间 rt_xfer_retry 是**故意**直接 -EIO 的，不是 DMA 出错，
                * 所以既不该降级重试也不该刷 "fallback" 警告 —— 卡都没了，
                * 每读一个 region 打一行会把日志淹掉（现场就是这样）。 */
-              if (g_sd_dead)
+              if (sf32lb_sd_dead())
                 {
                   return ret;
                 }
@@ -2403,7 +2667,7 @@ static int sf32lb_sd_write_region(uint64_t byte_off, FAR const uint8_t *buf,
           if (ret < 0)
             {
               /* 同读侧：判死是 rt_xfer_retry 故意返回的，不降级也不刷警告。 */
-              if (g_sd_dead)
+              if (sf32lb_sd_dead())
                 {
                   return ret;
                 }
@@ -2511,11 +2775,25 @@ static ssize_t sf32lb_sd_bread(FAR struct mtd_dev_s *dev, off_t startblock,
   g_sd_stats.bread_pages += nblocks;
 #endif
 
+  /* 判死快速失败必须发生在**取总线锁之前**：复活任务持锁做硬复位 + 全量
+   * identify 要数秒，在这里排队等锁等于把整机再冻一次（Codex R1 P1-1）。
+   * 判死期间 `sd1_dead_fail_fast()` 本来也只返回 -EIO，所以提前返回不丢语义。 */
+  if (sf32lb_sd_dead())
+    {
+      /* 顺手补一次复活调度：判死而"没有任务在跑"是可能出现的（任务刚清标志
+       * 又被判死、或 task_create 当时失败），这条入口是最后的兜底
+       *（Codex R2 N1/N2）。函数内部用原子占用，重复调用无害。 */
+      sd1_schedule_revive();
+      return -EIO;
+    }
+
   byte_off = (uint64_t)priv->byte_offset +
              (uint64_t)startblock * priv->page_size;
   sf32lb_sd_bus_lock(priv->kv_prio);
+  sd1_deadline_set(SD1_READ_BUDGET_US);
   ret = sf32lb_sd_read_region(byte_off, buffer,
                               (uint32_t)nblocks * priv->page_size);
+  sd1_deadline_clear();
   sf32lb_sd_bus_unlock();
   sf32lb_sd_io_progress();
   return ret < 0 ? ret : (ssize_t)nblocks;
@@ -2540,11 +2818,25 @@ static ssize_t sf32lb_sd_bwrite(FAR struct mtd_dev_s *dev, off_t startblock,
   g_sd_stats.bwrite_pages += nblocks;
 #endif
 
+  /* 判死快速失败必须发生在**取总线锁之前**：复活任务持锁做硬复位 + 全量
+   * identify 要数秒，在这里排队等锁等于把整机再冻一次（Codex R1 P1-1）。
+   * 判死期间 `sd1_dead_fail_fast()` 本来也只返回 -EIO，所以提前返回不丢语义。 */
+  if (sf32lb_sd_dead())
+    {
+      /* 顺手补一次复活调度：判死而"没有任务在跑"是可能出现的（任务刚清标志
+       * 又被判死、或 task_create 当时失败），这条入口是最后的兜底
+       *（Codex R2 N1/N2）。函数内部用原子占用，重复调用无害。 */
+      sd1_schedule_revive();
+      return -EIO;
+    }
+
   byte_off = (uint64_t)priv->byte_offset +
              (uint64_t)startblock * priv->page_size;
   sf32lb_sd_bus_lock(priv->kv_prio);
+  sd1_deadline_set(SD1_WRITE_BUDGET_US);
   ret = sf32lb_sd_write_region(byte_off, buffer,
                                (uint32_t)nblocks * priv->page_size);
+  sd1_deadline_clear();
   sf32lb_sd_bus_unlock();
   sf32lb_sd_io_progress();
   return ret < 0 ? ret : (ssize_t)nblocks;
@@ -2576,11 +2868,25 @@ static int sf32lb_sd_erase(FAR struct mtd_dev_s *dev, off_t startblock,
   g_sd_stats.erase_blocks += nblocks;
 #endif
 
+  /* 判死快速失败必须发生在**取总线锁之前**：复活任务持锁做硬复位 + 全量
+   * identify 要数秒，在这里排队等锁等于把整机再冻一次（Codex R1 P1-1）。
+   * 判死期间 `sd1_dead_fail_fast()` 本来也只返回 -EIO，所以提前返回不丢语义。 */
+  if (sf32lb_sd_dead())
+    {
+      /* 顺手补一次复活调度：判死而"没有任务在跑"是可能出现的（任务刚清标志
+       * 又被判死、或 task_create 当时失败），这条入口是最后的兜底
+       *（Codex R2 N1/N2）。函数内部用原子占用，重复调用无害。 */
+      sd1_schedule_revive();
+      return -EIO;
+    }
+
   byte_off = (uint64_t)priv->byte_offset +
              (uint64_t)startblock * priv->erase_size;
   nbytes = (uint32_t)nblocks * priv->erase_size;
 
   sf32lb_sd_bus_lock(priv->kv_prio);
+  sd1_deadline_set(SD1_WRITE_BUDGET_US);
+  g_sd_call_first_valid = false;
   memset(g_sd_blkbuf, 0xff, sizeof(g_sd_blkbuf));
   while (nbytes >= SD_HW_BLOCK_SIZE)
     {
@@ -2588,6 +2894,16 @@ static int sf32lb_sd_erase(FAR struct mtd_dev_s *dev, off_t startblock,
 
       for (t = 0, ret = -EIO; t <= SF32LB_SD_IO_RETRIES; t++)
         {
+          /* erase 也是块 I/O：判死/超预算就不再往下擦（Codex R1 P1-3）。
+           * 预算按**每个 512 B 块**重算（见循环末尾），不是整次 erase ——
+           * 一个 4 KiB erase = 8 次合法写，按整次算会把健康慢卡切断在半路
+           *（Codex R2 N3）。 */
+          if (sf32lb_sd_dead() || sd1_deadline_passed())
+            {
+              ret = -EIO;
+              break;
+            }
+
           ret = sf32lb_sd_program_staged(byte_off);
           if (ret >= 0)
             {
@@ -2604,8 +2920,24 @@ static int sf32lb_sd_erase(FAR struct mtd_dev_s *dev, off_t startblock,
 
       byte_off += SD_HW_BLOCK_SIZE;
       nbytes -= SD_HW_BLOCK_SIZE;
+      sd1_deadline_set(SD1_WRITE_BUDGET_US);
     }
 
+  if (ret < 0)
+    {
+      /* 预算耗尽也要走判死/复活，否则这次擦除只是"静默中止"，卡还停在
+       * 一个没人修的状态（Codex R3 P2-N3）。 */
+      if (sd1_deadline_passed() && !sf32lb_sd_dead())
+        {
+          sd1_declare_dead("erase budget");
+        }
+
+      syslog(LOG_WARNING, "SD: erase aborted at 0x%llx (%s)\n",
+             (unsigned long long)byte_off,
+             sf32lb_sd_dead() ? "dead" : "io");
+    }
+
+  sd1_deadline_clear();
   sf32lb_sd_bus_unlock();
   sf32lb_sd_io_progress();
   return ret < 0 ? ret : (int)nblocks;
@@ -2711,44 +3043,251 @@ static int sd1_hard_reset(void)
 }
 
 /**
- * @brief 判死后的快速失败闸门，顺带按周期做一次硬复位复活尝试。
+ * @brief 声明判死：此后的 I/O 全部立即 -EIO，重识别交给后台任务。
+ *
+ * @details 判死不是"放弃"，而是把**数秒级的恢复动作**从调用者线程搬走。
+ *          第一次判死时记时刻；`g_sd_dead_try_us` 只由复活任务推进，所以
+ *          再怎么频繁失败也不会把复活周期往后推（否则 diag 每 500 ms 一次
+ *          的探针能让复活永远排不上队）。
+ *
+ * @param why 判死原因（只进日志，日志里已带固定前缀）。
+ * @note 由持有 `g_sd_lock` 的 I/O 路径调用。
+ */
+static void sd1_declare_dead(const char * why)
+{
+  if (!sf32lb_sd_dead())
+    {
+      uint64_t now = sd1_mono_us();
+
+      __atomic_store_n(&g_sd_dead, true, __ATOMIC_RELAXED);
+      g_sd_dead_since_us = now;
+      g_sd_dead_try_us = now;
+      g_sd_dead_mute = 0;
+      /* `first_sr` 只在本次调用真的记过失败时才有意义：批间到期这类早退
+       * 可能一条失败都没记录，别把上一次调用留下的 SR 当成这次的
+       *（Codex R5 P2-R1-10）。 */
+      if (g_sd_call_first_valid)
+        {
+          syslog(LOG_ERR,
+                 "SD: declared DEAD (%s); first_sr=0x%08lx (%s) "
+                 "last_sr=0x%08lx (%s); fast -EIO from now on, "
+                 "revive in background every %u..%u ms\n",
+                 why,
+                 (unsigned long)g_sd_call_first_sr,
+                 sd1_sr_why(g_sd_call_first_sr),
+                 (unsigned long)g_sd_last_sr, sd1_sr_why(g_sd_last_sr),
+                 (unsigned)SF32LB_SD_DEAD_RETRY_FAST_MS,
+                 (unsigned)SF32LB_SD_DEAD_RETRY_MS);
+        }
+      else
+        {
+          syslog(LOG_ERR,
+                 "SD: declared DEAD (%s); no failure SR recorded; "
+                 "fast -EIO from now on, revive in background every %u..%u ms\n",
+                 why, (unsigned)SF32LB_SD_DEAD_RETRY_FAST_MS,
+                 (unsigned)SF32LB_SD_DEAD_RETRY_MS);
+        }
+    }
+
+  sd1_schedule_revive();
+}
+
+/**
+ * @brief 起一个后台复活任务（已在跑就不重复起）。
+ *
+ * @details 用 `task_create()`（**内核分配栈**），不用静态栈：
+ *          静态栈方案有个真实的反例（Codex R1 P1-2）—— 任务清
+ *          `g_sd_revive_active` 之后、真正退出之前被抢占，别的线程再判死就会
+ *          把同一个栈交给第二个任务。改用堆栈后，"提前清标志"最多多起一个
+ *          任务，不会有两个任务共用同一块栈。
+ *
+ *          创建失败也不重置 `g_sd_dead_try_us` 以外的任何东西：任务里会在
+ *          失败后自己按节奏重试（见 `sd1_revive_task`），不依赖"下一次 I/O
+ *          来踢一脚"。
+ */
+static void sd1_schedule_revive(void)
+{
+  uint32_t now_ms;
+  uint32_t cool_ms;
+  int pid;
+
+  /* 原子占用：这个函数也会被**无锁**的入口闸门调用（见 bread/bwrite/erase），
+   * 所以不能用"读一下再写"的检查方式。 */
+  if (__atomic_exchange_n(&g_sd_revive_active, true, __ATOMIC_ACQ_REL))
+    {
+      return;
+    }
+
+  /* 冷却检查放在**占用之后**：否则"检查通过 → 被抢占 → 别人创建失败并发布冷却
+   * → 自己恢复后照样创建"会绕过冷却（Codex R4 P2-N2）。
+   *
+   * `0` 是"没有冷却"的哨兵，必须单独判 —— 带符号半周期比较在开机约 24.86 天后
+   * 会把 0 当成"未来"（Codex R4 N4）。 */
+  now_ms = (uint32_t)(sd1_mono_us() / 1000ull);
+  if (g_sd_revive_next_ms != 0
+      && (int32_t)(now_ms - g_sd_revive_next_ms) < 0)
+    {
+      __atomic_store_n(&g_sd_revive_active, false, __ATOMIC_RELEASE);
+      return;
+    }
+
+  /* 冷却清零必须在**占用之后、创建之前**：放在创建之后的话，子任务可能已经
+   * 跑完并释放 active，别的线程在此期间发布的新冷却会被这里覆盖掉
+   *（Codex R5 N5）。此刻我们仍独占这一轮状态，清掉旧冷却才是安全的。 */
+  g_sd_revive_next_ms = 0;
+
+  pid = task_create("sd_revive", SF32LB_SD_REVIVE_PRIO,
+                    SF32LB_SD_REVIVE_STACK, sd1_revive_task, NULL);
+  if (pid < 0)
+    {
+      cool_ms = (g_sd_dead_mute >= SF32LB_SD_DEAD_AFTER)
+                    ? (uint32_t)SF32LB_SD_DEAD_RETRY_MS
+                    : (uint32_t)SF32LB_SD_DEAD_RETRY_FAST_MS;
+      g_sd_revive_next_ms = now_ms + cool_ms;
+      __atomic_store_n(&g_sd_revive_active, false, __ATOMIC_RELEASE);
+      syslog(LOG_ERR, "SD: revive task create failed errno=%d (retry in %u ms)\n",
+             errno, (unsigned)cool_ms);
+    }
+}
+
+/**
+ * @brief 后台复活：拉低接口域 → 重新 identify，失败自行按节奏重试。
+ *
+ * @details 每轮全程持 `g_sd_lock`（与普通 I/O 互斥）；成功则清判死并把总线
+ *          时钟恢复到 6 MHz 的安全档（TRAN 恢复由下一个调用者的
+ *          `sd1_restore_tran_clock()` 完成）。
+ *
+ *          **循环到复活成功**（或判死被别人清掉）为止：判死后上层（瓦片/GPX）
+ *          会主动跳过文件读，可能没有别的 I/O 来"再踢一脚"；只起一次的话
+ *          坏卡会永远停在判死态（Codex R1 P1-2）。
+ *
+ *          成功退出时还有个窄窗口（Codex R2 N1）：清 dead → 解锁 → 被 UI 抢占
+ *          并立刻再次失败判死 → 对方看到 `active` 仍为 true 就不再起任务 →
+ *          本任务再清 `active` 退出，结果 dead=true 但没有复活任务。
+ *          所以**先清 active、再复查 dead**：复查发现又被判死就原子抢回 active
+ *          继续救；抢不到说明别人已经起了新任务，这时才真的退出。
+ *
+ * @return 恒为 0（任务退出码无意义）。
+ */
+static int sd1_revive_task(int argc, FAR char * argv)
+{
+  (void)argc;
+  (void)argv;
+
+  for (;;)
+    {
+      uint64_t now;
+      uint32_t wait_ms;
+      int ret;
+
+      if (!sf32lb_sd_dead())
+        {
+          /* 已经有人救回来了。但"读到 false → 清 active → 退出"中间仍可能被
+           * 别人判死（Codex R3 P2-N1）：先清 active 再复查，复查发现又死了就
+           * 原子抢回 active 继续救；抢不到说明别人已经起了新任务。 */
+          __atomic_store_n(&g_sd_revive_active, false, __ATOMIC_RELEASE);
+          if (!sf32lb_sd_dead())
+            {
+              return 0;
+            }
+
+          if (__atomic_exchange_n(&g_sd_revive_active, true, __ATOMIC_ACQ_REL))
+            {
+              return 0;
+            }
+
+          continue;
+        }
+
+      nxmutex_lock(&g_sd_lock);
+      g_sd_dead_tries++;
+      ret = sd1_hard_reset();
+      now = sd1_mono_us();
+      g_sd_dead_try_us = now;
+
+      if (ret == 0)
+        {
+          __atomic_store_n(&g_sd_dead, false, __ATOMIC_RELAXED);
+          g_sd_dead_mute = 0;
+          sd1_set_clock(SF32LB_SD_RETRY_CLOCK_HZ);
+          g_sd_bus_hz = SF32LB_SD_RETRY_CLOCK_HZ;
+          nxmutex_unlock(&g_sd_lock);
+          syslog(LOG_WARNING,
+                 "SD: RECOVERED by hard reset #%lu (was dead %llu ms)\n",
+                 (unsigned long)g_sd_dead_tries,
+                 (unsigned long long)((now - g_sd_dead_since_us) / 1000ull));
+
+          /* 先让位，再复查：见上面的窄窗口说明。 */
+          __atomic_store_n(&g_sd_revive_active, false, __ATOMIC_RELEASE);
+          if (!sf32lb_sd_dead())
+            {
+              return 0;
+            }
+
+          if (__atomic_exchange_n(&g_sd_revive_active, true, __ATOMIC_ACQ_REL))
+            {
+              return 0;   /* 新任务已经接手 */
+            }
+
+          continue;
+        }
+
+      if (g_sd_dead_mute < 0xffffu)
+        {
+          g_sd_dead_mute++;
+        }
+
+      syslog(LOG_WARNING, "SD: still dead after hard reset #%lu (n=%u)\n",
+             (unsigned long)g_sd_dead_tries, (unsigned)g_sd_dead_mute);
+      nxmutex_unlock(&g_sd_lock);
+
+      /* 与 `sd1_dead_fail_fast()` 同一套节奏：前 DEAD_AFTER 次 5 s，之后 30 s。 */
+      wait_ms = (g_sd_dead_mute >= SF32LB_SD_DEAD_AFTER)
+                    ? (uint32_t)SF32LB_SD_DEAD_RETRY_MS
+                    : (uint32_t)SF32LB_SD_DEAD_RETRY_FAST_MS;
+      usleep(wait_ms * 1000u);
+    }
+
+  __atomic_store_n(&g_sd_revive_active, false, __ATOMIC_RELEASE);
+  return 0;
+}
+
+/**
+ * @brief 判死后的快速失败闸门（顺带按需起后台复活任务）。
  * @return true 表示调用方应立刻返回 -EIO；false 表示可以继续正常 I/O。
- * @note 调用方须已持有 `g_sd_lock`（复活尝试里的 identify 也要用它）。
+ * @note 调用方须已持有 `g_sd_lock`。这里**不再**做任何阻塞动作：判死期间
+ *       的时间全部还给调用者（UI 立刻画空片）。
  */
 static bool sd1_dead_fail_fast(void)
 {
   uint64_t now;
+  uint32_t retry_ms;
 
-  if (!g_sd_dead)
+  if (!sf32lb_sd_dead())
     {
       return false;
     }
 
   now = sd1_mono_us();
-  if ((now - g_sd_dead_try_us) < (uint64_t)SF32LB_SD_DEAD_RETRY_MS * 1000ull)
+
+  /* 头几次搏快一点（多半是瞬态），连续失败 `SF32LB_SD_DEAD_AFTER` 次后
+   * 退到 30 s —— 真坏的卡上别每 5 s 白折腾一次接口下电。 */
+  retry_ms = (g_sd_dead_mute >= SF32LB_SD_DEAD_AFTER)
+                 ? (uint32_t)SF32LB_SD_DEAD_RETRY_MS
+                 : (uint32_t)SF32LB_SD_DEAD_RETRY_FAST_MS;
+
+  if (!g_sd_revive_active
+      && (now - g_sd_dead_try_us) >= (uint64_t)retry_ms * 1000ull)
     {
-      return true;
+      sd1_schedule_revive();
     }
 
-  g_sd_dead_try_us = now;
-  g_sd_dead_tries++;
-
-  if (sd1_hard_reset() == 0)
-    {
-      g_sd_dead = false;
-      g_sd_dead_mute = 0;
-      sd1_set_clock(SF32LB_SD_RETRY_CLOCK_HZ);
-      g_sd_bus_hz = SF32LB_SD_RETRY_CLOCK_HZ;
-      syslog(LOG_WARNING,
-             "SD: RECOVERED by hard reset #%lu (was dead %llu ms)\n",
-             (unsigned long)g_sd_dead_tries,
-             (unsigned long long)((now - g_sd_dead_since_us) / 1000ull));
-      return false;
-    }
-
-  syslog(LOG_WARNING, "SD: still dead after hard reset #%lu\n",
-         (unsigned long)g_sd_dead_tries);
   return true;
+}
+
+bool sf32lb_sd_dead(void)
+{
+  return __atomic_load_n(&g_sd_dead, __ATOMIC_RELAXED);
 }
 
 /* MPI/SD 那路 mux 的源名。取值见 RCC_CLK_MPI_SD_*：0=SYSCLK 2=DLL2 3=DLL3。
@@ -2776,8 +3315,8 @@ static const char *sd_clk_src_name(uint32_t sel)
  *
  *          **第一层"卡还能不能读"用 FAT 探** —— FAT 和两个 LFS 在同一张卡上，
  *          所以"FAT 还能读"就是"卡没坏"的**独立证据**。这比看 g_sd_dead 强：
- *          g_sd_dead 是 SD 层自己的意见（而且只在 3 次重识别失败后才置起，
- *          中间有窗口），FAT 探测是直接测量。
+ *          g_sd_dead 是 SD 层自己的意见（重试阶梯超预算 / 解卡失败就置起，
+ *          复活前一直是它），FAT 探测是直接测量。
  *
  *          **第二层"LFS 能不能用"常态用 stat 探，异常才升到 statfs(df) 探** ——
  *          常态（两个挂载点都 stat 得到）直接判健康，**一整个 tick 零遍历**。
@@ -2885,6 +3424,16 @@ int sf32lb_sd_fs_heal(void)
   int ret = 0;
   int one;
 
+  /* 判死期间**不要**重挂：mount 里会调 `sf32lb_sd_identify()`（不持总线锁），
+   * 与后台复活任务的硬复位/identify 交错会同时改控制器和时钟（Codex R1 P1-1）。
+   * 这里的 `-EAGAIN` 就是"卡读不到"的既有语义，diag 会按 cooldown 再看。 */
+  if (sf32lb_sd_dead())
+    {
+      syslog(LOG_WARNING,
+             "LFS: heal skipped, SD declared dead (background revive owns it)\n");
+      return -EAGAIN;
+    }
+
   if (statfs(SF32LB_SD_FAT_MOUNTPOINT, &st) != 0)
     {
       syslog(LOG_WARNING, "LFS: heal skipped, card not readable via %s (SD layer owns it)\n",
@@ -2894,6 +3443,15 @@ int sf32lb_sd_fs_heal(void)
 
   if (statfs(SF32LB_SD_MOUNTPOINT, &st) != 0)
     {
+      /* statfs 自己就是一次块 I/O：它可能**刚刚**把卡判死（预算耗尽/解卡失败）。
+       * 这里必须复查，否则会带着判死状态去 umount + mount，而 mount 里的
+       * identify 不持总线锁，会和复活任务撞在一起（Codex R2 P1-1）。 */
+      if (sf32lb_sd_dead())
+        {
+          syslog(LOG_WARNING, "LFS: heal abort, SD became dead during probe\n");
+          return -EAGAIN;
+        }
+
       syslog(LOG_WARNING, "LFS: remount %s (card readable, FS is not)\n",
              SF32LB_SD_MOUNTPOINT);
       (void)umount(SF32LB_SD_MOUNTPOINT);
@@ -2908,6 +3466,14 @@ int sf32lb_sd_fs_heal(void)
 
   if (statfs(SF32LB_SD_KV_MOUNTPOINT, &st) != 0)
     {
+      /* 与 /mnt/lfs 同理：这次 statfs 可能刚把卡判死，不能再带着判死去重挂
+       *（Codex R3 P1-1）。 */
+      if (sf32lb_sd_dead())
+        {
+          syslog(LOG_WARNING, "LFS: heal abort, SD became dead during kv probe\n");
+          return -EAGAIN;
+        }
+
       syslog(LOG_WARNING, "LFS: remount %s (card readable, FS is not)\n",
              SF32LB_SD_KV_MOUNTPOINT);
       (void)umount(SF32LB_SD_KV_MOUNTPOINT);
@@ -3890,16 +4456,48 @@ int sf32lb_sd_mount_littlefs(int minor)
                "LFS: re-init card before retry %d (backoff %lu ms fail_run=%u)\n",
                attempt + 1, (unsigned long)backoff_ms, (unsigned)g_sd_fail_run);
 
-        if (sf32lb_sd_identify() != 0)
+        /* 判死期间不要做 identify：它与后台复活任务的硬复位/识别会同时改
+         * 控制器和时钟（Codex R2 P1-1）。开机挂载时 dead 恒为 false。 */
+        if (sf32lb_sd_dead())
           {
-            syslog(LOG_ERR, "LFS: card re-init FAILED before retry %d\n",
-                   attempt + 1);
-            sd1_set_clock(g_sd_bus_hz);
+            /* 这里**不能**碰时钟：复活任务此刻可能正持锁在 400 kHz 的 identify
+             * 阶段，无锁写 CLKCR 会打断它的识别（Codex R3 P1-1）。 */
+            syslog(LOG_WARNING,
+                   "LFS: mount aborted, SD dead (background revive owns it)\n");
+            return -EAGAIN;
           }
-        else
+
+        /* 识别本身也要在总线锁里做：只在上面查一次 dead 是 TOCTOU —— 检查通过
+         * 后被别人判死并启动复活，两个识别流程仍会交错（Codex R3 P1-1）。 */
+        nxmutex_lock(&g_sd_lock);
+        if (sf32lb_sd_dead())
+          {
+            nxmutex_unlock(&g_sd_lock);
+            syslog(LOG_WARNING,
+                   "LFS: mount aborted, SD died before identify\n");
+            return -EAGAIN;
+          }
+
+        ret = sf32lb_sd_identify();
+
+        /* 时钟恢复必须还在锁里做完：解锁后再 `sd1_set_clock()` 可能正好撞上
+         * 复活任务持锁的 400 kHz identify 阶段，把那一次识别打断
+         *（Codex R4 P1-1）。 */
+        if (ret == 0)
           {
             sd1_set_clock(SF32LB_SD_TRAN_CLOCK_HZ);
             g_sd_bus_hz = SF32LB_SD_TRAN_CLOCK_HZ;
+          }
+
+        nxmutex_unlock(&g_sd_lock);
+
+        if (ret != 0)
+          {
+            syslog(LOG_ERR, "LFS: card re-init FAILED before retry %d\n",
+                   attempt + 1);
+          }
+        else
+          {
             syslog(LOG_WARNING, "LFS: card re-init ok before retry %d\n",
                    attempt + 1);
           }
@@ -4288,7 +4886,7 @@ int sf32lb_sd_crash_reinit(void)
   g_sd_baremetal = true;
   g_sd_dma = false;
   g_sd_card_ready = false;
-  g_sd_dead = false;
+  __atomic_store_n(&g_sd_dead, false, __ATOMIC_RELAXED);
   g_sd_reinit_used = false;
 
   hwp_sdmmc1->IER = 0;

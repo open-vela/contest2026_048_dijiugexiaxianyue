@@ -73,7 +73,7 @@ usage() {
       UART 烧录清单（chip、memory、各 bin 的 NAND 地址）。
       由 build_board.py flash 读取；镜像路径解析为:
         ftab.bin / bootloader.bin → boot_loader/bin/
-        nuttx.bin                 → cmake_out/my_vendor_nsh/（或 --nuttx-dir）
+        nuttx.bin                 → cmake_out/helmone_nsh/（或 --nuttx-dir）
 
   jlink_nand.conf
       J-Link 调试/烧录参考配置（SF32LB52X_NAND），可选；

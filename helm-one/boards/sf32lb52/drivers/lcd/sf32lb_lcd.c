@@ -51,6 +51,7 @@
 
 #include "drv_io.h"
 #include "sf32lb_lcd.h"
+#include "sf32lb_lcd_async.h"
 
 /* Force linker to pull in LCD driver objects from static library.
  * LCD_DRIVER_EXPORT places descriptors in the LcdDriverDescTab section,
@@ -103,6 +104,20 @@ struct sf32lb_lcd_dev_s
 static struct sf32lb_lcd_dev_s s_drv_lcd;
 static volatile bool s_fb_registering;
 static volatile bool s_lcd_hw_ready;
+
+/* LVGL direct-flush path: one LCDC/QSPI transfer in flight, completion
+ * reported from the LCDC EOF interrupt (no worker thread).
+ */
+struct sf32lb_lcd_async_s
+{
+  volatile bool            pending;
+  volatile int             status;
+  sf32lb_lcd_async_done_t  done;
+  void                    *arg;
+};
+
+static struct sf32lb_lcd_async_s s_async;
+static sem_t s_async_done_sem;
 
 static void sf32lb_lcd_ensure_display_on(FAR struct sf32lb_lcd_dev_s *dev)
 {
@@ -257,7 +272,6 @@ static void SendLayerDataErrCbk(LCDC_HandleTypeDef *lcdc)
     lcdinfo("SendLayerDataErrCbk \r\n");
 }
 
-
 static void sf32lb_lcd_wrram(FAR struct sf32lb_lcd_dev_s *dev, FAR const uint8_t *buffer,
                           uint16_t x0, uint16_t y0,
                           uint16_t x1, uint16_t y1)
@@ -325,8 +339,234 @@ static void sf32lb_lcd_wrram(FAR struct sf32lb_lcd_dev_s *dev, FAR const uint8_t
    }
 }
 
+/****************************************************************************
+ * Name:  sf32lb_lcd_async_finish
+ *
+ * Description:
+ *   Complete one async transfer: clear the pending flag, wake waiters and
+ *   invoke the caller callback.  Runs either from the LCDC EOF interrupt
+ *   (normal path) or synchronously when HAL refuses to start the transfer.
+ *
+ ****************************************************************************/
 
-                           
+static void sf32lb_lcd_async_finish(int status)
+{
+  sf32lb_lcd_async_done_t done;
+  void *arg;
+
+  done = s_async.done;
+  arg  = s_async.arg;
+
+  s_async.done    = NULL;
+  s_async.arg     = NULL;
+  s_async.pending = false;
+  s_async.status  = status;
+
+  sem_post(&s_async_done_sem);
+
+  if (done != NULL)
+    {
+      done(arg, status);
+    }
+}
+
+/****************************************************************************
+ * Name:  sf32lb_lcd_async_cplt_cb
+ *
+ * Description:
+ *   LCDC EOF callback (interrupt context).  HAL has already set the handle
+ *   back to READY before calling us, so the next strip can be programmed
+ *   from the UI thread as soon as this returns.
+ *
+ ****************************************************************************/
+
+static void sf32lb_lcd_async_cplt_cb(LCDC_HandleTypeDef *lcdc)
+{
+  lcdc->XferCpltCallback = NULL;
+  sf32lb_lcd_async_finish(0);
+}
+
+/****************************************************************************
+ * Name:  sf32lb_lcd_async_err_cb
+ *
+ * Description:
+ *   HAL transfer error callback.  May be invoked synchronously from
+ *   WriteMultiplePixels() when the transfer cannot be started.
+ *
+ ****************************************************************************/
+
+static void sf32lb_lcd_async_err_cb(LCDC_HandleTypeDef *lcdc)
+{
+  lcdc->XferErrorCallback = NULL;
+
+  if (s_async.pending)
+    {
+      sf32lb_lcd_async_finish(-EIO);
+    }
+}
+
+/****************************************************************************
+ * Name:  sf32lb_lcd_putarea_async
+ *
+ * Description:
+ *   Program one packed full-width RGB565 strip and start the QSPI transfer
+ *   without waiting for it.  The completion callback is invoked from the
+ *   LCDC interrupt; see sf32lb_lcd_async.h.
+ *
+ ****************************************************************************/
+
+int sf32lb_lcd_putarea_async(fb_coord_t row_start, fb_coord_t row_end,
+                             fb_coord_t col_start, fb_coord_t col_end,
+                             const uint8_t *buffer, fb_coord_t stride,
+                             sf32lb_lcd_async_done_t done, void *arg)
+{
+  FAR struct sf32lb_lcd_dev_s *priv = &s_drv_lcd;
+  size_t bytes_per_pixel;
+  size_t row_bytes;
+  size_t rows;
+
+  if (!s_lcd_hw_ready || s_fb_registering ||
+      priv->p_drv_ops == NULL || priv->p_drv_ops->p_ops == NULL ||
+      priv->p_drv_ops->p_ops->WriteMultiplePixels == NULL)
+    {
+      return -ENODEV;
+    }
+
+  if (buffer == NULL || row_start > row_end || col_start > col_end ||
+      row_start < 0 || col_start < 0)
+    {
+      return -EINVAL;
+    }
+
+  bytes_per_pixel = (size_t)priv->bpp >> 3;
+  if (bytes_per_pixel != 2)
+    {
+      /* Direct path is RGB565-only; RGB332 callers stay on PUTAREA. */
+      return -ENOTSUP;
+    }
+
+  row_bytes = (size_t)(col_end - col_start + 1) * bytes_per_pixel;
+  if ((size_t)stride != row_bytes)
+    {
+      return -EINVAL;
+    }
+
+  rows = (size_t)(row_end - row_start + 1);
+  if (rows == 0 || rows * row_bytes > SF32LB_LCD_ASYNC_MAX_BYTES)
+    {
+      return -E2BIG;
+    }
+
+  if (s_async.pending || priv->hlcdc.State != HAL_LCDC_STATE_READY)
+    {
+      return -EBUSY;
+    }
+
+  /* Window commands go over the same QSPI link but are short synchronous
+   * sends; they must be issued while the engine is idle (checked above).
+   */
+  sf32lb_lcd_setarea(priv, (uint16_t)col_start, (uint16_t)row_start,
+                     (uint16_t)col_end, (uint16_t)row_end);
+
+  /* Drain completion tokens left by a previously timed-out waiter. */
+
+  while (sem_trywait(&s_async_done_sem) == 0)
+    {
+    }
+
+  s_async.done    = done;
+  s_async.arg     = arg;
+  s_async.status  = 0;
+  s_async.pending = true;
+
+  priv->hlcdc.XferCpltCallback   = sf32lb_lcd_async_cplt_cb;
+  priv->hlcdc.XferErrorCallback  = sf32lb_lcd_async_err_cb;
+  priv->hlcdc.debug_cnt0++;
+
+  /* Strip buffers live in non-cacheable HCPU SRAM (mpu_config()), so no
+   * D-cache clean is needed here.  Do not add a full-screen clean.
+   */
+
+  priv->p_drv_ops->p_ops->WriteMultiplePixels(&priv->hlcdc,
+      (uint8_t *)buffer, (uint16_t)col_start, (uint16_t)row_start,
+      (uint16_t)col_end, (uint16_t)row_end);
+
+  /* A very short transfer (or a start failure) may have completed inside
+   * WriteMultiplePixels(); the callback already ran in that case.
+   */
+
+  if (!s_async.pending)
+    {
+      return s_async.status;
+    }
+
+  if (priv->hlcdc.State != HAL_LCDC_STATE_BUSY)
+    {
+      s_async.pending               = false;
+      s_async.done                  = NULL;
+      s_async.arg                   = NULL;
+      priv->hlcdc.XferCpltCallback  = NULL;
+      priv->hlcdc.XferErrorCallback = NULL;
+      return -EIO;
+    }
+
+  return 0;
+}
+
+/****************************************************************************
+ * Name:  sf32lb_lcd_async_busy
+ ****************************************************************************/
+
+bool sf32lb_lcd_async_busy(void)
+{
+  return s_async.pending ||
+         s_drv_lcd.hlcdc.State == HAL_LCDC_STATE_BUSY;
+}
+
+/****************************************************************************
+ * Name:  sf32lb_lcd_async_wait
+ *
+ * Description:
+ *   Block until the in-flight transfer (async or synchronous PUTAREA) has
+ *   completed.  Safe to call when idle: returns immediately.  timeout_ms 0
+ *   waits forever.
+ *
+ ****************************************************************************/
+
+int sf32lb_lcd_async_wait(uint32_t timeout_ms)
+{
+  struct timespec ts;
+
+  while (sf32lb_lcd_async_busy())
+    {
+      if (timeout_ms == 0)
+        {
+          if (sem_wait(&s_async_done_sem) < 0)
+            {
+              return -errno;
+            }
+        }
+      else
+        {
+          clock_gettime(CLOCK_REALTIME, &ts);
+          ts.tv_sec  += (time_t)(timeout_ms / 1000u);
+          ts.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+          if (ts.tv_nsec >= 1000000000L)
+            {
+              ts.tv_sec++;
+              ts.tv_nsec -= 1000000000L;
+            }
+
+          if (sem_timedwait(&s_async_done_sem, &ts) < 0)
+            {
+              return errno == ETIMEDOUT ? -ETIMEDOUT : -errno;
+            }
+        }
+    }
+
+  return 0;
+}
+
 
 /****************************************************************************
  * Name:  sf32lb_lcd_putrun
@@ -478,7 +718,12 @@ static int sf32lb_lcd_putarea(FAR struct lcd_dev_s *dev,
   if ((size_t)stride == row_bytes)
     {
       fb_coord_t y = row_start;
-      const fb_coord_t chunk_rows = 24;
+      /* One QSPI write window per chunk.  The old 24-row split made a
+       * 160-row strip 7 serial DMA transactions, each with its own
+       * SetRegion command pair + sem_timedwait wake-up.  128 rows keeps
+       * the transfer below 64 KiB (240*128*2 = 61440 B) while cutting a
+       * strip to at most 2 transactions. */
+      const fb_coord_t chunk_rows = 128;
 
       while (y <= row_end)
         {
@@ -794,9 +1039,19 @@ static int lcd_hw_setup_thread_entry(int argc, FAR char *argv[])
                             LCDC_PIXEL_FORMAT_RGB565);
 
     s_lcd_hw_ready = true;
-    syslog(LOG_INFO, "INFO: lcd_hw ready (keep 2SFBL panel, LCDC freq=%lu HCLK=%lu)\n",
-           (unsigned long)s_drv_lcd.hlcdc.Init.freq,
-           (unsigned long)HAL_RCC_GetHCLKFreq(CORE_ID_HCPU));
+    {
+      uint32_t hclk = HAL_RCC_GetHCLKFreq(CORE_ID_HCPU);
+      uint32_t div = (s_drv_lcd.hlcdc.Instance->SPI_IF_CONF &
+                      LCD_IF_SPI_IF_CONF_CLK_DIV_Msk) >>
+                     LCD_IF_SPI_IF_CONF_CLK_DIV_Pos;
+
+      syslog(LOG_INFO,
+             "INFO: lcd_hw ready (keep 2SFBL panel, LCDC req=%lu HCLK=%lu "
+             "div=%lu sclk=%lu)\n",
+             (unsigned long)s_drv_lcd.hlcdc.Init.freq,
+             (unsigned long)hclk, (unsigned long)div,
+             (unsigned long)(div != 0 ? hclk / div : 0));
+    }
 
     return OK;
 }
@@ -951,6 +1206,11 @@ int board_lcd_initialize(void)
 
     sem_init(&(s_drv_lcd.init_sem), 0, 0);
     sem_init(&(s_drv_lcd.draw_sem), 0, 0);
+
+    /* LVGL direct-flush completion semaphore (posted from the LCDC IRQ). */
+
+    memset(&s_async, 0, sizeof(s_async));
+    sem_init(&s_async_done_sem, 0, 0);
 
     /* Keep bringup non-blocking; init/register devices in a worker task. */
 

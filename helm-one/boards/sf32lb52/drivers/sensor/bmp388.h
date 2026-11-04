@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/sensor/bmp388.h
+ * vendor/HelmOne/boards/sf32lb52/drivers/sensor/bmp388.h
  *
  * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/

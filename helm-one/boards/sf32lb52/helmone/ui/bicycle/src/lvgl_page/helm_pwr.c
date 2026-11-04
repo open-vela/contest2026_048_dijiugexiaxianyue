@@ -525,7 +525,11 @@ static void helm_pwr_off_show(const char *title)
     lv_obj_set_style_opa(s_off, LV_OPA_TRANSP, 0);
 
     helm_splash_build(&s_off_sp, s_off);
-    helm_splash_set_gray(&s_off_sp, 255);
+    /* 底色跟主题（用户 2026-09-26 晚："开关机界面也[要]受主题变化影响"）：
+     * 日光仍是白底黑字；夜间走黑底白字 —— 否则关机会先闪一整屏白，再接黑遮罩淡入。
+     * `set_gray` 传的是**背景**灰阶，文字/进度条自动取反（`ink = 255 - g`）。
+     * 这里每次弹出都重建 ⇒ 直接读当前调色板即可。 */
+    helm_splash_set_gray(&s_off_sp, helm_pal_night() ? 0u : 255u);
     s_off_key[0] = '\0';
     helm_splash_bar_set(&s_off_sp, 0);
     helm_splash_bar_linear(&s_off_sp, 0, 100, helm_pwr_off_bar_ms());
@@ -644,7 +648,8 @@ void helm_pwr_on_click(void)
 
     ui = helm_pwr_bl_cycle();
     lv_snprintf(buf, sizeof(buf), "%u%%", (unsigned)ui);
-    lv_pm_notify_show("亮度", buf, 1200);
+    /* 系统通知也带图标（用户 2026-09-27：和 App 通知一样，左侧给一个图标）。 */
+    lv_pm_notify_show_icon("亮度", buf, HELM_ICO_SUN, 1200);
     helm_menu_refresh();
 }
 
@@ -756,6 +761,6 @@ void helm_pwr_bat_tick(void)
     }
 
     myvendor_sound_warn();
-    lv_pm_notify_show("电量低", "请尽快充电", 4000);
+    lv_pm_notify_show_icon("电量低", "请尽快充电", HELM_ICO_BATT, 4000);
     syslog(LOG_INFO, "helm: low bat warn pct=%d mv=%d", pct, mv);
 }

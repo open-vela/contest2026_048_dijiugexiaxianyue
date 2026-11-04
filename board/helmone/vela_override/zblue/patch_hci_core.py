@@ -31,8 +31,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# MYVENDOR BUILD: patch_hci_core.py 补丁 subsys/bluetooth/host/hci_core.c@ab23d63b2da4 -- 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待
-print('my_vendor: override patch patch_hci_core.py -> subsys/bluetooth/host/hci_core.c@ab23d63b2da4 -- 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待')
+# MYVENDOR BUILD: patch_hci_core.py 补丁 subsys/bluetooth/host/hci_core.c@ab23d63b2da4 -- 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待；-19 闸门
+print('my_vendor: override patch patch_hci_core.py -> subsys/bluetooth/host/hci_core.c@ab23d63b2da4 -- 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待；-19 闸门（disable 失败也放 bt_dev + enable 回收 stale 槽位）')
 
 DECL = (
     "/* myvendor: abort HCI wait when LCPU is being recovered */\n"
@@ -130,6 +130,100 @@ SKIP_ENTER = (
 
 OLD_ENTER = "\tk_sem_init(&sync_sem, 0, 1);\n"
 
+# ---- (3) 2026-09-27：`-19` 永久闸门的两个修法 ---------------------------------
+#
+# 现场链（板上一手日志，含新开的栈日志）：
+#   `Controller unresponsive, command opcode 0x0c03 timeout`（HCI_RESET）
+#   → `Failed to reset BLE controller`（bt_disable_mc 提前 return，**没走 bt_dev_free**）
+#   → `bt_dev_pool[0].hci` 一直挂着 → 之后每次 `bt_enable()` 都在 `bt_dev_alloc()`
+#     被**静默**拒成 -ENODEV，BLE 只能靠重启救（同 boot 里
+#     `HCI driver is not ready`/`No HCI driver registered` 都是 0 条 ⇒ 就是那道静默闸门）。
+#
+# 两处各治一半：disable 别再留垃圾；enable 见到"槽位占着但栈不 ready"就回收重来。
+
+OLD_ALLOC = (
+    "\thdev = bt_dev_alloc(dev_id);\n"
+    "\tif (!hdev) {\n"
+    "\t\treturn -ENODEV;\n"
+    "\t}\n"
+)
+
+NEW_ALLOC = (
+    "\thdev = bt_dev_alloc(dev_id);\n"
+    "\tif (hdev == NULL && dev_id < CONFIG_BT_NUM_CTLRS) {\n"
+    "\t\t/* myvendor: 槽位被上一代占着但栈并不 ready（典型：上一次 disable 在\n"
+    "\t\t * HCI_RESET 超时处提前返回、没走到 bt_dev_free）⇒ 回收再分配一次，\n"
+    "\t\t * 否则每次 enable 都在这里被静默拒成 -ENODEV、BLE 永久起不来。 */\n"
+    "\t\tstruct bt_dev *stale = bt_dev_get(dev_id);\n"
+    "\n"
+    "\t\tif (stale != NULL && !atomic_test_bit(stale->flags, BT_DEV_READY)) {\n"
+    '\t\t\tLOG_ERR("bt_dev slot %u stale (not ready), reclaiming", dev_id);\n'
+    "\t\t\tbt_dev_free(stale);\n"
+    "\t\t\thdev = bt_dev_alloc(dev_id);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\tif (!hdev) {\n"
+    '\t\tLOG_ERR("bt_dev_alloc failed for dev_id %u", dev_id);\n'
+    "\t\treturn -ENODEV;\n"
+    "\t}\n"
+)
+
+OLD_DIS_RESET = (
+    "\t/* Reset the Controller */\n"
+    "\tif (!drv_quirk_no_reset(hdev)) {\n"
+    "\n"
+    "\t\terr = bt_hci_cmd_send_sync(hdev, BT_HCI_OP_RESET, NULL, NULL);\n"
+    "\t\tif (err) {\n"
+    '\t\t\tLOG_ERR("Failed to reset BLE controller");\n'
+    "\t\t\treturn err;\n"
+    "\t\t}\n"
+)
+
+NEW_DIS_RESET = (
+    "\t/* Reset the Controller */\n"
+    "\tif (!drv_quirk_no_reset(hdev)) {\n"
+    "\n"
+    "\t\terr = bt_hci_cmd_send_sync(hdev, BT_HCI_OP_RESET, NULL, NULL);\n"
+    "\t\tif (err) {\n"
+    '\t\t\tLOG_ERR("Failed to reset BLE controller");\n'
+    "\t\t\t/* myvendor: 控制器不应答时也要把本代 bt_dev 放掉 —— 否则\n"
+    "\t\t\t * `bt_dev_pool[dev_id].hci` 一直挂着，之后每次 bt_enable()\n"
+    "\t\t\t * 都被 `bt_dev_alloc()` 拒成 -ENODEV（2026-09-27 现场实证）。 */\n"
+    "\t\t\tatomic_clear_bit(hdev->flags, BT_DEV_ENABLE);\n"
+    "\t\t\tbt_dev_free(hdev);\n"
+    "\t\t\treturn err;\n"
+    "\t\t}\n"
+)
+
+OLD_CONN_FIND = "\tconn = find_pending_connect(hdev, evt->role, &id_addr);\n"
+
+NEW_CONN_FIND = (
+    "\t/* myvendor: 定向广播的 pending conn 是按 TargetA（手机当前 RPA）\n"
+    "\t * 登记的；translate_addrs() 把 RPA 解析成身份地址后，直接用 id_addr\n"
+    "\t * 查不到 ⇒ 连接随即被 0x16 No pending conn 丢掉（V1 实机）。\n"
+    "\t * 先按原始 peer_addr 查，再回退身份地址。 */\n"
+    "\tif (IS_ENABLED(CONFIG_BT_PERIPHERAL) &&\n"
+    "\t    evt->role == BT_HCI_ROLE_PERIPHERAL) {\n"
+    "\t\tconn = find_pending_connect(hdev, evt->role, &peer_addr);\n"
+    "\t\tif (!conn && bt_addr_le_cmp(&peer_addr, &id_addr) != 0) {\n"
+    "\t\t\tconn = find_pending_connect(hdev, evt->role, &id_addr);\n"
+    "\t\t}\n"
+    "\t} else {\n"
+    "\t\tconn = find_pending_connect(hdev, evt->role, &id_addr);\n"
+    "\t}\n"
+)
+
+def _once(text, old, new, what):
+    """把 old 替换成 new（要求 old 恰好出现一次）；已是 new 则原样返回。"""
+    if new in text:
+        return text
+    n = text.count(old)
+    if n == 0:
+        raise SystemExit(f"hci_core.c: {what} pattern not found")
+    if n > 1:
+        raise SystemExit(f"hci_core.c: {what} pattern matched {n} times, want 1")
+    return text.replace(old, new, 1)
+
 def _myvendor_stamp(path):
     """在被改写出来的副本里留三行标记（约定见 vela_override/CMakeLists.txt 顶部）。
 
@@ -142,7 +236,7 @@ def _myvendor_stamp(path):
     _script = 'patch_hci_core.py'
     _up = 'external/zblue/zblue / subsys/bluetooth/host/hci_core.c'
     _blob = 'ab23d63b2da4'
-    _why = '超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待'
+    _why = '超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待；-19 闸门（disable 失败放 bt_dev + enable 回收 stale 槽位）'
     _sym = 'patch_hci_core'
     _tag = "vela_override/" + _script + " -- 上游 " + _up + "@" + _blob + " -- " + _why
     _marker = (
@@ -196,6 +290,11 @@ def main() -> int:
         else:
             print("hci_core.c: k_sem_take timeout pattern not found", file=sys.stderr)
             return 1
+
+    text = _once(text, OLD_ALLOC, NEW_ALLOC, "bt_dev_alloc gate")
+    text = _once(text, OLD_DIS_RESET, NEW_DIS_RESET, "disable HCI_RESET early return")
+    text = _once(text, OLD_CONN_FIND, NEW_CONN_FIND,
+                 "directed adv pending conn RPA lookup")
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(text, encoding="utf-8")

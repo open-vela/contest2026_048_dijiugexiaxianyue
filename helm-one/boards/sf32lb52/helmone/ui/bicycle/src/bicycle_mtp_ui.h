@@ -37,6 +37,14 @@ void bicycle_mtp_ui_init(bicycle_mtp_ui_t * ui);
  */
 void bicycle_mtp_ui_run(bicycle_mtp_ui_t * ui);
 
+/**
+ * @brief 当前是否有 MTP「存储占用」在替主界面兜着 cover。
+ *
+ * @return true = 主界面的 cover 是**正当的**（手机还在、瓦片存储被占用），
+ *         此时 map_page 的 stale-cover 兜底不应强行 resume。
+ */
+bool bicycle_mtp_ui_storage_held(void);
+
 #ifdef __cplusplus
 }
 #endif

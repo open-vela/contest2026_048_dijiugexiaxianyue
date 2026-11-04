@@ -1,7 +1,7 @@
 # Helm One 知识库（PC 侧深读版）
 
 > **运行时 Skill 不在这里。** 给设备/助手运行时用的 Skill 是单文件
-> `vendor/my_vendor/ai/skills/vela-helm-one.md`，可直接拷成
+> `vendor/HelmOne/ai/skills/vela-helm-one.md`，可直接拷成
 > `/data/agent/skills/vela-helm-one.md`（openvela `packages/ai_agent` 只识别该目录下的
 > 扁平 `.md` 文件，子目录会被忽略）。
 >

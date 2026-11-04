@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/st7789s_lcd.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/st7789s_lcd.c
  *
  * ST7789S SPI LCD on SPI2 (PA37-PA42) via dedicated lcd_spi2 (not sifli_spi).
  * Portrait 240x320 is hardcoded here (TK024F3036 + bicycle UI); Kconfig

@@ -85,6 +85,13 @@ void lv_pm_theme_apply_all(void);
 /** @brief 将当前预设推入 LVGL lv_theme_t（apply_cb + lv_display_set_theme）。 */
 void lv_pm_theme_lvgl_bind(const lv_pm_theme_def_t * def);
 
+/** @brief 循环顶补跑"整树样式重算"（1.2~1.5 s 的活，不能挡在换主题的同步路径里）。
+ *  @details 详见 `lv_pm_theme_lvgl_bind()` 的注释；UI 主循环每圈调一次，空操作无开销。 */
+void lv_pm_theme_poll_styles(void);
+
+/** @brief 只补跑"整树样式重算"那一步（由 `lv_pm_theme_poll_styles()` 调用）。 */
+void lv_pm_theme_report_styles_now(void);
+
 /** @brief 一次性叠加 pm 页面壳层样式（add_style，不 remove_style_all）。 */
 void lv_pm_theme_lvgl_attach_page(lv_obj_t * page);
 /**

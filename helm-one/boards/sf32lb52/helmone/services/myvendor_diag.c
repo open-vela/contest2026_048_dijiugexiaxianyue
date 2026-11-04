@@ -7,7 +7,9 @@
 
 #include <nuttx/config.h>
 
+#include "myvendor_coredump.h"
 #include "myvendor_diag.h"
+#include "myvendor_diaglog.h"
 #include "sf32lb_dvfs.h"
 #include "sf32lb_sdio.h"
 
@@ -19,6 +21,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
 #include <string.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -99,10 +102,31 @@ static uint32_t diag_elapsed(uint32_t now, uint32_t then)
 #ifdef CONFIG_BLUETOOTH
 static uint8_t g_ble_soft;
 static uint32_t g_ble_why_ms;
+/** @brief 最近一次 BLE 诊断异常的单调时刻（ms；0 = 从未）。状态栏拿它做"蓝牙图标红灯闪"。 */
+static uint32_t g_ble_bad_ms;
+
+/**
+ * @brief 距最近一次 BLE 诊断异常的毫秒数（`UINT32_MAX` = 从未异常过）。
+ *
+ * @note 用户 2026-09-27：状态栏据此让**蓝牙图标红灯闪烁**。只要有新的异常上报，年龄就被
+ *       刷新 ⇒ 闪烁窗口跟着续期。判据在状态栏侧（年龄 < 10 s 就闪），这里只提供读数。
+ */
+uint32_t myvendor_diag_ble_unhealthy_age_ms(void)
+{
+  if (g_ble_bad_ms == 0u)
+    {
+      return UINT32_MAX;
+    }
+
+  return diag_elapsed(diag_now(), g_ble_bad_ms);
+}
 
 static void diag_ble_log_unhealthy(const char *why)
 {
   uint32_t now = diag_now();
+
+  /* 每次上报都刷新（**在 2s 限频之前**）：闪烁窗口据此续期，不会"报了一下就熄"。 */
+  g_ble_bad_ms = now ? now : 1u;
 
   if (g_ble_why_ms != 0 && diag_elapsed(now, g_ble_why_ms) < 2000u)
     {
@@ -111,8 +135,7 @@ static void diag_ble_log_unhealthy(const char *why)
 
   g_ble_why_ms = now;
   syslog(LOG_ERR,
-         "diag: ble not ok (%s) hb=%u alive=%d skip=%d rxstall=%d "
-         "cmdsilent=%d busy=%d phase=%s phone=%d\n",
+         "diag: ble not ok (%s) hb=%u alive=%d skip=%d rxstall=%d "         "cmdsilent=%d busy=%d phase=%s phone=%d\n",
          why,
 #if defined(CONFIG_MYVENDOR_BLE_COMPANION) || defined(CONFIG_MYVENDOR_BICYCLE)
          (unsigned)companion_bridge_heartbeat_age_ms(),
@@ -827,6 +850,222 @@ static void diag_tick_one(struct diag_slot *s, uint32_t now)
     }
 }
 
+/* ---- 周期计数器表（板级，2026-09-24）-------------------------------------
+ *
+ * 一张表管"哪些模块的计数器要周期性打"，选择是一个位掩码：
+ *   · **默认全开**（KV 里没有 `persist.diag.cnt_mask` ⇒ 0xffffffff）；
+ *   · `ctl cnt` 改开关、改动落 KV（owner 是 devctl，同 log mask / dvfs charge 的取舍）；
+ *   · diag 每 `DIAG_CNT_PERIOD_MS` 扫一遍表，把选中的模块**无条件**各打一行。
+ *
+ * 与"异常判定 + 自愈"分开：后者（`report(false)`）**每拍都跑、与开关无关** ——
+ * 免得用户关掉报表就把自愈也关掉了。
+ *
+ * 打印一律在本线程（中断侧只累加计数），见各模块自己的说明。
+ */
+#define DIAG_CNT_PERIOD_MS 60000u
+
+struct diag_cnt_mod
+{
+  const char *name;               /**< ctl 里用的名字。 */
+  void      (*report)(bool force);/**< true = 无条件打一行计数器。 */
+};
+
+static uint32_t g_cnt_mask = 0xffffffffu;
+static uint32_t g_cnt_last_ms;
+
+static void diag_cnt_ble(bool force)
+{
+  extern void sf32lb52_bt_rx_chain_report(bool force);
+
+  sf32lb52_bt_rx_chain_report(force);
+}
+
+static void diag_cnt_gnss(bool force)
+{
+  extern void myvendor_gnss_uart_cnt_report(void);
+  extern void myvendor_gnss_uart_check_anomaly(void);
+  extern void myvendor_gnss_link_cnt_report(void);
+
+  if (force)
+    {
+      /* 周期报表（受 `ctl cnt` 开关管）：UART 侧 + **解析/链路侧**各一行 ——
+       * 后者是"没收到 vs 收到没解析出来"的分叉判据（见其注释）。 */
+      myvendor_gnss_uart_cnt_report();
+      myvendor_gnss_link_cnt_report();
+      return;
+    }
+
+  /* 每拍跑：异常直报（LOG_ERR，**与开关无关**）。 */
+  myvendor_gnss_uart_check_anomaly();
+}
+
+static void diag_cnt_isrprint(bool force)
+{
+  extern uint32_t sifli_isr_console_chars(void);
+
+  if (force)
+    {
+      syslog(LOG_INFO, "diag: cnt isrprint console-chars-in-isr=%lu\n",
+             (unsigned long)sifli_isr_console_chars());
+    }
+}
+
+/** @brief 手机通知的过滤计数（板级，2026-09-24）。
+ *
+ *  `merged` / `throttled` 增长 = **过滤在起作用**（常驻通知在刷）⇒ WARN 限频报；
+ *  `evicted` 增长 = inbox 满**真丢了通知** ⇒ ERROR 直报。
+ */
+static void diag_cnt_notif(bool force)
+{
+  extern void companion_bridge_notif_stats(uint32_t *rx, uint32_t *merged,
+                                           uint32_t *throttled,
+                                           uint32_t *evicted);
+  static uint32_t s_thr_seen;
+  static uint32_t s_evict_seen;
+  static uint32_t s_evict_log_ms;
+  static uint32_t s_flt_log_ms;
+  uint32_t rx = 0;
+  uint32_t merged = 0;
+  uint32_t throttled = 0;
+  uint32_t evicted = 0;
+  uint32_t now;
+
+  companion_bridge_notif_stats(&rx, &merged, &throttled, &evicted);
+
+  if (force)
+    {
+      syslog(LOG_INFO,
+             "diag: cnt notif rx=%lu merged=%lu throttled=%lu evicted=%lu\n",
+             (unsigned long)rx, (unsigned long)merged,
+             (unsigned long)throttled, (unsigned long)evicted);
+      s_thr_seen = throttled;
+      s_evict_seen = evicted;
+      return;
+    }
+
+  now = diag_now();
+
+  /* 真丢通知：ERROR（关不掉）。 */
+  if (evicted != s_evict_seen)
+    {
+      s_evict_seen = evicted;
+
+      if (s_evict_log_ms == 0u ||
+          (int32_t)(now - s_evict_log_ms) >= 5000)
+        {
+          s_evict_log_ms = now ? now : 1u;
+          syslog(LOG_ERR,
+                 "diag: ERROR notif inbox full, dropped %lu notification(s) "
+                 "(total %lu) — 通知比 UI 快\n",
+                 (unsigned long)evicted, (unsigned long)evicted);
+        }
+    }
+
+  /* 过滤在工作（常驻通知刷屏被合并/限流）：WARN，30 s 限频。 */
+  if (throttled != s_thr_seen || merged != 0u)
+    {
+      if (s_flt_log_ms == 0u || (int32_t)(now - s_flt_log_ms) >= 30000)
+        {
+          s_flt_log_ms = now ? now : 1u;
+          s_thr_seen = throttled;
+          syslog(LOG_WARNING,
+                 "diag: notif filter active: merged=%lu throttled=%lu rx=%lu "
+                 "(常驻通知只更新、不重弹)\n",
+                 (unsigned long)merged, (unsigned long)throttled,
+                 (unsigned long)rx);
+        }
+    }
+}
+
+static const struct diag_cnt_mod g_cnt_mods[] =
+{
+  { "ble",      diag_cnt_ble },
+  { "gnss",     diag_cnt_gnss },
+  { "notif",    diag_cnt_notif },
+  { "isrprint", diag_cnt_isrprint },
+};
+
+#define DIAG_CNT_MODS (sizeof(g_cnt_mods) / sizeof(g_cnt_mods[0]))
+
+static void diag_cnt_dump_enabled(void)
+{
+  unsigned i;
+
+  for (i = 0; i < DIAG_CNT_MODS; i++)
+    {
+      if (((g_cnt_mask >> i) & 1u) != 0u)
+        {
+          g_cnt_mods[i].report(true);
+        }
+    }
+}
+
+/** @brief 每拍跑一遍所有模块的**异常判定**（`report(false)`）：**与开关无关**。
+ *
+ *  约定（各模块的 `report(bool)` 都按这条实现）：
+ *    · `report(true)`  = 周期报表，受 `ctl cnt` 掩码管，打 WARN 级计数行；
+ *    · `report(false)` = 异常判定，**每拍都跑、掩码关不掉**，真异常一律 `LOG_ERR`
+ *      直报（这样 `ctl log err` 只剩错误级时也看得见）。
+ */
+static void diag_cnt_check_all(void)
+{
+  unsigned i;
+
+  for (i = 0; i < DIAG_CNT_MODS; i++)
+    {
+      g_cnt_mods[i].report(false);
+    }
+}
+
+/** @brief 供 ctl 读/改开关（位序同 {@link g_cnt_mods}）。 */
+uint32_t myvendor_diag_cnt_mask_get(void)
+{
+  return g_cnt_mask;
+}
+
+void myvendor_diag_cnt_mask_set(uint32_t mask)
+{
+  g_cnt_mask = mask;
+}
+
+/** @brief 立即打一遍（`ctl cnt now`）：不用等下一个周期。 */
+void myvendor_diag_cnt_dump_now(void)
+{
+  diag_cnt_dump_enabled();
+}
+
+/** @brief 按名字找模块下标；找不到返回 -1（`ctl cnt <name> on|off` 用）。 */
+int myvendor_diag_cnt_find(const char *name)
+{
+  unsigned i;
+
+  if (name == NULL)
+    {
+      return -1;
+    }
+
+  for (i = 0; i < DIAG_CNT_MODS; i++)
+    {
+      if (strcmp(g_cnt_mods[i].name, name) == 0)
+        {
+          return (int)i;
+        }
+    }
+
+  return -1;
+}
+
+/** @brief 打印模块清单（`ctl cnt` 的表头；由 ctl 拼行）。 */
+const char *myvendor_diag_cnt_name(unsigned idx)
+{
+  return (idx < DIAG_CNT_MODS) ? g_cnt_mods[idx].name : NULL;
+}
+
+unsigned myvendor_diag_cnt_count(void)
+{
+  return (unsigned)DIAG_CNT_MODS;
+}
+
 static void *diag_thread(void *arg)
 {
   (void)arg;
@@ -892,6 +1131,127 @@ static void *diag_thread(void *arg)
           {
             (void)myvendor_diaglog_flush();
             g_flush_ms = now;
+          }
+      }
+
+      /** 每拍：**看门狗活动链表的只读巡检**（`wd_start.c` 里的 `myvendor_wd_audit`）。
+       *
+       *  目的只有一个：**抓到"链表变坏的那一拍"**。clip 要等到有人 `wd_start`
+       *  才被发现，而 2026-09-27 一整天才两次 ⇒ 靠 clip 反推凶手太慢；巡检只在
+       *  "好↔坏"翻转时打一行，正常静默（关中断、有界、只读，不改行为）。 */
+      {
+        extern void myvendor_wd_audit(void);
+
+        myvendor_wd_audit();
+      }
+
+      /** 每拍：**日志文件的运行期清理**（两边各自限频，默认 10 分钟）。
+       *
+       *  为什么要有这一条（2026-09-25 用户反馈）：`/mnt/kv/diag` 与 `/mnt/kv/coredump`
+       *  原先只在**开机**（coredump 另加"写新 dump 时"、diag 另加"按天滚动"）裁剪 ⇒
+       *  只要设备不重启、不跨天就只涨不落；而旧 diag 侧删除失败还是**静默**的，
+       *  堆到撑满 /mnt/kv 都没人知道。现在两条都按"最小序号/最老戳"删到 KEEP=10，
+       *  失败一律 WARNING（`prune stuck` / `prune unlink … failed`）。 */
+      (void)myvendor_diaglog_prune();
+      myvendor_coredump_prune();
+
+      /** 每拍：**所有模块的异常判定**（`report(false)`）—— 与 `ctl cnt` 开关无关，
+       *  真异常一律 LOG_ERR 直报；周期报表（`report(true)`）才受掩码管。 */
+      {
+        extern uint32_t sifli_isr_console_chars(void);
+        static uint32_t s_isr_chars_last;
+        static uint32_t s_isr_chars_ms;
+        uint32_t isr_chars;
+
+        diag_cnt_check_all();
+
+        /* 哨兵：**中断里走轮询式控制台输出**（`arm_lowputc()`，即 `up_putc()` 那条路）。
+         *
+         *  只算这一条路，**不算**驱动逐字节写硬件（`sifli_send()`）—— 后者由
+         *  NuttX 的发送完成中断调用，属设计如此（现场 delta=9 的误报已更正）。
+         *  例外：fault/panic 路径本来就会在中断里 `up_putc`，那是崩溃取证、不算病。
+         *  限频 5 s，且报的是这段窗口里的**增量**；用 ERROR 级（关不掉）。
+         *
+         *  **点名**：`sifli_isrprint_take()` 交出这次窗口的冒犯者快照 —— IPSR（哪个
+         *  中断/异常）、CFSR/HFSR（是否故障路径）、以及**输出正文开头**（模块前缀就在
+         *  里面，例如 `dump_assert_info:` / `gnss:` / `diag:`）。正文做单行化，免得一条
+         *  ERROR 撑成多行、破坏"真错误只认 `[ ERROR]` 标签行"的口径。 */
+        isr_chars = sifli_isr_console_chars();
+        if (isr_chars != s_isr_chars_last &&
+            (int32_t)(now - s_isr_chars_ms) >= 5000)
+          {
+            extern void sifli_isrprint_take(uint32_t *ipsr, uint32_t *cfsr,
+                                            uint32_t *hfsr, char *text,
+                                            size_t n);
+            uint32_t ipsr = 0;
+            uint32_t cfsr = 0;
+            uint32_t hfsr = 0;
+            char raw[64];
+            char text[64];
+            char irq[24];
+            const char *who;
+            size_t i;
+
+            sifli_isrprint_take(&ipsr, &cfsr, &hfsr, raw, sizeof(raw));
+
+            for (i = 0; raw[i] != '\0' && i < sizeof(text) - 1u; i++)
+              {
+                unsigned char c = (unsigned char)raw[i];
+                text[i] = (c >= 0x20u && c < 0x7fu) ? (char)c : '.';
+              }
+
+            text[i] = '\0';
+
+            switch (ipsr)
+              {
+              case 0u:  who = "thread/panic"; break;
+              case 2u:  who = "NMI";          break;
+              case 3u:  who = "HardFault";    break;
+              case 4u:  who = "MemManage";    break;
+              case 5u:  who = "BusFault";     break;
+              case 6u:  who = "UsageFault";   break;
+              case 11u: who = "SVCall";       break;
+              case 14u: who = "PendSV";       break;
+              case 15u: who = "SysTick";      break;
+              default:  who = NULL;           break;   /* >=16 外部中断 */
+              }
+
+            if (who != NULL)
+              {
+                (void)snprintf(irq, sizeof(irq), "%lu(%s)",
+                               (unsigned long)ipsr, who);
+              }
+            else if (ipsr >= 16u)
+              {
+                (void)snprintf(irq, sizeof(irq), "%lu(IRQ%lu)",
+                               (unsigned long)ipsr,
+                               (unsigned long)(ipsr - 16u));
+              }
+            else
+              {
+                /* 保留号 / 未命名核内异常：直接报号，别做减法（会无符号下溢）。 */
+                (void)snprintf(irq, sizeof(irq), "%lu", (unsigned long)ipsr);
+              }
+
+            syslog(LOG_ERR,
+                   "diag: ERROR polled-console chars written in ISR: %lu (+%lu in %u ms; fault/panic 除外) irq=%s cfsr=%08lx hfsr=%08lx text=\"%s\"\n",
+                   (unsigned long)isr_chars,
+                   (unsigned long)(isr_chars - s_isr_chars_last),
+                   (unsigned)(now - s_isr_chars_ms),
+                   irq,
+                   (unsigned long)cfsr,
+                   (unsigned long)hfsr,
+                   text);
+
+            s_isr_chars_last = isr_chars;
+            s_isr_chars_ms = now;
+          }
+
+        /* 周期报表：按掩码把选中的模块各打一行计数器（默认全开）。 */
+        if ((int32_t)(now - g_cnt_last_ms) >= (int32_t)DIAG_CNT_PERIOD_MS)
+          {
+            g_cnt_last_ms = now ? now : 1u;
+            diag_cnt_dump_enabled();
           }
       }
 

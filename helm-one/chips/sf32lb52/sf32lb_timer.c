@@ -83,6 +83,20 @@ struct sf32lb_timer_lowerhalf_s
   tccb_t cbk;                          /* Call back function when timeout */
   FAR void *arg;                       /* The argument that will accompany */
   uint32_t frequency;
+  /** 微秒 → tick 的**定点乘数**（Q20：真值 = mul / 2^20），见 `us_to_ticks()`。
+   *
+   *  为什么要有它：`settimeout()` 会在**中断里**被调（`sf32lb_timer_handler`
+   *  的重装路径），而原来那句 `period * frequency / USEC_PER_SEC` 是 64 位除法
+   *  ⇒ Cortex-M33 上走 libgcc 的 `__aeabi_uldivmod` → `__udivmoddi4`，
+   *  那几个函数吃真栈。2026-09-23 的转储 n586（`cfsr=0x00100000` STKOF、
+   *  HardFault）解出来的链就是
+   *  `exception_direct → irq_dispatch → sf32lb_timer_handler →
+   *   sf32lb_timer_settimeout → __aeabi_uldivmod → __udivmoddi4`。
+   *
+   *  改成"先在**线程态**算好乘数、中断里只做一次 64 位乘 + 移位"，
+   *  中断里不再有除法调用（不占额外栈、也省周期）。
+   *  初始化时算（`sf32lb_timer_initialize`），`frequency` 之后再不改。 */
+  uint32_t us_to_ticks_mul;
   uint32_t period;
   uint32_t timeout;
 };
@@ -143,6 +157,50 @@ static const struct timer_ops_s g_timer_ops =
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
+
+/** @brief 预乘**定点数**的移位位数（Q20，见 `us_to_ticks_mul`）。
+ *
+ *  取 20 的理由（离线全网格校验过）：
+ *   - `mul = ceil(freq << 20 / 1e6)`：本板唯一的调用点是 `myvendor_cpuload.c`
+ *     传的 **resolution = 1000000** ⇒ `mul` 恰好 = 2^20 ⇒
+ *     `(timeout * mul) >> 20` **逐位等于**原来的
+ *     `timeout * freq / 1e6`，零精度损失。
+ *   - 一般情形：`mul ≤ 2^32`（freq ≤ 2.4e8 时最大 251658240）；
+ *     `timeout * mul ≤ (2^32-1) * 2^32` 仍在 uint64 内 ⇒ 不会溢出。
+ *   - 最坏相对误差 1/mul，实测出现在低频分辨率（freq=1000 时 1e-3）；
+ *     **不会**出现"原来 >0 现在 =0"的反转（`DEBUGASSERT(period > 0)` 的语义保住）。 */
+#define SF32LB52_TIMER_MUL_SHIFT 20u
+
+/** @brief 算出"微秒 → tick"的定点乘数（**线程态**调用，见 `us_to_ticks_mul`）。
+ *
+ *  `mul = ceil(freq * 2^20 / 1e6)`，但**分子分母同除 64** 之后全用 32 位算：
+ *
+ *      2^20 / 1e6  ==  16384 / 15625
+ *
+ *  `resolution` 是 `uint16_t`（见 `sf32lb_timer_initialize`）⇒
+ *  `freq * 16384 ≤ 65535 * 16384 = 1.07e9 < 2^32` ⇒ 装得下，
+ *  于是这里也只是个 **32 位除法**，不会把 libgcc 的 64 位除法拖进来。
+ *  （已离线逐值核对：freq ∈ [1, 65535] 内两种写法结果完全相同。）
+ *
+ *  上取整是必须的：截断会让低频分辨率算出 0 —— freq=1000、timeout=1 ms 时
+ *  截断得 1048，`(1000*1048)>>20 == 0`，定时器直接失效。
+ *  取整后 `mul` 最小是 2（freq=1），**永不为 0**，所以 `settimeout` 不需要兜底。 */
+static void sf32lb_timer_calc_us_to_ticks(
+  FAR struct sf32lb_timer_lowerhalf_s *timer)
+{
+  timer->us_to_ticks_mul =
+    ((uint32_t)timer->frequency * 16384u + 15624u) / 15625u;
+
+  DEBUGASSERT(timer->us_to_ticks_mul != 0u);
+}
+
+/** @brief 微秒 → tick 计数。**中断安全**：只有 64 位乘与移位，无除法、无调用。 */
+static inline uint64_t sf32lb_timer_us_to_ticks(
+  FAR struct sf32lb_timer_lowerhalf_s *timer, uint32_t timeout)
+{
+  return (((uint64_t)timeout) * timer->us_to_ticks_mul)
+         >> SF32LB52_TIMER_MUL_SHIFT;
+}
 
 static void timer_init(struct sf32lb_timer_lowerhalf_s *timer)
 {
@@ -236,7 +294,17 @@ static int sf32lb_timer_settimeout(struct timer_lowerhalf_s *lower,
   uint64_t period;
 
   period = timeout;
-  period = (period * (uint64_t)timer->frequency) / USEC_PER_SEC;
+  /* **中断里不能有除法**：原来这句是 `period * frequency / USEC_PER_SEC`，
+   * 64 位除法会调 libgcc 的 `__aeabi_uldivmod`（转储 n586 的栈里就是它），
+   * 而这条重装路径是在 GPT ISR 上跑的。现在只剩一次 64 位乘 + 移位。
+   *
+   * 乘数在 `sf32lb_timer_initialize()` 里就算好了，`frequency` 之后不再变，
+   * 且乘数**永不为 0**（见 `sf32lb_timer_calc_us_to_ticks`）⇒ 这里不需要兜底
+   * 分支。这一点很重要：**留了兜底就等于把 64 位除法留在函数里**
+   * （已实测反汇编：留兜底时 `sf32lb_timer_settimeout` 里仍有
+   * `bl __aeabi_uldivmod`），那就等于没修。 */
+  period = sf32lb_timer_us_to_ticks(timer, timeout);
+
   DEBUGASSERT(period > 0);
   DEBUGASSERT(period <= UINT32_MAX);
 
@@ -362,6 +430,7 @@ struct timer_lowerhalf_s *sf32lb_timer_initialize(int chan, uint16_t resolution)
 
   timer = &g_low_timer[chan];
   timer->frequency = resolution;
+  sf32lb_timer_calc_us_to_ticks(timer);
   timer_init(timer);
 
   timer->running = false;

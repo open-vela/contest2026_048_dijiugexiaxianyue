@@ -60,17 +60,28 @@ FACT_CFG="$BOARD/configs/nsh-factory/"
 MAIN_OUT="$ROOT/cmake_out/helmone_nsh"
 FACT_OUT="$ROOT/cmake_out/helmone_nsh-factory"
 
-echo "=== 1/4 main 槽固件（$MAIN_CFG）==="
-./build.sh "$MAIN_CFG" --cmake -j"$JOBS"
+# ⚠ build.sh 必须收**相对工作区根**的配置路径：
+#   它用 `[ -d ${ROOTDIR}/${board_config} ]` 判断，绝对路径会拼成
+#   `${ROOTDIR}//home/...` ⇒ 落到 else 分支 ⇒ 输出目录算成 `cmake_out/_home`，
+#   与本脚本写死的 cmake_out/helmone_nsh 对不上，wrap 那步必失败。
+MAIN_CFG_REL="${MAIN_CFG#"$ROOT"/}"
+FACT_CFG_REL="${FACT_CFG#"$ROOT"/}"
+
+echo "=== 1/4 main 槽固件（$MAIN_CFG_REL）==="
+./build.sh "$MAIN_CFG_REL" --cmake -j"$JOBS"
 bash "$TREE/scripts/wrap_nuttx_image.sh" "$MAIN_OUT"
 
-echo "=== 2/4 factory 槽固件（$FACT_CFG；pack-sd-img 需要它）==="
-./build.sh "$FACT_CFG" --cmake -j"$JOBS"
+echo "=== 2/4 factory 槽固件（$FACT_CFG_REL；pack-sd-img 需要它）==="
+./build.sh "$FACT_CFG_REL" --cmake -j"$JOBS"
 bash "$TREE/scripts/wrap_nuttx_image.sh" "$FACT_OUT"
 
 if [ -d "$TREE/boot_loader/project" ]; then
   echo "=== 3/4 二级 boot：本树含 project，重建 ftab.bin + bootloader.bin ==="
-  bash "$TREE/boot_loader/build.sh" 2>/dev/null || echo "  （二级 boot 重建失败，改用随仓 bin）"
+  # --no-prompt + </dev/null：build.sh 找不到 SIFLI_SDK 时会 `read -p` 等输入，
+  # 而提示走 stderr、这里又把 stderr 吞了 —— 不重定向就会**静默卡住**。
+  # 失败（没装 SiFli SDK / scons）就退回随仓的预编译件，不影响出图。
+  SIFLI_SDK="${SIFLI_SDK:-}" bash "$TREE/boot_loader/build.sh" --no-prompt </dev/null \
+    || echo "  （二级 boot 重建失败，改用随仓 bin：boot_loader/bin/bootloader.bin + ftab.bin）"
 else
   echo "=== 3/4 二级 boot：用随仓的 boot_loader/bin 预编译件（本树未含 project）==="
 fi

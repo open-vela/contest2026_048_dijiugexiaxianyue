@@ -18,6 +18,15 @@
 
 #define MTP_PLUG_DEBOUNCE_MS 800u
 
+/** 当前是否有"存储占用"在替主界面兜着 cover（供 map_page 的兜底判据排除）。
+ *  用文件内单例即可：`bicycle_mtp_ui_run()` 每拍都会刷新它。 */
+static volatile bool s_storage_held;
+
+bool bicycle_mtp_ui_storage_held(void)
+{
+    return s_storage_held;
+}
+
 /**
  * USB MTP 才拆地图存储。BLE companion 每次 READ 也会 lfs_hold（让 vmap 跳过
  * 新的瓦片 I/O），若当成 cover 则会 release + 重载 16 块瓦片，把 ~100 KB/s
@@ -112,18 +121,31 @@ static bool host_detached_stable(bicycle_mtp_ui_t * ui, const myvendor_mtp_statu
     return !attached && (now - ui->host_attached_stable_since) >= MTP_PLUG_DEBOUNCE_MS;
 }
 
-static void try_storage_reload(bicycle_mtp_ui_t * ui)
+/**
+ * @brief 尝试"存储占用结束 → 恢复主界面"。
+ *
+ * @return true 表示**真的执行了** map_page_resume_after_cover()（显示已恢复）；
+ *         false = 还没到时候（手机仍插着 / 没有待办），调用方**不要**清
+ *         `storage_released`，下一拍继续重试。
+ *
+ * 现场故障（2026-11-04，5 小时长测）：这里原来是 void，`plug != OFF` 时直接
+ * return，而调用方 `ui->storage_released = false;` 是**无条件**清零的 ——
+ * 于是「手机还插着」这一条就把恢复永久掐断：
+ *   暂停已经做了（shell ui/rot 定时器停、按键回调清空、render_timer 停），
+ *   恢复却再也不会重试 ⇒ 屏定格在最后一帧、时钟停走、翻页/按键全失效。
+ */
+static bool try_storage_reload(bicycle_mtp_ui_t * ui)
 {
     myvendor_mtp_status_t st;
     map_page_t * map;
 
     if (!ui->storage_reload_pending) {
-        return;
+        return false;
     }
 
     myvendor_mtp_get_status(&st);
     if (st.plug != MYVENDOR_MTP_PLUG_OFF) {
-        return;
+        return false;
     }
 
     map = lvgl_page_map();
@@ -138,6 +160,7 @@ static void try_storage_reload(bicycle_mtp_ui_t * ui)
     }
 
     ui->storage_reload_pending = false;
+    return true;
 }
 
 static bool enter_allowed(const bicycle_mtp_ui_t * ui)
@@ -167,7 +190,7 @@ static void finish_leave(bicycle_mtp_ui_t * ui)
     ui->transfer_active_seen = false;
     try_storage_reload(ui);
     bicycle_runtime_emit_mtp_evt(false, false);
-    LV_LOG_USER("MTP UI leave transfer (LiveMap resume)");
+    LV_LOG_INFO("MTP UI leave transfer (LiveMap resume)");
 }
 
 static void try_leave(bicycle_mtp_ui_t * ui, const myvendor_mtp_status_t * st, uint32_t now)
@@ -266,9 +289,17 @@ void bicycle_mtp_ui_run(bicycle_mtp_ui_t * ui)
     } else if (ui->storage_released && !lvgl_page_is_usb_transfer() &&
                !ui->leaving) {
         ui->storage_reload_pending = true;
-        try_storage_reload(ui);
-        ui->storage_released = false;
+
+        /* **只有真的恢复显示才清标志**：手机还插着时 try_storage_reload 会
+         * 早退（`plug != OFF`），若这里无条件清零，就再也没有人重试 ⇒
+         * covered 永久为真（现场故障，见 try_storage_reload 的注释）。
+         * 保留标志让下一拍继续尝试，直到 plug==OFF 真正恢复。 */
+        if (try_storage_reload(ui)) {
+            ui->storage_released = false;
+        }
     }
+
+    s_storage_held = ui->storage_released;
 
     if (st.transfer_active) {
         ui->transfer_active_seen = true;

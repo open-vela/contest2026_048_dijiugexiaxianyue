@@ -41,6 +41,7 @@
 #include "ble_sensor.h"
 #include "ble_supervisor.h"
 #include "bluetooth.h"
+#include "bt_adapter.h"
 #include "bt_addr.h"
 #include "bt_gatt_defs.h"
 #include "bt_gattc.h"
@@ -56,10 +57,18 @@
 bool sf32lb52_bt_hci_skip_sync(void);
 
 #ifndef CONFIG_BLUETOOTH_BLE_SCAN
-#  error "ble_companion needs CONFIG_BLUETOOTH_BLE_SCAN=y (in defconfig). cmake_out/.config is stale: cmake --build cmake_out/my_vendor_nsh --target resetconfig"
+#  error "ble_companion needs CONFIG_BLUETOOTH_BLE_SCAN=y (in defconfig). cmake_out/.config is stale: cmake --build cmake_out/helmone_nsh --target resetconfig"
 #endif
 
+/**
+ * @brief 本模块日志出口（官方规则：服务层统一走 `syslog()`，不用 `printf`、不走 BT_LOG）。
+ *
+ * @details 前缀固定 `ble_sensor: `，一条事件一行；等级分档 = 例行/正常结束 INFO、
+ *          可恢复异常 WARNING（例如 `[radio] heal:` 这类自愈）、真故障 ERROR。
+ *          `/mnt/kv/diag` 归档只收 WARNING 及以上——所以"能自愈的事"不该占 ERROR。
+ */
 #define LOGI(fmt, ...) syslog(LOG_INFO, "ble_sensor: " fmt "\n", ##__VA_ARGS__)
+#define LOGW(fmt, ...) syslog(LOG_WARNING, "ble_sensor: " fmt "\n", ##__VA_ARGS__)
 #define LOGE(fmt, ...) syslog(LOG_ERR, "ble_sensor: " fmt "\n", ##__VA_ARGS__)
 
 #ifdef CONFIG_MYVENDOR_BLE_COMPANION_DEBUG
@@ -114,27 +123,83 @@ bool sf32lb52_bt_hci_skip_sync(void);
 #define SENSOR_HEALTH_ADV_HITS       2u
 #define SENSOR_HEALTH_LOG_MS         10000u
 #define SENSOR_SUB_RETRY_MAX         3u
-/** 手机未连接且 sensor 待回连时，ADV / observer 互斥时间片。 */
-#define SENSOR_PHONE_ADV_WINDOW_MS   2000u
-#define SENSOR_RECONNECT_SCAN_MS     1000u
+/* **射频策略（2026-09-22 / 2026-09-23）** —— SF32 广播/扫描互斥，分时：
+ *   1) BLE 稳定 / 手机刚掉线后：**15 s 只广播**（接 App），不扫 sensor；
+ *   2) 之后进入稳态：**4 s 广播（或手机已连时的静默）+ 0.8 s 快扫**；
+ *      连失败扫描窗按 1/2/4… 拉长，上限 8 s；
+ *   3) 扫到已绑地址且 RSSI 尚可 → **停广播再连**（只覆盖建链过程，无 30 s 专连窗）；
+ *   4) 各 want_link 槽均已连上 → 停快扫；掉线后再进稳态间隔扫；
+ *   5) 手机已连：同样间隔扫（静默↔短扫），不再连续扫；
+ *   6) 自愈：deadline 丢失 / STOP_WAIT 超时 / 长时间无扫 / SCAN 无 observer
+ *      → kick 重进短扫（限频）；**建链/发现 busy 时禁止踢扫**（留给 ATT）；
+ *   7) 配对窗关闭后 **4 s 冷静** 再扫传感器；重连 observer 重启 ≥500 ms。 */
+#define SENSOR_PHONE_FIRST_MS        15000u
+#define SENSOR_STEADY_ADV_MS         4000u
+#define SENSOR_STEADY_SCAN_MS         800u
+/** 重连需要扫却长时间未真正进入扫窗 → 强制 kick。 */
+#define SENSOR_RADIO_HEAL_NO_SCAN_MS  10000u
+/** 两次 heal kick 最小间隔，避免刷屏。 */
+#define SENSOR_RADIO_HEAL_MIN_GAP_MS   5000u
+/** ADV_STOP_WAIT 绝对上限（hold 回执丢失时仍强制开扫）。 */
+#define SENSOR_RADIO_STOP_WAIT_MAX_MS  2500u
+/** SCAN_WINDOW 无 observer 超过此时长则补起扫。 */
+#define SENSOR_RADIO_SCAN_REARM_MS     1500u
+/** 配对窗关闭后冷静期：先别扫/建传感器，把射频还给手机收尾。 */
+#define SENSOR_PAIR_COOL_MS            4000u
+/** 重连 observer 重启最小间隔，压住 30 ms 刷屏风暴。 */
+#define SENSOR_SCAN_RESTART_MIN_MS      500u
+/** 0 = 搜表 LOW_LATENCY，1 = 重连低占空比（与 g_scan_duty 一致）。 */
+#define SCAN_DUTY_DISCOVERY  0
+#define SCAN_DUTY_RECONNECT  1
+/** 可见门槛（列表/认地址）；专连/建链用更高的「尚可」。 */
+#define SENSOR_CONNECT_RSSI_MIN       (-75)
 
-/* **连接失败退避**（与"空扫退避" g_reconnect_gap_ms 互补）：扫到设备但连接超时时，
- * 旧的空扫退避不生效，于是每 ~1.5 s 一轮"停广播→起扫描"，把 ACL 池打空
- * （pool count=4 empty → giving up），之后 HCI 状态错乱（zblue adv.c 空指针崩）。
- * 连续失败按 1/2/4/8 s 递增，连上一次即清零。 */
+/** **临时关掉 RSSI 信号门槛**（用户 2026-09-23 要求）。
+ *
+ *  下面这行在 = 两道门槛都失效：
+ *    · `SENSOR_RSSI_MIN`(-90)        —— 本来"连 -90 都不到的广播直接不处理"；
+ *    · `SENSOR_CONNECT_RSSI_MIN`(-75) —— 本来"弱信号只更新 rssi、等更近再连"。
+ *  失效后：**只要收到该地址的广播就认可建链**，弱信号也照连。
+ *
+ *  为什么两道一起关：现场（固件 `202609231915`）那台小米心率带
+ *  `DF:F6:04:F3:7B:AC` 的 rssi 在 **-80 ~ -90** 之间漂、正好骑在 -90 上；
+ *  只关 -75 的话，掉到 -91 的那些广播仍会被就地丢掉，还是连不上。
+ *
+ *  ⚠ 这是**临时调试开关**，不是修好：弱信号下心率数据本身就不可靠，连上之后
+ *  RSSI 更差时会自己断、然后重连。要恢复原设计，**把下面这行注释掉**即可
+ *  —— 两道门槛的判据都还在代码里（`SENSOR_RSSI_ACCEPT` /
+ *  `SENSOR_RSSI_CONNECTABLE`），不用改回来。 */
+#define SENSOR_RSSI_GATE_OFF 1
+
+#ifdef SENSOR_RSSI_GATE_OFF
+/** "这包广播值不值得处理"（原：`rssi >= -90`）。 */
+#  define SENSOR_RSSI_ACCEPT(rssi)       (true)
+/** "这个信号可以建链了"（原：`rssi >= -75`）。 */
+#  define SENSOR_RSSI_CONNECTABLE(rssi)  (true)
+#else
+#  define SENSOR_RSSI_ACCEPT(rssi)       ((rssi) >= SENSOR_RSSI_MIN)
+#  define SENSOR_RSSI_CONNECTABLE(rssi)  ((rssi) >= SENSOR_CONNECT_RSSI_MIN)
+#endif
+
+/* **连接失败退避**：连上后清零；超时按 1/2/4/8 s 拉长 scan 窗。 */
 static uint32_t s_connect_fails;
 
-/* **空轮回连退避**（2026-09-20 加）：一台绑定过、但此刻不在附近的外设，不该让射频
- * 一直"2 s 广播 → 停广播 → 1 s 扫描"空转 —— 本控制器广播与扫描不能同时开，每一轮
- * 扫描都要先把手机广播停掉（用户原话："注意好节奏"）。做法：一轮扫描没能连上任何
- * 东西，就把**下一轮之前的广播窗口**按 2/4/8/16 s 拉长（上限
- * `SENSOR_RECONNECT_IDLE_MAX_MS`）；连上一次、或用户重扫/重绑/恢复流程，清零。
- * 扫描窗口本身不动（还是 1 s），所以"外设回来了"最坏只等一个退避周期。 */
+/** 空扫退避（稳态短扫仍空时略拉长 ADV，封顶 4 s）。 */
 static uint32_t s_reconnect_idle_cycles;
-#define SENSOR_RECONNECT_IDLE_MAX_MS  32000u
-/** 空扫退避的上限与步进（见 `g_reconnect_gap_ms`）：1 s → 4 s → 15 s → 60 s。 */
+#define SENSOR_RECONNECT_IDLE_MAX_MS  4000u
 #define SENSOR_RECONNECT_BACKOFF_MAX_MS  60000u
 #define SENSOR_RECONNECT_BACKOFF_STEP    4u
+
+/** 手机优先窗截止（mono）；0 = 未武装。 */
+static uint32_t s_phone_first_until_ms;
+/** phone-first 结束后立刻开一轮短扫（掉线 burst 排在优先窗之后）。 */
+static bool     s_kick_scan_after_phone_first;
+/** 上一拍是否在配对窗口内（上升沿：拆传感器链，射频全给手机 ADV）。 */
+static bool     s_pair_win_prev;
+/** 配对窗关闭后冷静截止（mono）；0 = 无。 */
+static uint32_t s_pair_cool_until_ms;
+/** 最近一次成功 `bt_le_start_scan` 的时刻（限频）。 */
+static uint32_t s_scan_start_ms;
 #define SENSOR_NAME_MAX         24
 #define ADV_HEX_MAX             62
 #define ADV_DEBUG_HEARTBEAT_MS  2000u
@@ -244,28 +309,13 @@ static struct sensor_slot g_slots[SENSOR_KIND_COUNT];
 /** 重连观察者的空扫退避（0 = 未退避）。见 `sensor_want_reconnect_observer()`。 */
 static uint32_t g_reconnect_gap_ms;
 
-/* **扫描档位（用户 2026-09-19 定）**：
- *   开机 60 s = 全量扫描（广播 + 传感器重连扫描，尽快把外设接回来）；
- *   之后进入**轻量级**：至少每 SENSOR_SCAN_IDLE_MS 扫一次（沿用空扫退避的时间阶梯）；
- *   任何"设备掉线 / 界面上点连接 / 收到开启扫描"都重新给 60 s 全量窗口。
- * 落地方式：`sensor_scan_burst()` 只置一个请求位（不需要在调用点拿时钟），
- * 由 `sensor_want_reconnect_observer()` 在下一个射频 tick 上兑现（≤1 s）。 */
-#define SENSOR_SCAN_BURST_MS   60000u
-#define SENSOR_SCAN_IDLE_MS    60000u
-static uint32_t s_scan_burst_until_ms;
-static bool     s_scan_burst_req;
-static bool     s_burst_boot_done;
-static uint32_t s_last_scan_ms;   /* 上次允许重连扫描的时刻（轻量档用它限速） */
-
-void ble_sensor_scan_burst(void)
-{
-  s_scan_burst_req = true;
-}
 static uint32_t g_reconnect_next_ms;
 static struct sensor_found g_found[SENSOR_FOUND_MAX];
 static uint8_t g_found_n;
 static bt_address_t g_seen[SENSOR_SEEN_MAX];
 static uint8_t g_seen_n;
+
+/* 射频窗武装函数在 g_radio_phase / sensor_now_ms 定义之后。 */
 
 /**
  * @brief 保护槽位/扫描表/地址的互斥量。
@@ -327,12 +377,17 @@ static bool g_phone_adv_held;    /**< companion 已消费停广播请求。 */
 static uint32_t g_radio_dbg_ms;  /**< [radio] tick 快照的限频时间戳。 */
 static enum sensor_radio_phase g_radio_phase;
 static uint32_t g_radio_deadline_ms;
+static uint32_t g_radio_phase_ms;       /**< 进入当前 phase 的 mono。 */
+static uint32_t g_radio_last_scan_ms;   /**< 最近一次真正开扫窗的 mono；0=从未。 */
+static uint32_t g_radio_reconnect_since_ms; /**< 本轮 reconnect 需求起始；0=不需要。 */
+static uint32_t g_radio_heal_ms;        /**< 上次 heal kick 时间。 */
 static uint32_t g_linked_print_ms;
 static uint32_t g_health_log_ms;
 static uint16_t g_health_zombie_n;
 static uint16_t g_health_hci_n;
 static uint16_t g_health_disc_to_n;
 static uint16_t g_health_recreate_n;
+static uint16_t g_health_radio_heal_n;
 
 static struct
 {
@@ -363,6 +418,221 @@ static uint32_t sensor_now_ms(void)
 static uint32_t sensor_age_ms(uint32_t now, uint32_t then)
 {
   return myvendor_mono_elapsed_ms(now, then);
+}
+
+/** @brief 武装「先给手机 15 s ADV」；结束后直接进稳态间隔扫。 */
+static void sensor_radio_arm_phone_first(uint32_t now_ms)
+{
+  if (g_phone_connected)
+    {
+      /* 手机已在线：跳过优先窗，进稳态间隔扫。 */
+      s_phone_first_until_ms = 0;
+      s_kick_scan_after_phone_first = false;
+      s_reconnect_idle_cycles = 0;
+      s_connect_fails = 0;
+      g_reconnect_gap_ms = 0;
+      g_reconnect_next_ms = 0;
+      g_radio_phase = SENSOR_RADIO_IDLE;
+      g_radio_phase_ms = now_ms;
+      g_radio_deadline_ms = 0;
+      LOGI("[radio] skip phone-first (phone up) -> steady interval scan");
+      return;
+    }
+
+  s_phone_first_until_ms = now_ms + SENSOR_PHONE_FIRST_MS;
+  s_kick_scan_after_phone_first = false;
+  s_reconnect_idle_cycles = 0;
+  if (g_radio_phase != SENSOR_RADIO_IDLE)
+    {
+      g_radio_phase = SENSOR_RADIO_IDLE;
+      g_radio_phase_ms = now_ms;
+      g_radio_deadline_ms = 0;
+    }
+
+  LOGI("[radio] phone-first ADV %u ms (then steady ADV/scan)",
+       (unsigned)SENSOR_PHONE_FIRST_MS);
+}
+
+/** @brief 立刻切到短扫（停 ADV 再扫）；用于掉线 / 扫到可连设备。 */
+static void sensor_radio_kick_scan(uint32_t now_ms, const char *why)
+{
+  s_reconnect_idle_cycles = 0;
+  /* heal 踢扫不清 0x3e 退避计数，否则每 5 s 自愈把退避清零，建链更挤。 */
+  if (why == NULL || strncmp(why, "heal-", 5) != 0)
+    {
+      s_connect_fails = 0;
+    }
+
+  g_reconnect_gap_ms = 0;
+  g_reconnect_next_ms = 0;
+  g_want_scan = true;
+  g_scan_duty = SCAN_DUTY_RECONNECT;
+
+  /* 相位交给 pump：手机已连无 ADV 可停，ADV_STOP_WAIT 立刻到期进 SCAN。 */
+  g_radio_phase = SENSOR_RADIO_ADV_STOP_WAIT;
+  g_radio_phase_ms = now_ms;
+  g_radio_deadline_ms = g_phone_connected ? now_ms : (now_ms + SENSOR_ADV_STOP_ACK_MS);
+
+  LOGI("[radio] kick scan (%s)", why != NULL ? why : "-");
+}
+
+static void sensor_radio_enter_phase(enum sensor_radio_phase phase,
+                                    uint32_t now_ms)
+{
+  if (g_radio_phase != phase)
+    {
+      g_radio_phase = phase;
+      g_radio_phase_ms = now_ms;
+    }
+  else
+    {
+      g_radio_phase = phase;
+    }
+}
+
+static void sensor_radio_note_scan_window(uint32_t now_ms)
+{
+  g_radio_last_scan_ms = now_ms;
+  sensor_radio_enter_phase(SENSOR_RADIO_SCAN_WINDOW, now_ms);
+}
+
+/**
+ * @brief 射频时间片自愈：相位被外部清掉 / hold 丢回执 / 长期无扫时强制 kick。
+ *
+ * @details
+ * 实机：`ble_sensor_set_phone_state()` 曾每拍把 phase 打回 IDLE，kick 起的
+ * 扫窗立刻消失，CPS 掉线后 busy=1 却 scanner=0。边沿修复后仍保留本看门狗
+ * 作兜底（其它路径误清 phase / ADV_STOP 卡死同理）。
+ */
+static void sensor_radio_heal_watchdog(uint32_t now_ms, bool reconnect,
+                                      bool connect_busy)
+{
+  uint32_t since_scan;
+  uint32_t since_need;
+  bool can_heal;
+  const char *why = NULL;
+
+  if (!reconnect)
+    {
+      g_radio_reconnect_since_ms = 0;
+      return;
+    }
+
+  if (g_radio_reconnect_since_ms == 0)
+    {
+      g_radio_reconnect_since_ms = now_ms;
+    }
+
+  can_heal = (g_radio_heal_ms == 0) ||
+             (sensor_age_ms(now_ms, g_radio_heal_ms) >=
+              SENSOR_RADIO_HEAL_MIN_GAP_MS);
+
+  /* 1) 有窗相位却丢了 deadline → 直接 kick。 */
+  if ((g_radio_phase == SENSOR_RADIO_ADV_WINDOW ||
+       g_radio_phase == SENSOR_RADIO_SCAN_WINDOW) &&
+      g_radio_deadline_ms == 0)
+    {
+      why = "heal-deadline";
+    }
+
+  /* 2) ADV_STOP_WAIT 超过绝对上限（hold 回执丢失）。 */
+  if (why == NULL &&
+      g_radio_phase == SENSOR_RADIO_ADV_STOP_WAIT &&
+      g_radio_phase_ms != 0 &&
+      sensor_age_ms(now_ms, g_radio_phase_ms) >= SENSOR_RADIO_STOP_WAIT_MAX_MS)
+    {
+      why = "heal-stop-wait";
+    }
+
+  /* 3) 已在扫窗却长期无 observer → kick 重进 ADV_STOP→SCAN。 */
+  if (why == NULL &&
+      g_radio_phase == SENSOR_RADIO_SCAN_WINDOW &&
+      g_scanner == NULL &&
+      g_radio_phase_ms != 0 &&
+      sensor_age_ms(now_ms, g_radio_phase_ms) >= SENSOR_RADIO_SCAN_REARM_MS)
+    {
+      why = "heal-scan-rearm";
+    }
+
+  /* 4) 需要重连却长时间没真正扫过（相位被清 / quiet 死循环）。
+   *    busy（槽位要连却未 READY）时阈值收紧到 6 s。 */
+  if (why == NULL && g_scanner == NULL &&
+      g_radio_phase != SENSOR_RADIO_SCAN_WINDOW &&
+      g_radio_phase != SENSOR_RADIO_ADV_STOP_WAIT)
+    {
+      since_need = sensor_age_ms(now_ms, g_radio_reconnect_since_ms);
+      since_scan = (g_radio_last_scan_ms == 0) ?
+                   since_need :
+                   sensor_age_ms(now_ms, g_radio_last_scan_ms);
+
+      if (since_need >= SENSOR_RADIO_HEAL_NO_SCAN_MS &&
+          since_scan >= SENSOR_RADIO_HEAL_NO_SCAN_MS)
+        {
+          why = "heal-noscan";
+        }
+    }
+
+  /* 5) ADV deadline 被异常刷到过远（超过一个安静窗），当作漂移。 */
+  if (why == NULL && connect_busy && g_scanner == NULL &&
+      g_radio_phase == SENSOR_RADIO_ADV_WINDOW &&
+      g_radio_deadline_ms != 0 &&
+      (int32_t)(g_radio_deadline_ms - now_ms) >
+      (int32_t)(SENSOR_STEADY_ADV_MS + 1000u))
+    {
+      why = "heal-deadline-drift";
+    }
+
+  if (why == NULL || !can_heal)
+    {
+      return;
+    }
+
+  /* 正在建链 / GATT 发现时禁止踢扫类自愈：ATT 与 LE features 需要安静射频。
+   * 现场（2026-09-23）：heal-scan-rearm 在 discover 超时前每 5 s 踢扫 →
+   * scanner 空转 + 0x3e / discover timeout 螺旋。只保留 ADV_STOP_WAIT 卡死救援。 */
+  if (connect_busy && strcmp(why, "heal-stop-wait") != 0)
+    {
+      return;
+    }
+
+  /* 2026-09-25（口径：可恢复异常→WARN）：这条是"发现卡住并**当场踢活**"的叙事
+   * （why ∈ heal-noscan / heal-deadline / heal-scan-rearm / heal-deadline-drift），
+   * 踢完就恢复 ⇒ 降为 WARNING，别占 `[ ERROR]` 这一档。 */
+  LOGW("[radio] heal: %s phase=%d busy=%d scanner=%d since_need=%u since_scan=%u",
+       why, (int)g_radio_phase, connect_busy ? 1 : 0,
+       g_scanner != NULL ? 1 : 0,
+       (unsigned)sensor_age_ms(now_ms, g_radio_reconnect_since_ms),
+       (unsigned)(g_radio_last_scan_ms != 0 ?
+                  sensor_age_ms(now_ms, g_radio_last_scan_ms) : 0));
+  sensor_radio_kick_scan(now_ms, why);
+  g_radio_heal_ms = now_ms;
+  g_health_radio_heal_n++;
+}
+
+static bool sensor_radio_in_phone_first(uint32_t now_ms)
+{
+  return s_phone_first_until_ms != 0u &&
+         (int32_t)(s_phone_first_until_ms - now_ms) > 0;
+}
+
+/** @brief 手动/掉线：尽快开一轮短扫（手机优先窗内则排队到其后）。 */
+void ble_sensor_scan_burst(void)
+{
+  uint32_t now = sensor_now_ms();
+
+  if (!g_started)
+    {
+      return;
+    }
+
+  if (sensor_radio_in_phone_first(now))
+    {
+      s_kick_scan_after_phone_first = true;
+      LOGI("[radio] kick-scan queued after phone-first");
+      return;
+    }
+
+  sensor_radio_kick_scan(now, "burst");
 }
 
 /**
@@ -1065,63 +1335,58 @@ static bool sensor_radio_scan_allowed(uint32_t now_ms)
  */
 static bool sensor_want_reconnect_observer(uint32_t now_ms)
 {
+  extern bool myvendor_pair_window_active(void);
 
-  /** **配对阶段把射频让给"可发现广播"**（2026-09-20 用户要求）。
-   *
-   * 开窗（开机 60 s / `ctl pair open [秒]`）是设备"可被发现、可被配对"的窗口，
-   * 手机正是在这段时间里扫到并配对；传感器重连扫描这时只会抢射频，把手机的
-   * 可见窗口切成碎片（现场：`stop phone ADV for reconnect scan` 一秒一次）。
-   * 窗口结束后开机 burst 请求仍在（`s_scan_burst_req` 没被消费 ⇒ 下面照常兑现），
-   * 全量扫描自然补上。 */
-  {
-    extern bool myvendor_pair_window_active(void);
-
-    if (myvendor_pair_window_active())
-      {
-        return false;
-      }
-  }
-
-  /* 兑现"回到全量扫描"的请求（掉线/手动/开启扫描都会置位）。 */
-  if (!s_burst_boot_done)
-    {
-      s_burst_boot_done     = true;
-      s_scan_burst_req      = true;      /* 开机：先给 60 s 全量窗口 */
-    }
-
-  if (s_scan_burst_req)
-    {
-      s_scan_burst_req       = false;
-      s_scan_burst_until_ms  = now_ms + SENSOR_SCAN_BURST_MS;
-      g_reconnect_gap_ms     = 0;      /* 空扫退避清零 */
-      s_connect_fails        = 0;      /* 连接失败退避清零 */
-      LOGI("[scan] burst %u ms (full scan)", (unsigned)SENSOR_SCAN_BURST_MS);
-    }
-
-  /* 全量窗口内：不受任何退避限制 */
-  if (s_scan_burst_until_ms != 0u
-      && (int32_t)(s_scan_burst_until_ms - now_ms) > 0)
-    {
-      return true;
-    }
-
-  /* 轻量窗口：**限速到至少 SENSOR_SCAN_IDLE_MS 一次**。
-   * 只靠"空扫退避"是不够的：外设可见但连不上时扫描**不算空**，阶梯会被清零，
-   * 于是又回到 1.5~3 s 一轮（现场实测 171/174 s 还在刷 reconnect scan window）。
-   * 这里直接按时间闸门限速；全量窗口在上面已经 return，不受它影响。 */
-  if (s_last_scan_ms != 0u
-      && (int32_t)(now_ms - s_last_scan_ms) < (int32_t)SENSOR_SCAN_IDLE_MS)
+  /* 配对窗口：射频全给可发现广播。 */
+  if (myvendor_pair_window_active())
     {
       return false;
     }
 
-  s_last_scan_ms = now_ms;
+  /* 配对窗刚关的冷静期：先别报 want_reconnect，避免别处立刻起扫。 */
+  if (s_pair_cool_until_ms != 0u &&
+      (int32_t)(s_pair_cool_until_ms - now_ms) > 0)
+    {
+      return false;
+    }
+
+  if (!sensor_want_link())
+    {
+      s_kick_scan_after_phone_first = false;
+      if (!sensor_radio_in_phone_first(now_ms))
+        {
+          s_phone_first_until_ms = 0;
+        }
+
+      return false;
+    }
+
+  /* BLE 稳定后的 15 s：只广播接 App（手机已连则跳过）。 */
+  if (!g_phone_connected && sensor_radio_in_phone_first(now_ms))
+    {
+      return false;
+    }
+
+  /* 优先窗刚结束且有排队的 kick：立刻短扫一轮，然后走稳态。 */
+  if (s_kick_scan_after_phone_first)
+    {
+      s_kick_scan_after_phone_first = false;
+      if (s_phone_first_until_ms != 0u)
+        {
+          s_phone_first_until_ms = 0;
+        }
+
+      sensor_radio_kick_scan(now_ms, "after-phone-first");
+    }
+
+  /* 专连窗已取消；建链忙时仍允许扫（见 pump 延长 SCAN）。 */
+  if (ble_sensor_connect_busy())
+    {
+      return true;
+    }
 
   return sensor_radio_scan_allowed(now_ms);
 }
-
-#define SCAN_DUTY_DISCOVERY  0
-#define SCAN_DUTY_RECONNECT  1
 
 /**
  * @brief 紧凑轮询行：HR bpm loc=… bat=… contact=… energy=…（缺项打 NA）。
@@ -2132,14 +2397,14 @@ static void on_scan_result(bt_scanner_t *scanner, ble_scan_result_t *result)
       adv_debug_print(result, svc_mask, name);
     }
 
-  if (svc_mask != 0 && result->rssi >= SENSOR_RSSI_MIN)
+  if (svc_mask != 0 && SENSOR_RSSI_ACCEPT(result->rssi))
     {
       found_upsert(result, svc_mask, name);
     }
 
   /** 已绑定槽位按地址认人，不要求这包 ADV 里带服务 UUID。 */
 
-  if (result->rssi >= SENSOR_RSSI_MIN)
+  if (SENSOR_RSSI_ACCEPT(result->rssi))
     {
       for (kind = 0; kind < SENSOR_KIND_COUNT; kind++)
         {
@@ -2159,8 +2424,17 @@ static void on_scan_result(bt_scanner_t *scanner, ble_scan_result_t *result)
 
           if (slot->state == SENSOR_IDLE)
             {
-              slot->adv_seen   = true;
-              slot->skip_dwell = true;
+              /* 尚可才认「可建链」；弱信号只更新 rssi，等更近再连。
+               * `SENSOR_RSSI_GATE_OFF` 期间恒真 —— 见该开关的注释。 */
+                  if (SENSOR_RSSI_CONNECTABLE(result->rssi))
+                {
+                  slot->adv_seen   = true;
+                  slot->skip_dwell = true;
+                  if (!sensor_radio_in_phone_first(now))
+                    {
+                      sensor_radio_kick_scan(now, "rssi-ok");
+                    }
+                }
             }
           else if ((slot->state == SENSOR_READY ||
                     slot->state == SENSOR_SUBSCRIBING) &&
@@ -2293,14 +2567,48 @@ static const scanner_callbacks_t g_scan_cbs =
   on_scan_stopped,
 };
 
+/** @brief 适配器此刻是否可用（语义同 `ble_companion.c` 的 `adapter_is_usable`）。
+ *
+ *  2026-09-24 02:50 转储 n589 的护栏 —— 那一崩就在 `bt_le_scan_user_remove()`
+ *  里对**已经坏掉的扫描上下文**做原子清位（`cfsr=0x82` DACCVIOL+MMARVALID、
+ *  `mmfar=0x10`、`pc=stlex [r3]`），任务正是 `ble_companion`。
+ *
+ *  为什么需要它：上游 zblue 的护栏**不对称** ——
+ *  `bt_le_scan_start()` 会先查 `BT_DEV_READY`，不 ready 就返回 `-EAGAIN`
+ *  （现场那串 `bt_le_scan_start fail, err:-11` 就是它，**安全**）；
+ *  而 `bt_le_scan_stop()` → `bt_le_scan_user_remove()` **不查**，
+ *  直接 `atomic_clear_bit(hdev->scan_ctx->…->scan_flags, flag)` ——
+ *  适配器已 down 时那条链是坏值 ⇒ MemManage ⇒ panic ⇒ 重启。
+ *
+ *  所以在我们这一侧：**适配器不可用时绝不把手柄交给协议栈**。
+ *  此时那些手柄本身也已失效，丢掉即可（下面 `g_scanner = NULL` 照做）。 */
+static bool sensor_adapter_usable(void)
+{
+  bt_adapter_state_t st;
+
+  if (g_sensor_ins == NULL)
+    {
+      return false;
+    }
+
+  st = bt_adapter_get_state(g_sensor_ins);
+  return st == BT_ADAPTER_STATE_ON || st == BT_ADAPTER_STATE_BLE_ON;
+}
+
 /**
  * @brief 只向栈发 stop；句柄随后由 scan_manager 释放。
  */
 static void sensor_observer_halt(void)
 {
-  if (g_scanner != NULL && g_sensor_ins != NULL)
+  if (g_scanner != NULL && sensor_adapter_usable())
     {
       bt_le_stop_scan(g_sensor_ins, g_scanner);
+    }
+  else if (g_scanner != NULL)
+    {
+      /* 适配器不可用/正在恢复：**不下发**，只丢手柄。
+       * 留一行日志，免得"扫描怎么没停"变成谜团（n589 就是没护栏才炸的）。 */
+      LOGI("observer halt skipped, adapter not usable (handle dropped)");
     }
 
   g_scanner = NULL;
@@ -2322,6 +2630,14 @@ static int sensor_start_scan(uint8_t duty)
     }
 
   if (g_scanner != NULL && g_scan_duty == duty)
+    {
+      return 0;
+    }
+
+  /* 重连接扫限频：现场配对窗后 observer on 每 ~30 ms 刷一次，和建链抢射频。 */
+  if (duty == SCAN_DUTY_RECONNECT &&
+      s_scan_start_ms != 0 &&
+      sensor_age_ms(sensor_now_ms(), s_scan_start_ms) < SENSOR_SCAN_RESTART_MIN_MS)
     {
       return 0;
     }
@@ -2366,6 +2682,7 @@ static int sensor_start_scan(uint8_t duty)
     }
 
   g_scan_duty = duty;
+  s_scan_start_ms = sensor_now_ms();
   LOGI("[scan] observer on (mode=%u, %s)", (unsigned)mode,
        duty == SCAN_DUTY_RECONNECT ? "reconnect" : "discovery");
   return 0;
@@ -2409,11 +2726,43 @@ static bool sensor_pending_connect(void)
  */
 static void sensor_adv_hold_update(void)
 {
-  bool discovery = g_want_scan && g_scan_duty == SCAN_DUTY_DISCOVERY;
-  bool slot_scan = g_radio_phase == SENSOR_RADIO_ADV_STOP_WAIT ||
-                   g_radio_phase == SENSOR_RADIO_SCAN_WINDOW;
-  bool want = ((!g_phone_connected && discovery) || slot_scan ||
-               sensor_hci_connecting() || sensor_pending_connect());
+  extern bool myvendor_pair_window_active(void);
+  bool discovery;
+  bool slot_scan;
+  bool want;
+
+  /* 配对窗口：射频只给可发现广播，禁止因传感器扫/建链停手机 ADV。 */
+  if (myvendor_pair_window_active())
+    {
+      want = false;
+    }
+  else
+    {
+      discovery = g_want_scan && g_scan_duty == SCAN_DUTY_DISCOVERY;
+      slot_scan = g_radio_phase == SENSOR_RADIO_ADV_STOP_WAIT ||
+                  g_radio_phase == SENSOR_RADIO_SCAN_WINDOW;
+      /** 这里**不能**用 `ble_sensor_connect_busy()`：它把"绑过地址但当前
+       *  IDLE"也算 busy（`want_link && addr && state != READY`），那是**常驻**
+       *  条件 —— 绑定的外设不在场时它恒真，让位闩锁就再也不回落，
+       *  `g_hold_le_adv` 常 1 ⇒ `companion_start_advertising()` 一停不返
+       *  ⇒ 手机永久扫不到设备。
+       *
+       *  现场 2026-09-23 13:13~14:25（`main-20260923-131318.dat`）：外设关机
+       *  72 分钟，`[radio] tick` 恒为 `phone=0 held=1 want=1 reconnect=1 busy=1`、
+       *  `hold le adv off`/`adv active` 各 0 次，手机侧每 30.5 分钟一轮
+       *  `TimeoutException after 0:30:00`。同一版固件健康会话里让位最长 768 s
+       *  且 32 次全闭合（见 analysis/BLE_ADV_HOLD_LOCKOUT.md）。
+       *
+       *  覆盖并不减少：正在建链由 `sensor_hci_connecting()` 管，"看见过它的广播、
+       *  即将建链"由 `sensor_pending_connect()` 管（后者要求 `adv_seen`），
+       *  扫描时片由上面的 `slot_scan` 管 —— 与本函数文档注释的三种情形一致。
+       *
+       *  自证伪：若改后出现"外设在眼前却被手机广播挤掉、建链成功率下降"，
+       *  说明确实需要按 busy 扩让位 —— 那时应改成**有界**让位（上限几十秒），
+       *  而不是恢复成无界闩锁。 */
+      want = ((!g_phone_connected && discovery) || slot_scan ||
+              sensor_hci_connecting() || sensor_pending_connect());
+    }
 
   if (want == g_adv_hold_want)
     {
@@ -2433,6 +2782,70 @@ static void sensor_adv_hold_update(void)
       g_hold_request_pend = false;
       LOGI("resume phone adv");
     }
+}
+
+/**
+ * @brief 配对窗口上升沿：停扫、拆传感器链（保留 want_link）、强制放行手机 ADV。
+ *
+ * 现场：窗口已开仍 `adv held by sensor` + `busy=1`，整段 30 s 手机扫不到码表。
+ */
+static void sensor_pair_window_guard(uint32_t now_ms)
+{
+  extern bool myvendor_pair_window_active(void);
+  bool win = myvendor_pair_window_active();
+  uint8_t i;
+
+  if (win && !s_pair_win_prev)
+    {
+      LOGI("[radio] pair window ON: sensors yield, ADV only");
+      if (g_scanner != NULL)
+        {
+          sensor_observer_halt();
+        }
+
+      g_want_scan = false;
+      g_scan_until_ms = 0;
+      if (g_radio_phase != SENSOR_RADIO_IDLE)
+        {
+          sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
+          g_radio_deadline_ms = 0;
+        }
+
+      for (i = 0; i < SENSOR_KIND_COUNT; i++)
+        {
+          struct sensor_slot *s = &g_slots[i];
+
+          /* want_link 保留 → 窗口结束后自动回连；此处只拆当前占用射频的链路。 */
+          if (s->gatt != NULL && s->state >= SENSOR_CONNECTING &&
+              s->state != SENSOR_DISCONNECTING)
+            {
+              slot_begin_disconnect(s, now_ms);
+            }
+        }
+
+      sensor_adv_hold_update();
+    }
+  else if (!win && s_pair_win_prev)
+    {
+      /* 冷静期：手机刚配对完仍在加密/服务发现，立刻扫传感器易 0x3e。 */
+      s_pair_cool_until_ms = now_ms + SENSOR_PAIR_COOL_MS;
+      if (g_scanner != NULL)
+        {
+          sensor_observer_halt();
+        }
+
+      g_want_scan = false;
+      if (g_radio_phase != SENSOR_RADIO_IDLE)
+        {
+          sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
+          g_radio_deadline_ms = 0;
+        }
+
+      LOGI("[radio] pair window OFF: cool %u ms then sensors reconnect",
+           (unsigned)SENSOR_PAIR_COOL_MS);
+    }
+
+  s_pair_win_prev = win;
 }
 
 /**
@@ -2483,32 +2896,200 @@ static void sensor_reconnect_scan(void)
 }
 
 /**
- * @brief 手机未连接时，给可发现广播和 sensor 重连扫描轮流分配射频。
- *
- * 停广播请求先由 companion 消费，下一拍确认 g_phone_adv_held 后才排队
- * start scan；停 scan 后再释放 hold。板级 SAL 的跨角色 ticket 队列再
- * 保证实际 HCI worker 按 stop-before-start 顺序执行。
+ * @brief 手机优先窗 / 稳态 ADV(或静默)↔短扫。手机已连时同样走间隔扫。
  *
  * @return true 表示本拍的重连 observer 已由时间片状态机处理。
  */
 static bool sensor_reconnect_radio_pump(uint32_t now_ms)
 {
-  bool reconnect = sensor_want_reconnect_observer(now_ms);
+  bool reconnect;
+  bool connect_busy;
+  bool link_inflight;
 
-  /* 每秒一次的状态快照：2026-09-18 排查"停在 ADV_STOP_WAIT 空等 14 s、
-   * 射频全空、被 diag 拆适配器"时，状态机的输入完全看不见（相位切换只有
-   * 进入时打一行），只能靠猜。这一行把判据全部摊开：相位、让位确认、
-   * want、scanner、want_scan、duty。 */
+  /* 手机优先窗内：保证不扫，射频全给 companion ADV。 */
+  if (!g_phone_connected && sensor_radio_in_phone_first(now_ms))
+    {
+      if (g_scanner != NULL)
+        {
+          sensor_observer_halt();
+        }
+
+      if (g_radio_phase != SENSOR_RADIO_IDLE)
+        {
+          sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
+          g_radio_deadline_ms = 0;
+        }
+
+      if (g_radio_dbg_ms == 0 ||
+          sensor_age_ms(now_ms, g_radio_dbg_ms) >= 10000u)
+        {
+          g_radio_dbg_ms = now_ms;
+          LOGI("[radio] tick phone-first left=%d ms",
+               (int)(s_phone_first_until_ms - now_ms));
+        }
+
+      return true;
+    }
+
+  /* 配对窗刚关：冷静期内不扫不建链，避免和手机加密/服务发现抢射频。 */
+  if (s_pair_cool_until_ms != 0u &&
+      (int32_t)(s_pair_cool_until_ms - now_ms) > 0)
+    {
+      if (g_scanner != NULL)
+        {
+          sensor_observer_halt();
+        }
+
+      if (g_radio_phase != SENSOR_RADIO_IDLE)
+        {
+          sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
+          g_radio_deadline_ms = 0;
+        }
+
+      if (g_radio_dbg_ms == 0 ||
+          sensor_age_ms(now_ms, g_radio_dbg_ms) >= 2000u)
+        {
+          g_radio_dbg_ms = now_ms;
+          LOGI("[radio] tick pair-cool left=%d ms",
+               (int)(s_pair_cool_until_ms - now_ms));
+        }
+
+      return true;
+    }
+
+  if (s_pair_cool_until_ms != 0u)
+    {
+      s_pair_cool_until_ms = 0;
+      LOGI("[radio] pair-cool done, sensors may reconnect");
+    }
+
+  reconnect = sensor_want_reconnect_observer(now_ms);
+  connect_busy = ble_sensor_connect_busy();
+  /* 只有真正飞在 CONNECTING…SUBSCRIBING 才静默射频。
+   * ble_sensor_connect_busy() 在「want_link 但 IDLE」时也是 true ——
+   * 若拿它挡扫，phone-first 结束后永远 scanner=0（现场 2026-09-23 01:20）。 */
+  link_inflight = sensor_hci_connecting();
+
+  /* 建链 / GATT 发现中：停扫、相位 IDLE，把射频留给 ATT（禁止补扫风暴）。 */
+  if (link_inflight && reconnect)
+    {
+      if (g_scanner != NULL)
+        {
+          sensor_observer_halt();
+        }
+
+      if (g_radio_phase != SENSOR_RADIO_IDLE)
+        {
+          sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
+          g_radio_deadline_ms = 0;
+        }
+
+      /* 仅允许 ADV_STOP 卡死救援；其它 heal 在 watchdog 内已按 inflight 过滤。 */
+      sensor_radio_heal_watchdog(now_ms, reconnect, true);
+
+      if (g_radio_dbg_ms == 0 ||
+          sensor_age_ms(now_ms, g_radio_dbg_ms) >= 10000u)
+        {
+          g_radio_dbg_ms = now_ms;
+          LOGI("[radio] tick phase=%d phone=%d held=%d want=%d scanner=%d "
+               "reconnect=%d busy=%d inflight=1 deadline=%d heal=%u",
+               (int)g_radio_phase, g_phone_connected ? 1 : 0,
+               g_phone_adv_held ? 1 : 0,
+               g_adv_hold_want ? 1 : 0, g_scanner != NULL ? 1 : 0,
+               reconnect ? 1 : 0, connect_busy ? 1 : 0,
+               g_radio_deadline_ms != 0 ? 1 : 0,
+               (unsigned)g_health_radio_heal_n);
+        }
+
+      return true;
+    }
+
+  if (!reconnect)
+    {
+      g_radio_reconnect_since_ms = 0;
+    }
+
   if (g_radio_dbg_ms == 0 ||
-      sensor_age_ms(now_ms, g_radio_dbg_ms) >= 1000u)
+      sensor_age_ms(now_ms, g_radio_dbg_ms) >= 10000u)
     {
       g_radio_dbg_ms = now_ms;
-      LOGI("[radio] tick phase=%d held=%d want=%d scanner=%d "
-           "want_scan=%d duty=%d reconnect=%d deadline=%d",
-           (int)g_radio_phase, g_phone_adv_held ? 1 : 0,
+      LOGI("[radio] tick phase=%d phone=%d held=%d want=%d scanner=%d "
+           "reconnect=%d busy=%d deadline=%d heal=%u",
+           (int)g_radio_phase, g_phone_connected ? 1 : 0,
+           g_phone_adv_held ? 1 : 0,
            g_adv_hold_want ? 1 : 0, g_scanner != NULL ? 1 : 0,
-           g_want_scan ? 1 : 0, (int)g_scan_duty, reconnect ? 1 : 0,
-           g_radio_deadline_ms != 0 ? 1 : 0);
+           reconnect ? 1 : 0, connect_busy ? 1 : 0,
+           g_radio_deadline_ms != 0 ? 1 : 0,
+           (unsigned)g_health_radio_heal_n);
+
+      /** **只加观测、不改行为**：把"有没有听到这个绑定地址 / 听到时多强"打出来。
+       *
+       *  建链闸门是 `slot_keep_link() && slot->adv_seen`，而 `adv_seen` 只在收到
+       *  **该地址**的广播且 `rssi >= SENSOR_CONNECT_RSSI_MIN(-75)` 时打开；
+       *  `seen_ms` 则是"只要匹配上该地址（rssi >= -90）就刷新"。两者以前都没有日志，
+       *  现场只能看到 `empty=4` 与 companion 那句 `seen=0` 干瞪眼
+       *  （2026-09-23 16:2x 用户："只有心率计在开机，但设备半天没连上"）。
+       *
+       *  判读：
+       *    · `last=never` 一直不变 ⇒ **根本没匹配上这个地址**（记录里的地址不是它
+       *      现在广播的 / 不在范围内 / rssi 连 -90 都不到）；
+       *    · `last=` 在刷新但 `seen=0` ⇒ **听到了，只是没过 -75 门槛**（远近问题）；
+       *    · `seen=1` 却不建链 ⇒ 闸门之外的问题（另查）。
+       *
+       *  自证伪：若这行自己不出现，说明没有已绑定槽位（`slot_keep_link` 全假）。 */
+      {
+        char line[192];
+        size_t off = 0;
+        uint8_t k;
+
+        for (k = 0; k < SENSOR_KIND_COUNT; k++)
+          {
+            const struct sensor_slot *s = &g_slots[k];
+
+            if (!slot_keep_link(s))
+              {
+                continue;
+              }
+
+            if (off < sizeof(line) - 48u)
+              {
+                if (s->seen_ms == 0u)
+                  {
+                    off += (size_t)snprintf(line + off, sizeof(line) - off,
+                                            "%s%s st=%u seen=%u rssi=%d last=never",
+                                            off != 0 ? " | " : "",
+                                            kind_name(s->kind),
+                                            (unsigned)s->state,
+                                            s->adv_seen ? 1u : 0u, (int)s->rssi);
+                  }
+                else
+                  {
+                    uint32_t age = sensor_age_ms(now_ms, s->seen_ms);
+
+                    off += (size_t)snprintf(line + off, sizeof(line) - off,
+                                            "%s%s st=%u seen=%u rssi=%d last=%u.%us",
+                                            off != 0 ? " | " : "",
+                                            kind_name(s->kind),
+                                            (unsigned)s->state,
+                                            s->adv_seen ? 1u : 0u, (int)s->rssi,
+                                            (unsigned)(age / 1000u),
+                                            (unsigned)((age % 1000u) / 100u));
+                  }
+              }
+          }
+
+        if (off != 0)
+          {
+            /* 门槛状态如实打出来：`SENSOR_RSSI_GATE_OFF` 期间说 "无门槛"，
+             * 否则会让人拿 -75 去解释一个根本不设门槛的现象。 */
+#ifdef SENSOR_RSSI_GATE_OFF
+            LOGI("[sensor] %s (建链需 seen=1；RSSI 门槛已关)", line);
+#else
+            LOGI("[sensor] %s (建链需 seen=1 且 rssi>=%d)",
+                 line, (int)SENSOR_CONNECT_RSSI_MIN);
+#endif
+          }
+      }
     }
 
   if (!reconnect ||
@@ -2516,28 +3097,17 @@ static bool sensor_reconnect_radio_pump(uint32_t now_ms)
     {
       if (g_radio_phase != SENSOR_RADIO_IDLE)
         {
-          g_radio_phase = SENSOR_RADIO_IDLE;
+          sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
           g_radio_deadline_ms = 0;
         }
 
       return false;
     }
 
-  /** 手机已连时没有手机 ADV，observer 可连续运行。 */
+  /* 自愈在推进相位之前跑：卡住时 kick 进 ADV_STOP_WAIT，本拍 switch 接上。
+   * heal 的 busy 用 link_inflight，勿用 want_link-IDLE。 */
+  sensor_radio_heal_watchdog(now_ms, reconnect, link_inflight);
 
-  if (g_phone_connected)
-    {
-      if (g_radio_phase != SENSOR_RADIO_IDLE)
-        {
-          LOGI("[radio] phone connected, reconnect scan continuous");
-          g_radio_phase = SENSOR_RADIO_IDLE;
-          g_radio_deadline_ms = 0;
-        }
-
-      return false;
-    }
-
-  /* 同上：后台重连这一拍**不清表**，理由见 sensor_reconnect_scan()。 */
   g_want_scan = true;
   g_scan_duty = SCAN_DUTY_RECONNECT;
 
@@ -2549,10 +3119,12 @@ static bool sensor_reconnect_radio_pump(uint32_t now_ms)
             sensor_observer_halt();
           }
 
-        g_radio_phase = SENSOR_RADIO_ADV_WINDOW;
-        g_radio_deadline_ms = now_ms + SENSOR_PHONE_ADV_WINDOW_MS;
-        LOGI("[radio] phone ADV window %u ms",
-             (unsigned)SENSOR_PHONE_ADV_WINDOW_MS);
+        /* 手机已连：ADV_WINDOW = 静默间隔；未连：真广播窗。 */
+        sensor_radio_enter_phase(SENSOR_RADIO_ADV_WINDOW, now_ms);
+        g_radio_deadline_ms = now_ms + SENSOR_STEADY_ADV_MS;
+        LOGI("[radio] steady %s window %u ms",
+             g_phone_connected ? "quiet" : "ADV",
+             (unsigned)SENSOR_STEADY_ADV_MS);
         break;
 
       case SENSOR_RADIO_ADV_WINDOW:
@@ -2561,73 +3133,118 @@ static bool sensor_reconnect_radio_pump(uint32_t now_ms)
             sensor_observer_halt();
           }
 
-        if (now_ms >= g_radio_deadline_ms)
+        /* deadline 丢失：当作立刻到期，避免永久安静。 */
+        if (g_radio_deadline_ms == 0 || now_ms >= g_radio_deadline_ms)
           {
-            g_radio_phase = SENSOR_RADIO_ADV_STOP_WAIT;
-            g_radio_deadline_ms = now_ms + SENSOR_ADV_STOP_ACK_MS;
-            LOGI("[radio] stop phone ADV for reconnect scan");
+            if (g_phone_connected)
+              {
+                /* 无手机 ADV：直接开扫。 */
+                (void)sensor_start_scan(SCAN_DUTY_RECONNECT);
+                sensor_radio_note_scan_window(now_ms);
+                g_radio_deadline_ms = now_ms + SENSOR_STEADY_SCAN_MS;
+                if (s_connect_fails > 0u)
+                  {
+                    uint32_t stretch = SENSOR_STEADY_SCAN_MS << s_connect_fails;
+
+                    if (stretch > 8000u)
+                      {
+                        stretch = 8000u;
+                      }
+
+                    g_radio_deadline_ms = now_ms + stretch;
+                  }
+
+                LOGI("[radio] phone-linked scan window");
+              }
+            else
+              {
+                sensor_radio_enter_phase(SENSOR_RADIO_ADV_STOP_WAIT, now_ms);
+                g_radio_deadline_ms = now_ms + SENSOR_ADV_STOP_ACK_MS;
+                LOGI("[radio] stop phone ADV for short scan");
+              }
           }
         break;
 
       case SENSOR_RADIO_ADV_STOP_WAIT:
-        /** 等 companion 消费让位请求由 g_phone_adv_held 确认 —— 但那只是**记账**，
-         *  广播的 HCI stop 这时其实已经发完（实机日志：`hold le adv on` 与
-         *  停广播命令完成都在同一毫秒级窗口里）。2026-09-18 现场：这个标志一直
-         *  没被确认，状态机在此空等 14 s，射频全空（不广播、不扫描、HCI 一条
-         *  命令都不发），最后被 diag 的 cmdsilent 拆掉适配器 —— 22.6 s 一轮
-         *  的死循环，手机永远看不到设备、传感器也永远扫不到。
-         *  所以给它一个**有界**等待：SENSOR_ADV_STOP_ACK_MS 还没确认就照样起扫
-         *  （射频已经空了），并把 held 值打进日志，谁没跟上就一目了然。 */
-        if (g_phone_adv_held || now_ms >= g_radio_deadline_ms)
+        if (g_phone_connected || g_phone_adv_held ||
+            g_radio_deadline_ms == 0 ||
+            now_ms >= g_radio_deadline_ms ||
+            (g_radio_phase_ms != 0 &&
+             sensor_age_ms(now_ms, g_radio_phase_ms) >=
+             SENSOR_RADIO_STOP_WAIT_MAX_MS))
           {
+            uint32_t scan_ms = SENSOR_STEADY_SCAN_MS;
+
             (void)sensor_start_scan(SCAN_DUTY_RECONNECT);
-            g_radio_phase = SENSOR_RADIO_SCAN_WINDOW;
-            g_radio_deadline_ms = now_ms + (SENSOR_RECONNECT_SCAN_MS << s_connect_fails);
-            LOGI("[radio] reconnect scan window %u ms (held=%d)",
-                 (unsigned)SENSOR_RECONNECT_SCAN_MS,
-                 g_phone_adv_held ? 1 : 0);
+            sensor_radio_note_scan_window(now_ms);
+            if (s_connect_fails > 0u)
+              {
+                uint32_t stretch = SENSOR_STEADY_SCAN_MS << s_connect_fails;
+
+                if (stretch > 8000u)
+                  {
+                    stretch = 8000u;
+                  }
+
+                scan_ms = stretch;
+              }
+
+            g_radio_deadline_ms = now_ms + scan_ms;
+            LOGI("[radio] scan window %u ms (held=%d phone=%d)",
+                 (unsigned)scan_ms, g_phone_adv_held ? 1 : 0,
+                 g_phone_connected ? 1 : 0);
           }
         break;
 
       case SENSOR_RADIO_SCAN_WINDOW:
-        if (now_ms >= g_radio_deadline_ms)
+        /* 建链中本应由上方 link_inflight 早退；若仍落到此，停扫勿补扫。 */
+        if (link_inflight)
+          {
+            if (g_scanner != NULL)
+              {
+                sensor_observer_halt();
+              }
+
+            sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
+            g_radio_deadline_ms = 0;
+            break;
+          }
+
+        if (g_radio_deadline_ms == 0 || now_ms >= g_radio_deadline_ms)
           {
             uint32_t extra_ms = 0;
+            uint32_t adv_ms = SENSOR_STEADY_ADV_MS;
 
             if (g_scanner != NULL)
               {
                 sensor_observer_halt();
               }
 
-            /* **空轮回连退避**：这一轮没连上任何东西 ⇒ 下一轮之前多留一会儿给
-             * 手机广播（广播与扫描不能同时开，留长广播窗口 = 少一轮"停广播起扫描"）。
-             * 2 s → +2 → +4 → +8 → +16 s，上限 SENSOR_RECONNECT_IDLE_MAX_MS；
-             * 连上（1630 附近）或用户重扫/重绑/恢复流程都会清零。 */
-            if (s_reconnect_idle_cycles < 6u)
+            if (s_reconnect_idle_cycles < 4u)
               {
                 s_reconnect_idle_cycles++;
               }
 
             if (s_reconnect_idle_cycles > 1u)
               {
-                extra_ms = SENSOR_PHONE_ADV_WINDOW_MS
-                           << (s_reconnect_idle_cycles - 2u);
+                extra_ms = 1000u << (s_reconnect_idle_cycles - 2u);
                 if (extra_ms > SENSOR_RECONNECT_IDLE_MAX_MS)
                   {
                     extra_ms = SENSOR_RECONNECT_IDLE_MAX_MS;
                   }
               }
 
-            g_radio_phase = SENSOR_RADIO_ADV_WINDOW;
-            g_radio_deadline_ms = now_ms + SENSOR_PHONE_ADV_WINDOW_MS + extra_ms;
-            LOGI("[radio] resume phone ADV window %u ms (+%u idle backoff, empty=%u)",
-                 (unsigned)SENSOR_PHONE_ADV_WINDOW_MS, (unsigned)extra_ms,
+            sensor_radio_enter_phase(SENSOR_RADIO_ADV_WINDOW, now_ms);
+            g_radio_deadline_ms = now_ms + adv_ms + extra_ms;
+            LOGI("[radio] resume steady %s %u ms (+%u idle, empty=%u)",
+                 g_phone_connected ? "quiet" : "ADV",
+                 (unsigned)adv_ms, (unsigned)extra_ms,
                  (unsigned)s_reconnect_idle_cycles);
           }
         break;
 
       default:
-        g_radio_phase = SENSOR_RADIO_IDLE;
+        sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now_ms);
         g_radio_deadline_ms = 0;
         break;
     }
@@ -2879,6 +3496,12 @@ static void slot_idle_link_check(struct sensor_slot *slot, uint32_t now_ms)
 static void slot_try_connect(struct sensor_slot *slot, uint32_t now_ms)
 {
   bt_status_t ret;
+  extern bool myvendor_pair_window_active(void);
+
+  if (myvendor_pair_window_active())
+    {
+      return;                     /* 配对窗：只广播，不建传感器链 */
+    }
 
   if (!g_allow_connect && !slot->want_link)
     {
@@ -2995,6 +3618,10 @@ int ble_sensor_start(bt_instance_t *ins)
   g_phone_adv_held = false;
   g_radio_phase = SENSOR_RADIO_IDLE;
   g_radio_deadline_ms = 0;
+  g_radio_phase_ms = 0;
+  g_radio_last_scan_ms = 0;
+  g_radio_reconnect_since_ms = 0;
+  g_radio_heal_ms = 0;
   for (i = 0; i < SENSOR_KIND_COUNT; i++)
     {
       g_slots[i].kind = i;
@@ -3059,6 +3686,18 @@ void ble_sensor_stop(void)
   g_phone_adv_held = false;
   g_radio_phase = SENSOR_RADIO_IDLE;
   g_radio_deadline_ms = 0;
+  g_radio_phase_ms = 0;
+  g_radio_last_scan_ms = 0;
+  g_radio_reconnect_since_ms = 0;
+  g_radio_heal_ms = 0;
+  s_phone_first_until_ms = 0;
+  s_kick_scan_after_phone_first = false;
+  s_pair_win_prev = false;
+  s_pair_cool_until_ms = 0;
+  s_scan_start_ms = 0;
+  s_reconnect_idle_cycles = 0;
+  g_reconnect_gap_ms = 0;
+  g_reconnect_next_ms = 0;
   memset(g_pending_bind, 0, sizeof(g_pending_bind));
   sensor_adv_hold_update();
   sensor_ui_publish();
@@ -3106,7 +3745,7 @@ static void scan_progress(uint32_t left_sec, bool done)
 
             if (g_reconnect_gap_ms == 0)
               {
-                g_reconnect_gap_ms = SENSOR_RECONNECT_SCAN_MS *
+                g_reconnect_gap_ms = SENSOR_STEADY_SCAN_MS *
                                      SENSOR_RECONNECT_BACKOFF_STEP;
               }
             else if (g_reconnect_gap_ms < SENSOR_RECONNECT_BACKOFF_MAX_MS)
@@ -3320,10 +3959,10 @@ static void sensor_health_log(uint32_t now_ms)
            (unsigned)s->adv_live, (int)s->want_link);
     }
 
-  LOGI("health stats zombie=%u hci=%u disc_to=%u gattc=%u obs=%d",
+  LOGI("health stats zombie=%u hci=%u disc_to=%u gattc=%u radio_heal=%u obs=%d",
        (unsigned)g_health_zombie_n, (unsigned)g_health_hci_n,
        (unsigned)g_health_disc_to_n, (unsigned)g_health_recreate_n,
-       (int)(g_scanner != NULL));
+       (unsigned)g_health_radio_heal_n, (int)(g_scanner != NULL));
 }
 
 /**
@@ -3421,17 +4060,23 @@ void ble_sensor_pump(uint32_t now_ms)
   uint8_t i;
   struct sensor_slot *slot;
   bool radio_handled;
+  bool pair_win;
+  extern bool myvendor_pair_window_active(void);
 
   if (!g_started)
     {
       return;
     }
 
-  if (g_want_scan && g_scan_until_ms != 0 && now_ms >= g_scan_until_ms)
+  sensor_pair_window_guard(now_ms);
+  pair_win = myvendor_pair_window_active();
+
+  if (!pair_win && g_want_scan && g_scan_until_ms != 0 &&
+      now_ms >= g_scan_until_ms)
     {
       ble_sensor_scan_stop();
     }
-  else if (g_want_scan && g_scan_until_ms != 0 &&
+  else if (!pair_win && g_want_scan && g_scan_until_ms != 0 &&
            (g_adv_debug_ms == 0 ||
             sensor_age_ms(now_ms, g_adv_debug_ms) >= ADV_DEBUG_HEARTBEAT_MS))
     {
@@ -3444,9 +4089,23 @@ void ble_sensor_pump(uint32_t now_ms)
     }
 
   sensor_health_pump(now_ms);
-  radio_handled = sensor_reconnect_radio_pump(now_ms);
 
-  if (sensor_hci_connecting())
+  if (pair_win)
+    {
+      /* 配对窗：不跑 reconnect/扫；下面 switch 仍处理 DISCONNECTING 收尾。 */
+      radio_handled = true;
+      sensor_adv_hold_update();
+    }
+  else
+    {
+      radio_handled = sensor_reconnect_radio_pump(now_ms);
+    }
+
+  if (pair_win)
+    {
+      /* skip scan arming */
+    }
+  else if (sensor_hci_connecting())
     {
       if (g_scanner != NULL)
         {
@@ -3705,7 +4364,7 @@ void ble_sensor_set_connect(bool enable)
  */
 int ble_sensor_connect_index(uint8_t idx)
 {
-  ble_sensor_scan_burst();   /* 界面手动点连接：回到 60 s 全量 */
+  ble_sensor_scan_burst();   /* 界面手动点连接：尽快短扫 */
   return ble_sensor_connect_index_kind(idx, SENSOR_KIND_COUNT);
 }
 
@@ -3725,7 +4384,7 @@ int ble_sensor_connect_index(uint8_t idx)
  */
 int ble_sensor_connect_index_kind(uint8_t idx, uint8_t kind)
 {
-  ble_sensor_scan_burst();   /* 界面手动点连接：回到 60 s 全量 */
+  extern bool myvendor_pair_window_active(void);
   struct sensor_found *found;
   struct sensor_slot *slot;
   uint8_t i;
@@ -3734,6 +4393,14 @@ int ble_sensor_connect_index_kind(uint8_t idx, uint8_t kind)
   char addr[BT_ADDR_STR_LENGTH];
   char kinds[16];
   bool bound = false;
+
+  if (myvendor_pair_window_active())
+    {
+      LOGI("connect skip, pair window (ADV only)");
+      return -1;
+    }
+
+  ble_sensor_scan_burst();   /* 界面手动点连接：尽快短扫 */
 
   if (idx == 0 || idx > g_found_n)
     {
@@ -3978,6 +4645,7 @@ int ble_sensor_connect_addr(const uint8_t *mac, uint8_t addr_type, uint8_t kind,
                             const char *name, const uint8_t *drop_mac,
                             uint8_t drop_kind)
 {
+  extern bool myvendor_pair_window_active(void);
   bt_address_t addr;
   bt_address_t drop;
   struct sensor_slot *slot;
@@ -3985,6 +4653,12 @@ int ble_sensor_connect_addr(const uint8_t *mac, uint8_t addr_type, uint8_t kind,
   bool seen = false;
   int8_t rssi = 0;
   uint32_t now;
+
+  if (myvendor_pair_window_active())
+    {
+      LOGI("connect_addr skip, pair window (ADV only)");
+      return -1;
+    }
 
   if (kind >= SENSOR_KIND_COUNT || mac == NULL)
     {
@@ -4153,12 +4827,15 @@ void ble_sensor_reconnect_backoff_reset(void)
 
   g_reconnect_gap_ms  = 0;
   g_reconnect_next_ms = 0;
-  s_reconnect_idle_cycles = 0;   /* 空轮回连退避：恢复流程/用户动作后重来一遍 */
+  s_reconnect_idle_cycles = 0;
 
   for (k = 0; k < SENSOR_KIND_COUNT; k++)
     {
-      g_slots[k].retry_ms = 0;   /* 建链退避（0x3e 之类）也一起放行 */
+      g_slots[k].retry_ms = 0;
     }
+
+  /* 开机 / cycle / 重开外设：先 15 s 给手机。 */
+  sensor_radio_arm_phone_first(sensor_now_ms());
 }
 
 bool ble_sensor_connect_busy(void)
@@ -4193,8 +4870,15 @@ bool ble_sensor_connect_busy(void)
  */
 void ble_sensor_scan_arm(uint32_t timeout_ms)
 {
+  extern bool myvendor_pair_window_active(void);
 
-  ble_sensor_scan_burst();   /* 手动/被动触发：回到 60 s 全量扫描 */
+  if (myvendor_pair_window_active())
+    {
+      LOGI("[scan] skip, pair window (ADV only)");
+      return;
+    }
+
+  ble_sensor_scan_burst();   /* 手动/被动触发：尽快短扫 */
   uint32_t now = sensor_now_ms();
 
   if (ble_sensor_connect_busy())
@@ -4228,8 +4912,28 @@ void ble_sensor_scan_arm(uint32_t timeout_ms)
 
 void ble_sensor_set_phone_state(bool connected, bool adv_held)
 {
+  bool was = g_phone_connected;
+
   g_phone_connected = connected;
   g_phone_adv_held = adv_held;
+
+  /* 手机刚掉线：重新 15 s 只广播接 App，再进稳态间隔扫。 */
+  if (was && !connected)
+    {
+      sensor_radio_arm_phone_first(sensor_now_ms());
+    }
+  else if (!was && connected)
+    {
+      /* 仅上升沿进间隔扫；主循环每拍都会调本函数，不能每拍清 phase，
+       * 否则 quiet↔scan 永远卡在 IDLE（CPS 掉线后扫不起、busy 卡死）。 */
+      uint32_t now = sensor_now_ms();
+
+      s_phone_first_until_ms = 0;
+      s_kick_scan_after_phone_first = false;
+      s_reconnect_idle_cycles = 0;
+      sensor_radio_enter_phase(SENSOR_RADIO_IDLE, now);
+      g_radio_deadline_ms = 0;
+    }
 }
 
 /**
@@ -4360,9 +5064,10 @@ void ble_sensor_dump(void)
            (unsigned)g_slots[i].notify_ms, (unsigned)g_slots[i].adv_live);
     }
 
-  LOGI("health zombie=%u hci=%u disc_to=%u gattc=%u",
+  LOGI("health zombie=%u hci=%u disc_to=%u gattc=%u radio_heal=%u",
        (unsigned)g_health_zombie_n, (unsigned)g_health_hci_n,
-       (unsigned)g_health_disc_to_n, (unsigned)g_health_recreate_n);
+       (unsigned)g_health_disc_to_n, (unsigned)g_health_recreate_n,
+       (unsigned)g_health_radio_heal_n);
 }
 
 /**

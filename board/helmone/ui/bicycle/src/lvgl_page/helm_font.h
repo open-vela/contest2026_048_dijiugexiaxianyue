@@ -1,9 +1,14 @@
 /**
  * @file helm_font.h
- * @brief 菜单/标题：MiSans Medium 4bpp 点阵（缺字回退苹方位图）。
- *        通知/地图长文本：量产可用 helm_font_sys() FreeType；
- *        工厂固件只用 4bpp C 字模（helm_mism4_* + helm_ui_* 回退）。
+ * @brief 菜单/标题：MiSans Medium 4bpp 点阵，缺字按 `苹方位图 → 系统 TTF` 回退。
+ *        通知/地图长文本（用户文件名、蓝牙设备名、App 通知正文）：量产直接用
+ *        helm_font_sys() 的 FreeType；
+ *        工厂固件只用 4bpp C 字模（helm_mism4_* + helm_ui_* 回退，没有 TTF）。
  *        大号速度数字仍用码表位图。
+ *
+ * @note 点阵库只覆盖 582 个码位（2026-10-01 实测），外来文本必然缺字，而本工程
+ *       开了 `LV_USE_FONT_PLACEHOLDER` ⇒ 缺字画成**方块**。链尾挂系统 TTF 是
+ *       为了让这些字有地方可落，见 helm_font.c。
  */
 
 #ifndef HELM_FONT_H
@@ -26,6 +31,13 @@ LV_FONT_DECLARE(helm_mism4_22);
 LV_FONT_DECLARE(helm_ui_64);
 LV_FONT_DECLARE(helm_num_28);
 LV_FONT_DECLARE(helm_num_32);
+/** @brief 40px 时钟字（待机页主时钟用）。
+ *  @details 离线生成，只有 `0123456789:.` 十二个字形、2bpp、位图 1824 B
+ *           （生成器 `zcode/analysis/helm_preview/genfont.py`，不依赖 lv_font_conv；
+ *           已回读校验：与 PingFangSC-Semibold 直渲 40px 逐像素同形，"14:32" 同为 107px）。
+ *           为什么单开一档：32px 偏小，56px 的 "14:32" 宽 150px 而待机页左栏约 110px，
+ *           中间这一档原来是空的。 */
+LV_FONT_DECLARE(helm_num_40);
 LV_FONT_DECLARE(helm_num_56);
 LV_FONT_DECLARE(helm_num_64);
 LV_FONT_DECLARE(helm_fa_16);
@@ -58,12 +70,22 @@ static inline const lv_font_t * helm_font_sys(int32_t px, const lv_font_t * fall
 #endif
 }
 
-/** @brief 事项/标签用 15px 点阵（splash TTF 未就绪时）。 */
+/**
+ * @brief 把已就绪的系统 TTF 接到点阵链尾（保底字体）。
+ * @details 幂等、可重复调；TTF 还没预载完时是空操作，下次调用再补。
+ *          `helm_font_lab/title/val/status` 每次都会顺手调一次，所以调用方
+ *          通常不需要自己调 —— 只有"想让已经挂在屏上的对象立刻生效"时才显式调。
+ */
+void helm_font_sync_sys(void);
+
+/** @brief 副标题/行内小字 12px 点阵（MiSans → 苹方 → TTF）。 */
 const lv_font_t * helm_font_lab(void);
-/** @brief 标题 22px 点阵。 */
+/** @brief 行标题 15px 点阵（MiSans → 苹方 → TTF）。 */
 const lv_font_t * helm_font_title(void);
-/** @brief 数值 22px 点阵。 */
+/** @brief 大号数值 22px 点阵（MiSans → 苹方 → TTF）。 */
 const lv_font_t * helm_font_val(void);
+/** @brief 状态栏 12px 苹方位图（不含 MiSans 层）+ TTF 保底。 */
+const lv_font_t * helm_font_status(void);
 
 static inline const lv_font_t * helm_font_quad(void)
 {

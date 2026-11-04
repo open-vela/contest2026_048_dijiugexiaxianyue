@@ -103,6 +103,7 @@ struct gpx_record
 {
   bool thread_alive;            /* create 后 true，线程退出后置 false */
   bool thread_uses_static_stack; /* 占用单例 BoardPSRAM 外部栈 */
+  int close_error;             /* failed close retains writer/cache for retry */
   bool recording;               /* 文件已 open，可稳定 push */
   bool start_pending;           /* start 已投递，fopen 尚未完成 */
   bool paused;                  /* pause 置 true，resume 清零 */
@@ -448,42 +449,34 @@ static int gpx_record_flush_pending_locked(gpx_record_t *rec)
 static int gpx_record_close_session_locked(gpx_record_t *rec)
 {
   int ret = 0;
-  unsigned i;
 
-  if (!rec->recording)
+  if (!rec->recording && !rec->writer.open)
     {
       rec->stop_drain = false;
-      return 0;
+      return rec->close_error;
     }
 
-  for (i = 0; i < 4u; i++)
+  if (!rec->writer.footer_written)
     {
       ret = gpx_record_flush_pending_locked(rec);
-      if (ret == 0)
-        {
-          break;
-        }
+    }
 
+  if (ret == 0)
+    {
       gpx_port_mutex_unlock(&rec->lock);
-      gpx_port_sleep_ms(50);
+      ret = gpx_writer_close(&rec->writer);
       gpx_port_mutex_lock(&rec->lock);
     }
 
-  /* close 可能一直刷 128KiB 缓存；锁外做，UI 才不会跟盘卡住。 */
-  gpx_port_mutex_unlock(&rec->lock);
-  {
-    int close_ret = gpx_writer_close(&rec->writer);
-
-    if (ret == 0)
-      {
-        ret = close_ret;
-      }
-  }
-
-  gpx_port_mutex_lock(&rec->lock);
+  rec->close_error = ret;
   rec->recording = false;
   rec->paused = false;
   rec->stop_drain = false;
+  if (ret != 0)
+    {
+      printf("gpx_record: close failed (%d), retained for retry\n", ret);
+    }
+
   return ret;
 }
 
@@ -499,7 +492,7 @@ static int gpx_record_open_session_locked(gpx_record_t *rec,
 {
   int ret;
 
-  if (rec->recording)
+  if (rec->recording || rec->writer.open)
     {
       rec->start_pending = false;
       return -EBUSY;
@@ -529,6 +522,7 @@ static int gpx_record_open_session_locked(gpx_record_t *rec,
       return ret;
     }
 
+  rec->close_error = 0;
   rec->recording = true;
   rec->paused = false;
   rec->stop_drain = false;
@@ -721,7 +715,10 @@ static void *gpx_record_thread(void *arg)
     }
 
   gpx_port_mutex_lock(&rec->lock);
-  gpx_record_drain_data_ext_locked(rec);
+  if (rec->close_error == 0)
+    {
+      gpx_record_drain_data_ext_locked(rec);
+    }
   gpx_port_queue_reset(&rec->cmd_q);
   rec->thread_alive = false;
   gpx_port_mutex_unlock(&rec->lock);
@@ -995,13 +992,13 @@ static int gpx_record_start_common(gpx_record_t *rec, const char *filepath,
   gpx_record_fill_start_cmd(&cmd, filepath, meta, append);
 
   gpx_port_mutex_lock(&rec->lock);
-  if (rec->start_pending)
+  if (rec->start_pending || rec->stop_drain || rec->close_error != 0)
     {
       gpx_port_mutex_unlock(&rec->lock);
       return -EBUSY;
     }
 
-  /* 上一趟正在 close 时允许把下一趟 START 排在 STOP 后面。 */
+  /* A failed/in-progress close retains ownership of the previous session. */
   if (rec->recording && !rec->stop_drain)
     {
       gpx_port_mutex_unlock(&rec->lock);
@@ -1137,16 +1134,25 @@ int gpx_record_stop(gpx_record_t *rec)
 {
   gpx_record_cmd_msg_t cmd;
 
-  if (rec == NULL || !rec->thread_alive)
+  if (rec == NULL)
     {
       return -EINVAL;
+    }
+
+  if (!rec->thread_alive)
+    {
+      int ret = gpx_record_thread_spawn(rec);
+      if (ret != 0)
+        {
+          return ret;
+        }
     }
 
   memset(&cmd, 0, sizeof(cmd));
   cmd.id = GPX_RECORD_CMD_STOP;
 
   gpx_port_mutex_lock(&rec->lock);
-  if (!rec->recording && !rec->start_pending)
+  if (!rec->recording && !rec->start_pending && !rec->writer.open)
     {
       rec->stop_drain = false;
       gpx_port_mutex_unlock(&rec->lock);
@@ -1176,6 +1182,8 @@ int gpx_record_stop(gpx_record_t *rec)
  */
 int gpx_record_wait_close(gpx_record_t *rec)
 {
+  unsigned waited = 0;
+
   if (rec == NULL)
     {
       return -EINVAL;
@@ -1186,14 +1194,21 @@ int gpx_record_wait_close(gpx_record_t *rec)
       bool busy;
 
       gpx_port_mutex_lock(&rec->lock);
-      busy = rec->start_pending || rec->stop_drain || rec->release_pending;
+      busy = rec->start_pending || rec->stop_drain ||
+             (rec->release_pending && rec->thread_alive);
       gpx_port_mutex_unlock(&rec->lock);
       if (!busy)
         {
-          return 0;
+          return gpx_record_close_error(rec);
+        }
+
+      if (waited >= 10000u)
+        {
+          return -ETIMEDOUT;
         }
 
       gpx_port_sleep_ms(20);
+      waited += 20u;
     }
 }
 
@@ -1218,6 +1233,11 @@ int gpx_record_release(gpx_record_t **rec)
   r = *rec;
   if (!r->thread_alive)
     {
+      if (r->close_error != 0)
+        {
+          return r->close_error;
+        }
+
       if (r->thread_uses_static_stack)
         {
           (void)gpx_port_thread_join(&r->thread);
@@ -1249,6 +1269,11 @@ int gpx_record_release(gpx_record_t **rec)
       gpx_record_stack_free();
     }
 
+  if (r->close_error != 0)
+    {
+      return r->close_error;
+    }
+
   gpx_record_free_io(r);
   gpx_port_sem_destroy(&r->sem_wake);
   gpx_port_mutex_destroy(&r->lock);
@@ -1276,6 +1301,20 @@ bool gpx_record_is_recording(gpx_record_t *rec)
   v = (rec->recording || rec->start_pending) && !rec->stop_drain;
   gpx_port_mutex_unlock(&rec->lock);
   return v;
+}
+
+int gpx_record_close_error(gpx_record_t *rec)
+{
+  int ret;
+  if (rec == NULL)
+    {
+      return -EINVAL;
+    }
+
+  gpx_port_mutex_lock(&rec->lock);
+  ret = rec->close_error;
+  gpx_port_mutex_unlock(&rec->lock);
+  return ret;
 }
 
 bool gpx_record_is_closing(gpx_record_t *rec)

@@ -4,6 +4,10 @@
 # Vela 抽换层：按文件名替换 OpenVela 上游编译单元，不改 nuttx / apps /
 # frameworks / zblue git。往对应子目录丢同名 .c 即生效。
 #
+# 2026-09-25：把 patch_adapter_service.py 的 v3 改回来（日常断链的 DFX 上报
+# ERROR→WARNING，DFX 事件照发），并降级 sal_gatt_client_interface.c 的
+# `[UNSUBSCRIBED]` 与"未认领即释放"。本行同时起"真实编辑逼 reconfigure"的作用。
+#
 # 每个抽换件（*.c 与 patch_*.py）**文件头**都带：替的是哪个上游仓库/文件、写入时的 HEAD、
 # 该上游文件在 HEAD 的 blob、为什么抽换、以及版本漂移自查命令（rev-parse/diff）。
 # 本表只留一句话原因与它影响哪个 lib/target；要看全的打开文件头。
@@ -26,9 +30,13 @@
 #   bluetooth/   → libbluetooth
 #     scan_manager.c               LOCAL 下不编 bt_socket.h
 #     sal_gatt_client_interface.c  keep_db / 溢出不拆链
+#     sal_gatt_server_interface.c  CCC 写回调按写入字节/peer cfg 上报（不用 conn_index）
 #     sal_le_advertise_interface.c SF32 走 legacy bt_le_adv_start
 #     sal_le_scan_interface.c      -EALREADY 重试、options=0
 #     patch_adapter_service.py     加密状态变化 BLE 分支 NULL 设备保护（find_create + guard）
+#     patch_adapter_state.py       adapter turn-on 失败退回 off_state（HSM 没有失败出口 ⇒ 永久死态）
+#     patch_log_server.py          DIRECT 模式关掉 property monitor（那三个符号只在 client 模式编译 ⇒ 否则开了日志就链接失败）
+#     patch_hci_h4.py              RX 取包不再阻塞服务线程（K_FOREVER→K_NO_WAIT + 不可丢包退帧重试）；补 ext adv 到可丢集合；h4_open 例行信息 ERROR→INFO
 #   fs/          → lib fs
 #     fs_procfs_mount.c            df -h 用 uint64，避免 >=4GiB wrap
 #     fs_fat32util.c               FatSz16==0 当 FAT32（大簇 1GiB 卷）
@@ -45,12 +53,14 @@
 #     patch_hci_core.py 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待
 #     patch_gatt_ccc_pool.py 断开释放 CCC 槽 + 池满时回收已断开的 peer；CCC 写/复位原始字节取证；地址对不上不误关 CCC
 #     patch_net_buf_timeout.py 缓冲区 K_FOREVER 改成有上限的轮询（否则卡死不可杀）
+#     patch_conn_ready_null.py get_conn_ready 判空 + DISCONNECTED 时摘 conn_ready 节点
 #     （预留 id.c 扫描 -EACCES）
 #   sched/       → lib sched
-#     wd_start.c        PSRAM waitdog 视为合法；断链才剪环，避免 wd_insert HardFault
-#     wd_cancel.c       未入链不 list_delete
-#     sem_waitirq.c     waitobj==NULL 记 schedmon，不 DEBUGASSERT
-#     sem_post.c        mutex holder≠tid 记 schedmon，不 DEBUGASSERT
+#     wd_start.c                 PSRAM waitdog 视为合法；断链才剪环，避免 wd_insert HardFault
+#     wd_cancel.c                未入链不 list_delete
+#     sem_waitirq.c              waitobj==NULL 记 schedmon，不 DEBUGASSERT
+#     sem_post.c                 mutex holder≠tid 记 schedmon，不 DEBUGASSERT
+#     sched_removereadytorun.c   UP flink==NULL 拼回 IDLE，记 schedmon，不 DEBUGASSERT
 #
 # DEFER 执行时 CMAKE_CURRENT_LIST_DIR 已是 nuttx，路径必须先存下来。
 #
@@ -291,6 +301,39 @@ function(myvendor_patch_zblue_keys_kv)
     "zblue bt_keys persist to /mnt/kv/bt_keys.bin (smp.c save hook)")
 endfunction()
 
+# get_conn_ready() 对 conn_ready 链表 peek_head→CONTAINER_OF，原先没有判空；
+# 且 DISCONNECTED 时不摘节点 ⇒ TX 消费前断开会留下指着已清零 conn 的 stale 节点，
+# 下次 peek 就是空指针 + 成员偏移（现场 cfsr=0x82 bfar=0x124，ble_companion panic）。
+# 见 patch_conn_ready_null.py。
+function(myvendor_patch_zblue_conn_ready)
+  myvendor_patch_zblue_via_script(
+    conn.c
+    patch_conn_ready_null.py
+    "zblue conn_ready: NULL guard + unlink on disconnect")
+endfunction()
+
+# scan.c 有四处 `hdev->scan_ctx` 裸解引用（适配器拆栈 / HCI 复位未回的窗口里它是
+# NULL）：bt_scan_softreset（2026-09-18 现场 panic 的那处）、bt_le_scan_stop_mc
+# 尾部、以及两个同族入口 bt_le_scan_user_add / user_remove。2026-09-18 先就地改过
+# 前两处；2026-09-24 全部收进脚本（上游 git 回到不动状态）。
+# 见 patch_scan_stop_null.py 与 docs/pitch/zblue-scan-stop-null-ctx.md。
+function(myvendor_patch_zblue_scan_null)
+  myvendor_patch_zblue_via_script(
+    scan.c
+    patch_scan_stop_null.py
+    "zblue scan: 4x scan_ctx NULL guard (softreset/stop_mc/user_add/user_remove)")
+endfunction()
+
+# id.c：`LE Set Random Address` 在外设链路已建立时会被控制器拒绝（-EACCES），
+# 上游只对"扫描中/发起中"放行 ⇒ 手机连着时观测者起不来（一帧都收不到）。
+# 放宽为"一律保留当前身份地址继续扫"。见 patch_id_scan_addr.py。
+function(myvendor_patch_zblue_id_scan_addr)
+  myvendor_patch_zblue_via_script(
+    id.c
+    patch_id_scan_addr.py
+    "zblue id: tolerate -EACCES from Set Random Address (keep identity)")
+endfunction()
+
 function(myvendor_patch_upstream_sources)
   myvendor_patch_target_by_name(libbluetooth "${MYVENDOR_BT_OVERRIDE_DIR}")
 
@@ -317,6 +360,96 @@ function(myvendor_patch_upstream_sources)
     endif()
   endif()
 
+  # adapter 状态机（adapter_state.c）在「turn on 失败」这条路上**没有失败出口**：
+  # ble_turning_on_enter() 里 bt_sal_le_enable() 失败时不做任何迁移 ⇒ HSM 永久
+  # 停在 ble_turning_on_state（对外状态却是 OFF），而该状态只认 BLE_ENABLED /
+  # BLE_PROFILE_ENABLED（都需要 zblue 的 ready 回调 —— bt_enable() 已经失败了），
+  # 状态表又是扁平的 ⇒ 再 enable 也回不去。现场就是每 ~76 s 一轮的
+  # companion respawn 死循环（LCPU force reset / task restart 都救不回来，
+  # 因为它们都不碰这台 HSM）。见 patch_adapter_state.py 头注释。
+  if(NOT DEFINED NUTTX_APPS_DIR)
+    message(WARNING "my_vendor: NUTTX_APPS_DIR not set, skip adapter_state.c patch")
+  else()
+    execute_process(
+      COMMAND python3 "${MYVENDOR_BT_OVERRIDE_DIR}/patch_adapter_state.py"
+              "${NUTTX_APPS_DIR}/frameworks/connectivity/bluetooth/service/src/adapter_state.c"
+              "${MYVENDOR_BT_GEN_DIR}/adapter_state.c"
+      RESULT_VARIABLE _st_r
+      ERROR_VARIABLE _st_e)
+    if(NOT _st_r EQUAL 0)
+      message(WARNING "my_vendor: adapter_state.c patch failed: ${_st_e}")
+    else()
+      myvendor_patch_target_by_name(libbluetooth "${MYVENDOR_BT_GEN_DIR}")
+    endif()
+  endif()
+
+  # log_server.c：framework 的 BT_LOG* 实现。它碰 property_monitor_* 的三处只判了
+  # CONFIG_KVDB + __NuttX__，**漏判 CONFIG_KVDB_DIRECT** —— 而 KVDB 的 CMake 只在
+  # **非** DIRECT 模式编译提供那三个符号的 kvdb/client.c。本板是 DIRECT ⇒ 三个
+  # undefined reference。平时不炸是因为不开日志时 BT_LOG* 是空宏、没人引用
+  # bt_log_print_check() ⇒ log_server.o 压根不被链接器拉进来。
+  # 见 patch_log_server.py 头注释（含 CMakeLists 行号与 kvdb.h 行号）。
+  if(NOT DEFINED NUTTX_APPS_DIR)
+    message(WARNING "my_vendor: NUTTX_APPS_DIR not set, skip log_server.c patch")
+  else()
+    execute_process(
+      COMMAND python3 "${MYVENDOR_BT_OVERRIDE_DIR}/patch_log_server.py"
+              "${NUTTX_APPS_DIR}/frameworks/connectivity/bluetooth/service/utils/log_server.c"
+              "${MYVENDOR_BT_GEN_DIR}/log_server.c"
+      RESULT_VARIABLE _ls_r
+      ERROR_VARIABLE _ls_e)
+    if(NOT _ls_r EQUAL 0)
+      message(WARNING "my_vendor: log_server.c patch failed: ${_ls_e}")
+    else()
+      # 生成的副本在构建目录里，**同目录的头**就找不到了：log_server.c 里
+      # 用引号形式 include 了同目录的 `btsnoop_log.h` 和 `log.h`（引号形式先搜
+      # "包含者所在目录"），而副本不在那儿。不补的现场是
+      #   myvendor_bt/log_server.c:27:10: fatal error: btsnoop_log.h: No such file
+      #
+      # 用 target_include_directories（**target 作用域**）而不是
+      # set_property(SOURCE … COMPILE_OPTIONS …)：后者是本板目录作用域下写的，
+      # 对 add_subdirectory 进来的 libbluetooth 不生效 —— 实测
+      # compile_commands.json 里那条命令**没有**多出这个 -I（已验），
+      # 而 target 作用域一定生效。
+      #
+      # 追加在末尾（PRIVATE + 追加语义）：**不改变任何既有 include 的解析顺序**，
+      # 只是给这两个头多开一条路。service/utils 里有 `log.h` 这种通用名，
+      # 所以这一点很重要 —— 排在最后就不会顶掉别人的同名头。
+      # （同 myvendor_patch_zblue_via_script 给 zblue 副本补 -I 的意图。）
+      target_include_directories(
+        libbluetooth
+        PRIVATE
+          "${NUTTX_APPS_DIR}/frameworks/connectivity/bluetooth/service/utils")
+      myvendor_patch_target_by_name(libbluetooth "${MYVENDOR_BT_GEN_DIR}")
+    endif()
+  endif()
+
+  # hci_h4.c：zblue 的 H4 传输 + 字符设备 poll 回调。RX 取包原来对非可丢事件与 ACL
+  # 传 K_FOREVER ⇒ 拿不到 net_buf 就把**整条 BT 服务线程**（所有 SAL/GATT/连接管理）
+  # 钉住，而且超时后是丢包（高优先级事件丢一条会让流控与状态永久错位）。
+  # 改成 K_NO_WAIT + 不可丢包退帧重试，并补上扩展广播报告到可丢集合
+  # （SDK 2.4 的 commit 8a1103b 有这条）。见 patch_hci_h4.py 头注释。
+  #
+  # 注：这个文件在写入前**已经被人在原地改过**（h4_rx_reopen 那一段）。本补丁只碰
+  # get_rx 与调用点，不去动它；走脚本是为了上游重新同步时改动不会丢。
+  if(NOT DEFINED NUTTX_APPS_DIR)
+    message(WARNING "my_vendor: NUTTX_APPS_DIR not set, skip hci_h4.c patch")
+  else()
+    execute_process(
+      COMMAND python3 "${MYVENDOR_BT_OVERRIDE_DIR}/patch_hci_h4.py"
+              "${NUTTX_APPS_DIR}/frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c"
+              "${MYVENDOR_BT_GEN_DIR}/hci_h4.c"
+      RESULT_VARIABLE _h4_r
+      ERROR_VARIABLE _h4_e)
+    if(NOT _h4_r EQUAL 0)
+      message(WARNING "my_vendor: hci_h4.c patch failed: ${_h4_e}")
+    else()
+      # 不需要额外 -I：它 include 的 "hci_h4.h" 在
+      # service/stacks/zephyr/include，那个目录本来就在 libbluetooth 的 include 路径上。
+      myvendor_patch_target_by_name(libbluetooth "${MYVENDOR_BT_GEN_DIR}")
+    endif()
+  endif()
+
   myvendor_patch_target_by_name(fs "${MYVENDOR_FS_OVERRIDE_DIR}")
   if(TARGET fs)
     # override fs_fat32util.c: "fs_fat32.h" lives next to the upstream .c
@@ -327,6 +460,9 @@ function(myvendor_patch_upstream_sources)
   myvendor_patch_zblue_gatt_ccc()
   myvendor_patch_zblue_net_buf_timeout()
   myvendor_patch_zblue_keys_kv()
+  myvendor_patch_zblue_conn_ready()
+  myvendor_patch_zblue_scan_null()
+  myvendor_patch_zblue_id_scan_addr()
   myvendor_patch_target_by_name(sched "${MYVENDOR_SCHED_OVERRIDE_DIR}")
   if(TARGET sched)
     target_include_directories(sched PRIVATE "${MYVENDOR_BOARD_INCLUDE_DIR}")

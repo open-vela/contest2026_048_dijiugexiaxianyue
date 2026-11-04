@@ -597,7 +597,8 @@ static void tool_draw_compass(lv_layer_t * layer, const lv_area_t * box)
                        helm_font_title(), ink);
     } else {
         tool_draw_text(layer, cx, cy - 8, "--", helm_font_quad(), ink);
-        tool_draw_text(layer, cx, cy + 16, "等待地磁", helm_font_lab(), ink);
+        tool_draw_text(layer, cx, cy + 16, "等待地磁", helm_font_lab(),
+                       helm_color(HELM_COLOR_MUTE));
     }
 }
 
@@ -695,7 +696,8 @@ static void tool_draw_gmeter(lv_layer_t * layer, const lv_area_t * box)
     lv_snprintf(line, sizeof(line), "%0.2f g", (double)s_tool.g_now);
     tool_draw_text(layer, cx, box->y2 - 28, line, helm_font_val(), ink);
     lv_snprintf(line, sizeof(line), "峰值 %0.2f", (double)s_tool.peak_g);
-    tool_draw_text(layer, cx, box->y2 - 12, line, helm_font_lab(), ink);
+    tool_draw_text(layer, cx, box->y2 - 12, line, helm_font_lab(),
+                   helm_color(HELM_COLOR_MUTE));
 }
 
 static void tool_draw_alt_gauge(lv_layer_t * layer, int32_t cx, int32_t cy,
@@ -768,7 +770,8 @@ static void tool_draw_alt_readout(lv_layer_t * layer, int32_t cx, int32_t cy,
     tool_draw_text(layer, cx, cy + 24, bot, helm_font_val(),
                    gnss_ok ? ink : warn);
     tool_draw_text(layer, cx, cy + 42, gnss_ok ? "GNSS" : "无GNSS",
-                   helm_font_lab(), gnss_ok ? ink : warn);
+                   helm_font_lab(),
+                   gnss_ok ? helm_color(HELM_COLOR_MUTE) : warn);
 }
 
 static void tool_draw_altimeter(lv_layer_t * layer, const lv_area_t * box)
@@ -1097,7 +1100,8 @@ lv_obj_t * helm_toolbox_build(lv_obj_t * parent)
     s_tool.val = helm_label(s_tool.root, helm_font_val(), HELM_COLOR_INK, "--");
     lv_obj_set_width(s_tool.val, lv_pct(100));
     lv_obj_set_style_text_align(s_tool.val, LV_TEXT_ALIGN_CENTER, 0);
-    s_tool.sub = helm_label(s_tool.root, helm_font_lab(), HELM_COLOR_INK, "");
+    /* 仪表页的次级行（"按住 KEY2 归零"这类）跟菜单同一层级：MUTE 12px。 */
+    s_tool.sub = helm_label(s_tool.root, helm_font_lab(), HELM_COLOR_MUTE, "");
     lv_obj_set_width(s_tool.sub, lv_pct(100));
     lv_obj_set_style_text_align(s_tool.sub, LV_TEXT_ALIGN_CENTER, 0);
 

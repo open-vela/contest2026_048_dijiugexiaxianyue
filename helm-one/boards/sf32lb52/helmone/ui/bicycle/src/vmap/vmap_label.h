@@ -30,6 +30,12 @@ typedef struct {
     uint8_t kind;
     uint8_t prio;
     uint8_t road_vertical;
+    /** @brief 道路切向（画布/正北坐标系，单位向量）。
+     *  @details 航向朝上的正立标签要按"已经显示出来的地图旋转角"把它转成屏幕
+     *           方向，再决定横排还是逐字竖排（与正北同一套 |dy|>|dx| 规则）。
+     *           点标签（地名/水名/POI）固定 (1,0)；(0,0) = 方向未知，回退横排。 */
+    float dir_x;
+    float dir_y;
     char name[64];
 } vmap_label_cand_t;
 

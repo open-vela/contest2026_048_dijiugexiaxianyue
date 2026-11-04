@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <syslog.h>
 
 #include "companion_bridge.h"
 #include "companion_downlink.h"
@@ -22,8 +23,14 @@
 #include "transfer_backend.h"
 #include "board_malloc.h"
 
-#define LOGI(fmt, ...) printf("ble_companion: " fmt "\n", ##__VA_ARGS__)
-#define LOGE(fmt, ...) printf("ble_companion: ERROR " fmt "\n", ##__VA_ARGS__)
+/**
+ * @brief 本模块日志出口（官方规则：服务层统一走 `syslog()`，不用 `printf`）。
+ *
+ * @details 前缀固定 `ble_companion: `；正常收包/结束用 INFO，真故障才 ERROR
+ *          （`/mnt/kv/diag` 归档只收 WARNING 及以上，别把例行事件写成 ERROR）。
+ */
+#define LOGI(fmt, ...) syslog(LOG_INFO, "ble_companion: " fmt "\n", ##__VA_ARGS__)
+#define LOGE(fmt, ...) syslog(LOG_ERR, "ble_companion: " fmt "\n", ##__VA_ARGS__)
 
 struct frag_acc
 {

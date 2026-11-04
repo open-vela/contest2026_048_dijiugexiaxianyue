@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/myvendor_cpuload.c
+ * vendor/HelmOne/chips/sf32lb52/myvendor_cpuload.c
  *
  * CPULOAD_EXTCLK via BTIM2 period timer (async with 10 ms sys tick).
  *

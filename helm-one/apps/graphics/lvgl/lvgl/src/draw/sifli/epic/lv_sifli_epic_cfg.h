@@ -175,6 +175,9 @@ EZIP_HandleTypeDef * lv_ezip_get_handle(void);
  * @param size Range size in bytes
  */
 void lv_epic_flush_cache_range(const void * data, uint32_t size);
+#if LV_USE_NUTTX
+void lv_epic_clean_invalidate_cache_range(const void * data, uint32_t size);
+#endif
 
 /**
  * Clean and invalidate a cache range before EPIC reads/writes a shared buffer.

@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/gnss/sf32lb52_l96.h
+ * vendor/HelmOne/boards/sf32lb52/drivers/gnss/sf32lb52_l96.h
  *
  * u-blox MAX-M10S-00B-01 on USART2
  * (PA31 TX / PA32 RX / PA43 GNSS_PWR).

@@ -26,7 +26,7 @@ apps/frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c
 git -C frameworks/connectivity/bluetooth rev-parse HEAD
 git -C frameworks/connectivity/bluetooth rev-parse HEAD:service/stacks/zephyr/hci_h4.c  # 应等于上表 blob
 git -C frameworks/connectivity/bluetooth apply --check \
-    ../../vendor/my_vendor/docs/pitch/patches/vela-hci-h4-rx-reopen.patch
+    ../../vendor/HelmOne/docs/pitch/patches/vela-hci-h4-rx-reopen.patch
 ```
 
 ## 原因

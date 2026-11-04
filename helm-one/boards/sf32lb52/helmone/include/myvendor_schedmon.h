@@ -102,10 +102,14 @@ struct myvendor_schedmon_snap_s
   uint32_t mutex_bad_n;
   /** @brief waitobj 非空但不变量不成立的累计次数（与 null_n 分开计）。 */
   uint32_t sembad_n;
+  /** @brief 就绪链头的 flink 为空（IDLE 丢了）：remove_readytorun 自愈次数。 */
+  uint32_t ready_orphan_n;
   struct myvendor_schedmon_task_s task[MYVENDOR_SCHEDMON_TASKS];
   struct myvendor_schedmon_null_s last_null;
   struct myvendor_schedmon_mutex_s last_mutex;
   struct myvendor_schedmon_null_s last_sembad;
+  /** @brief 最近一次就绪链自愈：wt=被摘的头，run=拼回去的 IDLE。 */
+  struct myvendor_schedmon_null_s last_ready_orphan;
 };
 
 /**
@@ -145,6 +149,15 @@ void myvendor_schedmon_waitirq_bad(FAR struct tcb_s *wtcb, int errcode,
  */
 void myvendor_schedmon_mutex_bad(int32_t holder, pid_t tid, pid_t run_pid,
                                  FAR const void *sem, FAR const void *caller);
+
+/**
+ * @brief 就绪链头 flink==NULL（本应至少还有 IDLE）。临界区，禁止 syslog。
+ *
+ * @param rtcb 正被摘下的就绪链头（通常是即将阻塞的当前任务）。
+ * @param idle 找到的 IDLE TCB（可为 NULL，表示连 pid0 都没有）。
+ */
+void myvendor_schedmon_ready_orphan(FAR struct tcb_s *rtcb,
+                                    FAR struct tcb_s *idle);
 
 /** @brief diag 500 ms：抽样 TCB，有新 semnull 或到点则打日志。 */
 void myvendor_schedmon_tick(void);

@@ -183,6 +183,6 @@ void bicycle_inval_probe_init(lv_display_t * disp)
     lv_display_add_event_cb(disp, bicycle_inval_disp_event, LV_EVENT_REFR_START, NULL);
     lv_display_add_event_cb(disp, bicycle_inval_disp_event, LV_EVENT_FLUSH_START, NULL);
     lv_timer_create(bicycle_inval_summary_timer, BICYCLE_INVAL_SUMMARY_MS, NULL);
-    LV_LOG_USER("[inval] probe on — watch [inval] lines in log");
+    LV_LOG_INFO("[inval] probe on — watch [inval] lines in log");
     syslog(LOG_NOTICE, "[inval] probe on");
 }

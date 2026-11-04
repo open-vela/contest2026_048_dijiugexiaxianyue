@@ -14,6 +14,8 @@
 static lv_pm_theme_id_t g_theme_id = LV_PM_THEME_ID_INVALID;
 static lv_pm_theme_notify_cb g_theme_notify;
 static void * g_theme_notify_ud;
+/** @brief 待办的"页面级主题应用"（见 `lv_pm_theme_apply_all()` 的注释）。 */
+static bool s_pages_pending;
 
 /**
  * @brief lv_pm foreach registered page。
@@ -237,8 +239,30 @@ void lv_pm_theme_apply_all(void)
         g_theme_notify(g_theme_id, g_theme_notify_ud);
     }
 
-    lv_pm_foreach_registered_page(theme_apply_shell_visitor, NULL);
-    lv_pm_foreach_registered_page(theme_invoke_page, (void *)(uintptr_t)g_theme_id);
+    /* ⚠ **页面级重活不在这里做**（2026-09-27，用户现场"点一下像要点两次"）：
+     * 这两趟 foreach 会逐页 `lv_pm_page_layout_below_bars()` + 重贴页面壳样式 +
+     * 跑页面自己的 theme_changed_cb ⇒ 实测 0.4~2.0 秒（同一动作方差极大，见
+     * `[theme] click #N … cycle=…ms`）。它们跟"调色板换没换"无关，却排在同一个同步
+     * 路径里 ⇒ 用户点一下要等它们跑完**屏幕上才动**。
+     * ⇒ 这里只置待办，由 UI 主循环在循环顶补跑（同 lv_pm_theme_lvgl_bind 的整树重算）。
+     *   可见顺序变成：先换色（快），页面壳/状态栏晚一帧 —— 最终取的是同一个主题色，
+     *   所以肉眼无感。 */
+    s_pages_pending = true;
+}
+
+/** @brief 循环顶补跑待办的主题工作：页面级应用 + 整树样式重算。
+ *  @note UI 主循环每圈调一次；无待办时空操作。顺序：先页面（会设样式），
+ *        再整树重算（顺带把改动过的区域标脏）。 */
+void lv_pm_theme_poll_styles(void)
+{
+    if (s_pages_pending) {
+        s_pages_pending = false;
+        lv_pm_foreach_registered_page(theme_apply_shell_visitor, NULL);
+        lv_pm_foreach_registered_page(theme_invoke_page,
+                                      (void *)(uintptr_t)g_theme_id);
+    }
+
+    lv_pm_theme_report_styles_now();
 }
 
 /**

@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 22 px
  * Bpp: 2
- * Opts: --size 22 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name helm_factory_22 -o /home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/fonts/helm_factory_22.c --font /home/jinsc/SDK/SGl/PingFangSC/PingFangSC-Semibold.ttf --autohint-strong -r 0x20-0x7E --symbols  !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~°±·×÷—…℃←↑→↓●✓、。一中亮仅件份传位停储光关分列删制加动化卡即厂压变号后听启器固地坏备复外存完定将工已序度开式强待总手据接搜播放数无星最未机板校检模止气汇池法测源点电白目磁秒等红绿老背蓝蜂螺行视设试输过运连通速道闭陀除静页验鸣黑！，：；？
+ * Opts: --size 22 --bpp 2 --format lvgl --no-compress --no-prefilter --no-kerning --lv-include lvgl/lvgl.h --lv-font-name helm_factory_22 -o /home/jinsc/SDK/vela/openvela/vendor/HelmOne/boards/sf32lb52/helmone/ui/bicycle/src/lvgl_page/fonts/helm_factory_22.c --font /home/jinsc/SDK/SGl/PingFangSC/PingFangSC-Semibold.ttf --autohint-strong -r 0x20-0x7E --symbols  !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~°±·×÷—…℃←↑→↓●✓、。一中亮仅件份传位停储光关分列删制加动化卡即厂压变号后听启器固地坏备复外存完定将工已序度开式强待总手据接搜播放数无星最未机板校检模止气汇池法测源点电白目磁秒等红绿老背蓝蜂螺行视设试输过运连通速道闭陀除静页验鸣黑！，：；？
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

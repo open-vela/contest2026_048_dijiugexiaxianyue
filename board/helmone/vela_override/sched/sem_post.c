@@ -121,21 +121,28 @@ int get_blocking(FAR sem_t *sem, bool mutex, bool *blocking)
 
           /* **顺手把已经写坏的 holder 修回来。**
            *
-           * 现场看到的值是 `NXSEM_NO_MHOLDER - 2`（0x7FFFFFFD）—— 也就是有人
-           * 对互斥量做了**计数语义的减法**。这种值不可能是"我们认错的持有者"，
-           * 而是字段真的坏了。
+           * 现场两类非法 holder（都不是合法 pid）：
+           *   1) `NXSEM_NO_MHOLDER - N`（≥ 0x7FFFFFFD）—— 对互斥量做了
+           *      **计数语义的减法**；
+           *   2) `holder < 0`，尤其是 **-3（-ESRCH）** ——
+           *      `nxmutex_wait` 快路径用 `_SCHED_GETTID()` 写入 holder，而
+           *      `nxsched_gettid()` 在 `task_state != RUNNING` 时返回 -ESRCH
+           *      （见 nuttx/include/nuttx/sched.h）。之后真正的 unlock
+           *      （tid=正 pid）对不上 → mutexbad → blocking 位残留。
            *
-           * 为什么必须修：下面那句 `if (!*blocking) atomic_set(NO_MHOLDER)` 只在
-           * **没有** blocking 位时才清；而现场 blocking 位是立着的 → 残留下来 →
-           * **之后任何等这把锁的线程会永久阻塞**（正是异常1 里 companion 卡在
-           * `nxmutex_wait` 的形态）。这是"埋着的雷"。
+           * 为什么必须修：下面那句 `if (!*blocking) atomic_set(NO_MHOLDER)`
+           * 只在**没有** blocking 位时才清；而现场 blocking 位是立着的 →
+           * 残留 → **之后任何等这把锁的线程会永久阻塞**（WDT 现场
+           * companion 卡在 `sf32lb_sd_bread`/`nxmutex_wait`）。
            *
-           * 判据故意收得很窄：只有 holder **大于任何合法 pid**（本系统 pid 上限
-           * 32767）才动手。这样绝不会误清一个真的被持有的锁 —— 而 `tid` 判据本身
-           * 可能不可靠（见上面注释），所以不能拿"判据成立"当清锁的理由。 */
-          if (holder > 32767)
+           * 判据故意收得很窄：非法编码才动手，绝不误清一个真持有者。 */
+          if (holder > 32767 || holder < 0)
             {
-              atomic_set(NXSEM_MHOLDER(sem), NXSEM_NO_MHOLDER);
+              /* 清掉坏掉的 holder。下面仍按"有人在等"走唤醒路径，
+               * 否则 blocking 位曾立过、等待者会永久卡在 nxmutex_wait。 */
+              atomic_set(NXSEM_MHOLDER(sem),
+                         NXSEM_NO_MHOLDER | NXSEM_MBLOCKING_BIT);
+              mholder = NXSEM_NO_MHOLDER | NXSEM_MBLOCKING_BIT;
             }
         }
 

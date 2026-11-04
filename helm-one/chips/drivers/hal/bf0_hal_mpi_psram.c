@@ -976,6 +976,13 @@ HAL_StatusTypeDef HAL_MPI_PSRAM_Init(FLASH_HandleTypeDef *handle, qspi_configure
             w_lat = 6;
         else if (sys_clk <= 200 * 1000000)
             w_lat = 7;
+        else
+            /* 兜底：原表到 200MHz(sys_clk) 就没了，更高只是**落空**——
+             * w_lat 停在初值、r_lat 跟着变 0，`HAL_MPI_MODIFY_RCMD_DELAY(r_lat-1)`
+             * 于是把 -1 写进 DCYC。取最保守那一档而不是让它掉出去。
+             * 当前时钟树够不到（DLL2 288 或 SYSCLK 240 ÷ 分频 ≤ 288 MHz 总线，
+             * sys_clk ≤144）⇒ 这一支是给以后提频留的。 */
+            w_lat = 7;
 
 
         if (fix_lat)
@@ -1018,6 +1025,9 @@ HAL_StatusTypeDef HAL_MPI_PSRAM_Init(FLASH_HandleTypeDef *handle, qspi_configure
         else if (sys_clk <= 166 * 1000000)
             w_lat = 6;
         else if (sys_clk <= 200 * 1000000)
+            w_lat = 7;
+        else
+            /* 同上：兜底到最保守那一档，别让 w_lat 停在初值。 */
             w_lat = 7;
 
         if (fix_lat)

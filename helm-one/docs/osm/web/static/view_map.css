@@ -1,0 +1,109 @@
+#region-list {
+  max-height: 280px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.6;
+}
+#region-list button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: #e2e8f0;
+  padding: 4px 6px;
+  border-radius: 6px;
+  margin: 0 0 2px;
+}
+#region-list button:hover,
+#region-list button.active {
+  background: #334155;
+}
+#sel-body { font-size: 12px; color: #cbd5e1; line-height: 1.7; }
+#sel-body code { color: #93c5fd; }
+.leaflet-container { background: #eae6de; }
+.vmap-grid-label {
+  background: transparent;
+  border: none;
+  color: #c2410c;
+  font-weight: 700;
+  font-size: 11px;
+  text-shadow: 0 0 3px #fff, 0 0 3px #fff;
+  box-shadow: none;
+}
+.vmap-grid-label::before { display: none; }
+.switch { margin: 8px 0; }
+#src-dir { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#goto-msg { margin-top: 6px; min-height: 1.2em; }
+.ele-bar {
+  height: 10px; border-radius: 4px;
+  background: linear-gradient(90deg, #2166ac, #67a9cf, #d1e5f0, #fddbc7, #ef8a62, #b2182b);
+}
+.ele-scale { display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; margin-top: 4px; }
+.vmap-elev-canvas,
+.vmap-graph-canvas,
+.vmap-vec-canvas {
+  pointer-events: none;
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+/* ── 样式切换 ── */
+.style-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin: 6px 0 10px;
+}
+.style-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 9px;
+  font-size: 12px;
+}
+.style-btn .swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 2px solid #000;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+  flex: 0 0 auto;
+}
+.style-btn.active {
+  outline: 2px solid #f5b95e;
+  outline-offset: 1px;
+  color: #fff;
+}
+
+/* ── 设备视图（240×400 实像素） ── */
+#device-view {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 700;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 12px;
+  padding: 8px 8px 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+#device-view[hidden] { display: none; }
+.dev-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 2px 6px;
+  color: #94a3b8;
+  font-size: 11px;
+}
+.dev-title { color: #e2e8f0; font-weight: 600; }
+#dev-canvas {
+  display: block;
+  width: 360px;
+  height: 600px;
+  image-rendering: pixelated;
+  border-radius: 6px;
+  background: #F5F3EC;
+}

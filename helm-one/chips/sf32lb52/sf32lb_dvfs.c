@@ -1,8 +1,10 @@
 /****************************************************************************
- * vendor/my_vendor/chips/sf32lb52/sf32lb_dvfs.c
+ * vendor/HelmOne/chips/sf32lb52/sf32lb_dvfs.c
  *
- * SF32LB52 HCPU gears: 72/96/144 (S0) and 240 (S1). DLL2 stays at 288 MHz
- * so PSRAM XIP and NAND keep running. Do not drop to D0/D1 (24/48 MHz).
+ * SF32LB52 HCPU gears: **144 (S0) and 240 (S1)** —— 72 与 96 已先后取消，
+ * 见 g_gears[] 上的注释。PSRAM/NAND 总线已钉回 DLL2 @144 MHz（官方设计，
+ * 见 sifli_allocateheap.c 的 NAND 分支）⇒ 降档不再连带降内存带宽。
+ * D0/D1（24/48 MHz）从来没有用过。
  *
  * SPDX-License-Identifier: Apache-2.0
  ****************************************************************************/
@@ -38,7 +40,9 @@
 #include "arm_internal.h"
 #include "bf0_hal.h"
 #include "drv_io.h"
+#include "myvendor_watchdog.h"
 #include "eta9184.h"
+#include "sf32lb_adc.h"
 
 #ifdef CONFIG_MTD
 #  include "sf32lb_sdio.h"
@@ -70,7 +74,7 @@ extern void sf32lb_lcd_reclock(void);
 #endif
 
 #ifndef CONFIG_MYVENDOR_DVFS_DOWN_HOLD_MS
-#  define CONFIG_MYVENDOR_DVFS_DOWN_HOLD_MS 2000
+#  define CONFIG_MYVENDOR_DVFS_DOWN_HOLD_MS 4000
 #endif
 
 #define DVFS_GOV_POLL_MS 250u
@@ -79,10 +83,19 @@ extern void sf32lb_lcd_reclock(void);
  * Private Data
  ****************************************************************************/
 
+/* **96 MHz 已取消**（用户 2026-09-26）：现场一次 WDT 饥饿复位（uptime 136.5 s）
+ * 之前 0.5 秒内连着换了三档 96 -> 144 -> 240，每次都跟着重配 SD 时钟
+ * （`SD: clk div 3->4->6->10`），紧接着 UI 线程被占住 11.17 秒（日志静默窗口与
+ * 心跳停摆等长）。96 相对 72 的收益有限，却正好插在"低档 <-> 高档"的过渡带上多出
+ * 一次换档+重配；去掉它把换档路径从三段变两段。 */
+/* **72 MHz 也已取消**（用户 2026-10-01）。同一轮改动把 PSRAM 总线钉回 DLL2、
+ * 固定在 144 MHz（官方设计，见 `sifli_allocateheap.c` 的 NAND 分支），于是
+ * HCLK 降档**不再**带来内存带宽的下降 —— 72 相对 144 只剩 CPU 一侧的省电，
+ * 而它是最低档、最容易撞上"低档 <-> 高档"大跨度换档的那一端。
+ * 只留 144（S0）与 240（S1）两档。（两者都在 S 模式 ⇒ DLL2 的 288 MHz
+ * 上限对它们全部满足，`hpsys_dll2_limit[S0]=[S1]=288 MHz`。） */
 static const uint32_t g_gears[] =
 {
-  SF32LB_DVFS_MHZ_72,
-  SF32LB_DVFS_MHZ_96,
   SF32LB_DVFS_MHZ_144,
   SF32LB_DVFS_MHZ_240,
 };
@@ -117,6 +130,22 @@ static uint32_t g_hop_period_ms = SF32LB_DVFS_HOP_DEFAULT_MS;
 static uint32_t g_hop_next_ticks;
 static uint16_t g_hop_n;
 static uint8_t g_hop_pos;  /* 当前档位下标 */
+
+/** @brief 充电时也按负载动态调频（`ctl dvfs charge on`）。**默认关**。
+ *
+ *  由来（2026-09-23 用户要求："debug 的时候插电也能像正常使用一样调频"）：
+ *  `SF32LB_DVFS_HOLD_FLOOR` 里含 `HOLD_CHARGE`，插上充电器就把 HCLK 钉在 240 MHz
+ *  —— 于是"插电调试"与"电池使用"跑的是**两种频率行为**，现场复现不了。
+ *  `ctl dvfs hop` 虽然插电也能跳频，但它走的是 **force 路径**（hold / governor /
+ *  交互下限**全部被绕过**），那是合成扫描，不是"像正常使用一样"。
+ *
+ *  本模式只做一件事：**把 CHARGE 位从 FLOOR 掩码里摘掉**，其余策略原样。
+ *  - CHARGE 位本身**照旧记录**（`holds=` 里仍能看到 `charge`），只是不再抬地板
+ *    ⇒ 既能复现电池行为，又不丢"正在充电"这个遥测事实；
+ *  - BOOT/MAP/OFFING 仍钉 240（那三个是"不能低"的场合，与调试复现无关）。
+ *
+ *  默认关：量产/日常插电时原来的高频策略不变。 */
+static bool g_charge_dyn;
 
 /****************************************************************************
  * Private Functions
@@ -388,6 +417,7 @@ static void gov_update_load_locked(uint8_t idle)
 static uint32_t target_mhz_locked(void)
 {
   uint32_t target;
+  uint32_t floor_mask;
 
   if (mhz_is_gear(g_force_mhz))
     {
@@ -396,7 +426,15 @@ static uint32_t target_mhz_locked(void)
 
   interactive_expire_locked();
 
-  if ((g_holds & SF32LB_DVFS_HOLD_FLOOR) != 0)
+  /* 充电动态调频模式：把 CHARGE 摘出地板掩码（见 g_charge_dyn 的说明）。
+   * CHARGE 位本身仍在 g_holds 里，`holds=` 那行照旧显示，只是不再抬地板。 */
+  floor_mask = SF32LB_DVFS_HOLD_FLOOR;
+  if (g_charge_dyn)
+    {
+      floor_mask &= ~SF32LB_DVFS_HOLD_CHARGE;
+    }
+
+  if ((g_holds & floor_mask) != 0)
     {
       return SF32LB_DVFS_MHZ_240;
     }
@@ -433,22 +471,35 @@ static void charge_hold_locked(void)
 }
 
 /**
- * @brief HCLK 切换后重配所有依赖 HCLK 的外设。
+ * @brief HCLK 切换后重配所有依赖 HCLK 的外设，改完**统一**报告结果。
  *
  * @details
- * 包括 SysTick LOAD（不重启 arch_timer）、SD、LCDC 和背光 PWM。
- * 背光已关闭时不会被重新打开。USART 波特率走 SystemFixClock，不在这里
- * HAL_UART_Init（会清 DMAR，GNSS 假死）。
+ * 包括 SysTick LOAD（不重启 arch_timer）、SD、LCDC、背光 PWM，以及 **ADC 的采样
+ * 时序**（GPADC 没有专属分频器，转换计数时钟就是 PCLK1 = HCLK>>PDIV1，采样宽度
+ * 按它算 —— 见 sf32lb_adc_reclock）。背光已关闭时不会被重新打开。USART 波特率走
+ * SystemFixClock，不在这里 HAL_UART_Init（会清 DMAR，GNSS 假死）。
+ *
+ * 频率是一次改的，**验收也一次**：全部改完之后由调用方报一条带 `reclock=` 的
+ * 结论行，而不是每个外设各报各的。
+ *
+ * @return 0 全部跟上新时钟；-EIO 有外设报告自己没跟上（目前只有 ADC 能自证）。
  */
-static void reclock_peripherals(void)
+static int reclock_peripherals(void)
 {
+  int rc;
+
   sifli_systick_reclock();
+  /* SysTick LOAD 变了 → tick 换算失真；先把 WDT 心跳钉到"现在"。 */
+  myvendor_watchdog_tick_reclock();
 #ifdef CONFIG_LCD_USING_NV3031A
   sf32lb_lcd_reclock();
 #endif
 #ifdef CONFIG_MTD
   sf32lb_sd_reclock();
 #endif
+  /* ADC 采样时序。漏了它 = 在错的时钟下做 SAR，读数系统性偏高
+   * （现场 4439 -> 4571 mV 跟着档位走）。 */
+  rc = sf32lb_adc_reclock();
 #ifdef CONFIG_LCD_USING_NV3031A
   {
     uint8_t pct = BSP_LCD_BL_GetPct();
@@ -460,6 +511,7 @@ static void reclock_peripherals(void)
       }
   }
 #endif
+  return rc;
 }
 
 /**
@@ -495,6 +547,12 @@ static int apply_locked(void)
    */
   sf32lb_sd_clk_hold();
 
+  /* ADC 同理：它的转换计数时钟就是 PCLK1，切频瞬间还在跑的转换结果不可信。
+   * 拿住驱动锁把在途转换排空（锁由 sf32lb_adc_reclock() 释放）。
+   * ⚠ 下面**两条出口都要经过 reclock_peripherals()** —— 它才会放锁；
+   *   切频失败那条也一样，否则 ADC 就永远锁死了。 */
+  (void)sf32lb_adc_clk_hold();
+
   flags = enter_critical_section();
   SCB_InvalidateICache();
   st = HAL_RCC_HCPU_ConfigHCLK(want);
@@ -503,29 +561,41 @@ static int apply_locked(void)
   if (st != HAL_OK)
     {
       /* 切频失败，但 SDCLK 已经被 clk_hold 停掉了，必须放回去，
-       * 否则卡就此没有时钟。 */
-      reclock_peripherals();
+       * 否则卡就此没有时钟。ADC 的锁同样在这里放掉。 */
+      int rrc = reclock_peripherals();
+
       syslog(LOG_ERR,
              "dvfs: ConfigHCLK(%u) st=%d holds=0x%x idle=%u gov=%u "
-             "boost=%u dll2=%lu\n",
+             "boost=%u dll2=%lu reclock=%s\n",
              (unsigned)want, (int)st, (unsigned)g_holds,
              (unsigned)g_idle_pct, (unsigned)g_gov_mhz,
              (unsigned)(g_interactive_active ? interactive_mhz() : 0),
-             (unsigned long)HAL_RCC_HCPU_GetDLL2Freq());
+             (unsigned long)HAL_RCC_HCPU_GetDLL2Freq(),
+             rrc == 0 ? "ok" : "FAIL");
       return -EIO;
     }
 
   g_applied_mhz = want;
-  reclock_peripherals();
-  dll2 = HAL_RCC_HCPU_GetDLL2Freq();
-  syslog(LOG_INFO,
-         "dvfs: HCLK=%u MHz holds=0x%x force=%u idle=%u gov=%u "
-         "boost=%u dll2=%lu\n",
-         (unsigned)g_applied_mhz, (unsigned)g_holds,
-         (unsigned)g_force_mhz, (unsigned)g_idle_pct,
-         (unsigned)g_gov_mhz,
-         (unsigned)(g_interactive_active ? interactive_mhz() : 0),
-         (unsigned long)dll2);
+  {
+    int rrc = reclock_peripherals();
+
+    dll2 = HAL_RCC_HCPU_GetDLL2Freq();
+    syslog(rrc == 0 ? LOG_INFO : LOG_ERR,
+           "dvfs: HCLK=%u MHz holds=0x%x force=%u idle=%u gov=%u "
+           "boost=%u dll2=%lu chgdyn=%u reclock=%s\n",
+           (unsigned)g_applied_mhz, (unsigned)g_holds,
+           (unsigned)g_force_mhz, (unsigned)g_idle_pct,
+           (unsigned)g_gov_mhz,
+           (unsigned)(g_interactive_active ? interactive_mhz() : 0),
+           (unsigned long)dll2,
+           /* 必须有这一栏：开了充电动态模式之后 `holds` 里**仍然**带 charge 位
+            * （那是遥测事实），而 HCLK 却可能落在低档 —— 两栏并列会自相矛盾，
+            * 光看日志没法判断是"策略如此"还是"hold 记账坏了"。 */
+           g_charge_dyn ? 1u : 0u,
+           /* 频率是一次改的，验收也一次：这一栏是**全部**依赖 HCLK 的外设改完
+            * 之后的统一结论（目前能自证的只有 ADC，见 sf32lb_adc_reclock）。 */
+           rrc == 0 ? "ok" : "FAIL");
+  }
   return 0;
 }
 
@@ -630,8 +700,8 @@ static uint8_t gear_step(uint8_t pos, uint32_t step)
  *   - 步长取 DVFS_NGEAR-1，与档位数恒互质 ⇒ 连续 DVFS_NGEAR 次跳变覆盖
  *     全部档位；纯随机可能很久碰不到某个档，覆盖不完整；
  *   - 步长非 0 ⇒ 每次跳变都真的换频，不会原地不动白跳一次；
- *   - 步长 N-1 让顺序是"跨大步"而不是单调爬升：4 档时依次是
- *     72→240→144→96，含 72↔240 这种最大跨度，正是要测的场景；
+ *   - 步长 N-1 让顺序是"跨大步"而不是单调爬升：两档时即 144↔240 交替，
+ *     正是最大跨度、要测的场景；
  *   - 起点在 hop_start 时轮换，所以每次自检的档位次序不同，看起来像乱跳。
  *
  * @param cur 当前 HCLK，单位 MHz，用于兜底保证目标不等于它。
@@ -900,9 +970,8 @@ void sf32lb_dvfs_interact(void)
     }
 
   /* The down hold starts again from the last input edge.  Once interaction
-   * stops, the governor therefore walks 144 -> 96 -> 72 instead of dropping
-   * straight back to 72 when the short floor expires.
-   */
+   * stops, the governor therefore steps down one gear at a time instead of
+   * dropping straight to the lowest when the short floor expires. */
 
   g_down_candidate_mhz = 0;
   (void)apply_locked();
@@ -941,6 +1010,56 @@ int sf32lb_dvfs_force(uint32_t mhz)
   return ret;
 }
 
+/**
+ * @brief 开关"充电时也按负载动态调频"（见 `g_charge_dyn` 的说明）。
+ *
+ * @return true = 模式已处在请求的状态（含"本来就是"的情况）。
+ * @note 与 `hop` 互不影响：hop 走 force 路径，本模式只改地板掩码。
+ */
+bool sf32lb_dvfs_charge_dyn_set(bool on)
+{
+  nxmutex_lock(&g_lock);
+
+  if (g_charge_dyn != on)
+    {
+      g_charge_dyn = on;
+      syslog(LOG_WARNING,
+             "dvfs: charge-dyn %s — 充电时 %s（%s）\n",
+             on ? "on" : "off",
+             on ? "按负载调频，不钉 240" : "恢复钉 240",
+             on ? "插电调试=电池行为" : "原策略");
+    }
+
+  /* 立刻生效：正在充电时开模式要**马上**从 240 落到 governor 档位，
+   * 关模式要马上回到 240；否则要等下一个 gov tick（最长 DVFS_GOV_POLL_MS）。
+   *
+   * 但 `sf32lb_dvfs_boot()` 之前（bringup 早段从 KV 恢复本模式时会走到这里）
+   * 只记标志、不切频：那时外设重配还没准备好，`g_applied_mhz` 仍是 0。
+   * boot 时那次 apply 会自然带上这个档位。 */
+  if (g_applied_mhz != 0)
+    {
+      (void)apply_locked();
+    }
+
+  nxmutex_unlock(&g_lock);
+
+  return true;
+}
+
+/**
+ * @brief 查询"充电时也按负载动态调频"模式当前是否开启。
+ */
+bool sf32lb_dvfs_charge_dyn(void)
+{
+  bool on;
+
+  nxmutex_lock(&g_lock);
+  on = g_charge_dyn;
+  nxmutex_unlock(&g_lock);
+
+  return on;
+}
+
 int sf32lb_dvfs_hop_start(uint32_t period_ms)
 {
   if (period_ms == 0u)
@@ -962,7 +1081,7 @@ int sf32lb_dvfs_hop_start(uint32_t period_ms)
   g_hop_pos = gear_step(0u, (uint32_t)clock_systime_ticks() / 7u);
   g_hop_active = true;
   syslog(LOG_WARNING,
-         "dvfs: hop start period=%u ms start=%u MHz gears=72/96/144/240 "
+         "dvfs: hop start period=%u ms start=%u MHz gears=144/240 "
          "(force path)\n",
          (unsigned)period_ms, (unsigned)gear_at(g_hop_pos));
   hop_tick_locked();
@@ -1095,8 +1214,12 @@ void sf32lb_dvfs_print(void)
   nxmutex_unlock(&g_lock);
 
   holds_put(names, sizeof(names), holds);
-  printf("  dvfs    HCLK %u MHz  %s  idle %u%%  gov %u  boost %u/%ums  "
-         "holds %s (0x%x)  dll2 %lu\n",
+
+  /* 格式串写成**单个字面量**（别拆成相邻两段）：本仓写入门禁会把拆开的格式串
+   * 当高危拦掉，合成一条也更难出错。末尾新增 charge-dyn 一栏（见 apply_locked
+   * 里那条 syslog 的同名说明：开了模式后 holds 仍含 charge 位，不并列显示会
+   * 让人误判 hold 记账坏了）。 */
+  printf("  dvfs    HCLK %u MHz  %s  idle %u%%  gov %u  boost %u/%ums  holds %s (0x%x)  dll2 %lu  charge-dyn %s\n",
          (unsigned)applied,
          force ? "force" : "auto",
          (unsigned)idle,
@@ -1105,5 +1228,6 @@ void sf32lb_dvfs_print(void)
          (unsigned)boost_ms,
          names,
          (unsigned)holds,
-         (unsigned long)dll2);
+         (unsigned long)dll2,
+         g_charge_dyn ? "on(charge->load-driven)" : "off");
 }

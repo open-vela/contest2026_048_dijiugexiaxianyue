@@ -1,6 +1,6 @@
 # GPX 组件设计思路
 
-**路径**：`vendor/my_vendor/boards/sf32lb52/my_vendor/domain/gpx/`  
+**路径**：`vendor/HelmOne/boards/sf32lb52/helmone/domain/gpx/`  
 **版本**：v0.1  
 **更新**：2026-06-16
 

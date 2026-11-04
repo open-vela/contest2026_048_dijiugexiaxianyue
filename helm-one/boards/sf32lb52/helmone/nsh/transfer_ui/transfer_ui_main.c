@@ -40,7 +40,7 @@ static bool wait_for_fbdev(const char *path, int timeout_ms)
       if (fd >= 0)
         {
           close(fd);
-          LV_LOG_USER("fbdev ready: %s (%d ms)", path, elapsed);
+          LV_LOG_INFO("fbdev ready: %s (%d ms)", path, elapsed);
           return true;
         }
 
@@ -132,7 +132,7 @@ int transfer_ui_main(int argc, char *argv[])
   myvendor_mtp_lfs_ui_register(getpid());
   transfer_ui_build(lv_screen_active());
 
-  LV_LOG_USER("transfer_ui running (pid=%ld)", (long)getpid());
+  LV_LOG_INFO("transfer_ui running (pid=%ld)", (long)getpid());
 
   while (myvendor_mtp_lfs_is_mtp())
     {
@@ -140,7 +140,7 @@ int transfer_ui_main(int argc, char *argv[])
       usleep(idle ? idle * 1000 : 5000);
     }
 
-  LV_LOG_USER("transfer_ui MTP ended, exit");
+  LV_LOG_INFO("transfer_ui MTP ended, exit");
   lv_nuttx_deinit(&result);
   lv_deinit();
   return 0;

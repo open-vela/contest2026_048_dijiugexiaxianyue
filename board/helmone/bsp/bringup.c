@@ -5,6 +5,10 @@
  * 开机顺序以 g_bringup[] 为准，改表即可，勿改 runner。每步为 int (*)(void)：
  * 0 成功，&lt;0 失败；abort_on_fail 为 true 时失败则中止后续步骤。
  *
+ * ★ 动手改任何一步之前先读 g_bringup[] 上面的 **@section bootreset**：
+ *   "2SFBL 用过的外设，App 侧必须先 `HAL_RCC_ResetModule()` 再配置" ——
+ *   它们的 Init 多是读-改-写，纠正不回 bootloader 留下的状态。
+ *
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -370,6 +374,9 @@ static uint32_t g_ble_companion_stuck_n;  /**< 连续"收不回来"的次数。
                                            *  skip_sync"那条判据反复重新触发，
                                            *  日志里的 attempt 编号也跟着归零。 */
 static bool g_ble_companion_reclaim_up;   /**< 回收任务已 spawn，别重复起。 */
+static pid_t g_ble_companion_lost_pid = (pid_t)-1; /**< 被判"永远不会再被调度"、
+                                           *  于是隔离掉的那具僵尸（只记账）。 */
+static uint32_t g_ble_companion_lost_n;   /**< 隔离过几具；日志/遥测用，正常应为 0。 */
 #ifdef CONFIG_SCHED_LPWORK
 static struct work_s g_ble_deferred_work;
 #endif
@@ -383,8 +390,28 @@ static struct work_s g_ble_deferred_work;
 /** @brief 连续这么多轮都收不回来，就撤回 skip_sync（见下面失败分支）。 */
 #define BLE_COMPANION_GIVEUP_SKIP_N  3u
 
-/** @brief 回收任务栈（循环重试期间常驻，退出后不再占 CPU）。 */
-#define BLE_COMPANION_RECLAIM_STACK  2048
+/** @brief 回收任务栈（循环重试期间常驻，退出后不再占 CPU）。
+ *
+ *  **2048 → 8192（2026-09-23，转储 n586 实测）**：原来那 2048 **真的用满了**。
+ *
+ *  n586（旧固件 `202609231708`，18:50）是 `kind=assert` + `arm_hardfault.c` +
+ *  `cfsr=0x00100000`（**UFSR.STKOF：硬件栈溢出**），任务名 `ble_reclaim`。
+ *  同一份转储里的栈水位是决定性判据：
+ *
+ *      snap pid=57 ble_reclaim pri=100 st=6 wd=1 stk=1944/1944     ← 1944/1944，满
+ *
+ *  机制不是"这段代码吃栈"（`-fstack-usage` 实测本函数只有 24 B、
+ *  `board_restart_ble_companion` 64 B），而是 **Cortex-M 的异常入栈压的是当前
+ *  SP**：线程态用 PSP ⇒ 中断帧压在**任务自己的栈**上。栈本来就贴着 PSPLIM 时，
+ *  一个定时器中断（GPT ISR 里还有 libgcc 的 64 位除法 `__aeabi_uldivmod`）
+ *  就能把 SP 顶破 LIM ⇒ STKOF ⇒ HardFault ⇒ panic ⇒ 重启。
+ *
+ *  ⚠ 是"**用满**"而不是"偶尔擦边"：1944 是全部可用字节。所以这不是偶发，
+ *  只是要等它跑到最深处、且那一刻正好来中断。
+ *
+ *  取值同 `ctl` 那次（4096→8192）的理由：PSRAM 有 4 MB，翻倍成本可忽略；
+ *  而这个任务只在一路重试期间常驻，退出就不再占 CPU。 */
+#define BLE_COMPANION_RECLAIM_STACK  8192
 
 static uint8_t g_ble_companion_reclaim_stack[BLE_COMPANION_RECLAIM_STACK]
     __attribute__((aligned(16)));
@@ -399,6 +426,67 @@ static bool ble_companion_pid_alive(pid_t pid)
     }
 
   return kill(pid, 0) == 0;
+}
+
+/* 判"这具僵尸**永远不会再被调度**"。
+ *
+ * 为什么需要单独判：上面的 `kill(pid, 0)` 对"活着但卡住"和"再也跑不起来"
+ * 是同一个答案（都为真），而这两种在恢复策略上完全不同 —— 前者要等它自己
+ * 退，后者等下去是白等。
+ *
+ * 现场依据（2026-09-23）：三连杀 + LCPU 复位连做 28 轮都没收回来，日志停在
+ * `stuck … BLE down until it exits (check sys hr, or power cycle)`，也就是
+ * **只能断电**；而那一次的 stall dump 里僵尸的栈只有一帧
+ * `#0 nxtask_activate`（`task_activate.c:106`，就在 `nxsched_add_readytorun`
+ * 那一段）⇒ 线程**建起来了但没被调度**，与 GNSS 读线程"被调度器丢掉"同一形状。
+ *
+ * 判据（与 myvendor_gnss.c 的 `gnss_reader_lost()` 同源，那次已实机验证）：
+ *   状态是 RUNNING/READY + **没有 waitobj / waitdog / lockcount** +
+ *   **不在 `this_task()` 起头的就绪链上** ⇒ 没有任何 waitlist 持有它，
+ *   没有任何事件能把它挂回就绪链 ⇒ 它永远不会再运行，也就永远不会再碰 HCI。
+ * 因此隔离它是安全的：TCB/栈留着（泄漏），但不会再与新 companion 抢控制器。
+ *
+ * 整段在 `sched_lock()` 里做：既拿到稳定的链快照，也保证"判完"到调用方
+ * 动手之间没人把它挂回去。 */
+static bool ble_companion_task_lost(pid_t pid)
+{
+  FAR struct tcb_s *tcb;
+  bool lost = false;
+
+  if (pid <= 0)
+    {
+      return false;
+    }
+
+  sched_lock();
+  tcb = nxsched_get_tcb(pid);   /* 必须与 put 成对 */
+  if (tcb != NULL && tcb->pid == pid &&
+      (tcb->task_state == TSTATE_TASK_RUNNING ||
+       tcb->task_state == TSTATE_TASK_READYTORUN) &&
+      tcb->waitobj == NULL && tcb->lockcount == 0 &&
+      !WDOG_ISACTIVE(&tcb->waitdog))
+    {
+      FAR struct tcb_s *t = this_task();
+      int hops;
+
+      lost = true;   /* 先假设丢了；在链上就翻案 */
+      for (hops = 0; t != NULL && hops < 64; hops++, t = t->flink)
+        {
+          if (t == tcb)
+            {
+              lost = false;
+              break;
+            }
+        }
+    }
+
+  if (tcb != NULL)
+    {
+      nxsched_put_tcb(tcb);
+    }
+
+  sched_unlock();
+  return lost;
 }
 
 bool board_ble_companion_pid_alive(void)
@@ -735,17 +823,52 @@ int board_restart_ble_companion(void)
             }
         }
 
-      if ((g_ble_companion_stuck_n % BLE_COMPANION_RETRY_LOG_N) == 0u)
-        {
-          syslog(LOG_ERR,
-                 "ble_companion: stuck pid=%d, %u attempts; BLE down until it "
-                 "exits (check `sys hr`, or power cycle)\n",
-                 (int)(g_ble_companion_pid > 0 ? g_ble_companion_pid : pid),
-                 (unsigned)g_ble_companion_stuck_n);
-        }
+      /* ⭐ 2026-09-23 加：僵尸若"**永远不会再被调度**"，就别再等它退出。
+       *
+       * 现场：三连杀 + LCPU 复位连做 28 轮都收不回来，日志停在
+       * `stuck … BLE down until it exits (check sys hr, or power cycle)`
+       * —— 也就是**只能断电**才能让蓝牙回来（用户观察到的就是这个）。
+       * 而那具僵尸的 stall dump 只有一帧 `#0 nxtask_activate`
+       * （`task_activate.c:106` 就在 `nxsched_add_readytorun` 那段）⇒
+       * 它是"建起来了但没被调度"，与 GNSS 读线程被调度器丢掉同一形状：
+       * 不在任何等待队列上，没有任何事件能把它挂回就绪链 ⇒ **它永远不会
+       * 再运行、也永远不会再碰 HCI**。
+       *
+       * 于是这里把它**隔离**（记下 pid、下一轮起不再杀它），落在下面那条
+       * "杀干净"的成功路径上照常 spawn 新的 companion —— 僵尸的 TCB/栈留着
+       * （泄漏，但不可达），换来的是**不需要断电**。
+       *
+       * ⚠ 自证伪条件（写死在这里，别忘）：这条判据的前提是"不在就绪链上"。
+       * 若日志里出现**两具 companion 交替说话**（HCI 行里两套 pid 交错，
+       * 或 `sys hr` 里同时看到两个 companion），说明那具"僵尸"其实还会被
+       * 调度 ⇒ **撤回本改动**。隔离次数见 `lost_n=`（正常应长期为 0）。 */
+      {
+        pid_t zp = (g_ble_companion_pid > 0) ? g_ble_companion_pid : pid;
 
-      g_ble_companion_restarting = false;
-      return -EBUSY;
+        if (g_ble_companion_stuck_n >= BLE_COMPANION_GIVEUP_SKIP_N &&
+            ble_companion_task_lost(zp))
+          {
+            g_ble_companion_lost_pid = zp;
+            g_ble_companion_lost_n++;
+            syslog(LOG_WARNING,
+                   "ble_companion: zombie pid=%d unreachable (not on any ready "
+                   "list) -> quarantine + respawn (lost_n=%u)\n",
+                   (int)zp, (unsigned)g_ble_companion_lost_n);
+          }
+        else
+          {
+            if ((g_ble_companion_stuck_n % BLE_COMPANION_RETRY_LOG_N) == 0u)
+              {
+                syslog(LOG_ERR,
+                       "ble_companion: stuck pid=%d, %u attempts; BLE down "
+                       "until it exits (check `sys hr`, or power cycle)\n",
+                       (int)zp, (unsigned)g_ble_companion_stuck_n);
+              }
+
+            g_ble_companion_restarting = false;
+            return -EBUSY;
+          }
+      }
     }
 
   g_ble_companion_pid = (pid_t)-1;
@@ -1382,6 +1505,12 @@ static int bringup_hclk240(void)
 #ifdef CONFIG_MTD
   sf32lb_sd_reclock();
 #endif
+  /* ADC 的采样宽度是按 PCLK1（= HCLK>>PDIV1）算的，抬完频必须重算一次，
+   * 否则 SAR 在错的时钟下被截断、电池读数系统性偏高。开了 DVFS 的那条路由
+   * sf32lb_dvfs_boot() → reclock_peripherals() 负责，这里补的是没开 DVFS
+   * （工厂固件）的那一半。
+   * 此刻还没人开 ADC（board_sensor 在第 21 步才起），所以不用先 clk_hold。 */
+  (void)sf32lb_adc_reclock();
 #endif
 #endif
 
@@ -1716,6 +1845,36 @@ static int bringup_bicycle(void)
  * watchdog 最先：注册 /dev/watchdog0 并 START（接管 2SFBL 留下的 IWDT）。
  * lcd 在 gpio/pwm 之后异步初始化；bicycle 等 storage+devctl。
  * GNSS / I2C 非首帧必需。BLE HCI 只注册设备；companion 等 UI 起来再 spawn。
+ *
+ * @section bootreset ★ 规则：**2SFBL 用过的外设，App 侧必须先复位再配置**
+ *
+ * 起因（2026-10-01）：电池读数在冷启动后恒定输出 4571 mV（= 12 位中点码），
+ * 查了一整轮才发现是 **GPADC 模块没被复位** —— 2SFBL 自己也用这颗 ADC 读
+ * VBATS（`boot_loader/project/butterflmicro/board/boot_hw.c` 的
+ * `boot_hw_bat_init/convert_raw`），而 `HAL_ADC_Init()` 只做**读-改-写**，
+ * 纠正不回它留下的模拟状态。判据是"**冷启动必坏 / `reboot` 热启动正常**"。
+ *
+ * **症状签名**（比"完全不能用"危险得多，别等它自己暴露）：
+ *   · 功能只在**一个方向上**错（例如读数恒定、贴在量程中点）；
+ *   · 寄存器 dump **逐字节全都对**，两条代码路径用同一组值却行为不同；
+ *   · **复位整个模块**就好，而逐位去改寄存器怎么都修不好。
+ *
+ * 2SFBL 会碰的外设（`boot_loader/project/butterflmicro/board/`）：
+ *   `boot_lcd` 的 LCDC、`boot_flash`/`sd_*` 的 SD/eMMC、`board_psram` 的 MPI、
+ *   `boot_hw` 的 GPADC + ETA9184 引脚 + IWDT、`efuse`、`boot_lfs` 的 flash。
+ *
+ * **多数外设不用我们操心**：SiFli HAL 的 Init 会**无条件复位自己的模块** ——
+ * `HAL_I2C_Init`（`bf0_hal_i2c.c:208`）、`LCDC_HW_Init`（`bf0_hal_lcdc.c:2273`）
+ * 等等，而且都是 `HAL_RCC_EnableModule()` + `HAL_RCC_ResetModule()` 成对出现。
+ * **`HAL_ADC_Init()` 是例外**：既不复位也不 Enable（要驱动自己 `HAL_RCC_EnableModule`）。
+ *
+ * 已按此规则处理的先例：
+ *   · GPADC → `HAL_RCC_ResetModule(RCC_MOD_GPADC)`（`sf32lb_adc.c` 的 `sf32lb_adc_init`，
+ *             复位后 `HAL_Delay_us(1000)` 留模拟上电时间）；
+ *   · SD1   → `HAL_RCC_ResetModule(RCC_MOD_SDMMC1)`（`sf32lb_sdio.c` 的 `sd1_init`）；
+ *   · EPIC/EZIP/LCDC1 → `lv_sifli_epic_cfg.c`、`myvendor_coredump.c` 已有复位。
+ *
+ * **改动/新增步骤时先问一句"2SFBL 碰过这个外设吗"**；碰过就先复位。
  */
 static const struct bringup_step_s g_bringup[] =
 {

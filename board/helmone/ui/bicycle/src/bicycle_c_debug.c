@@ -126,7 +126,7 @@ static void debug_emit(const struct timespec * now)
 #endif
         , (unsigned)s_map_rev, (unsigned)s_render_rev);
 
-    LV_LOG_USER(
+    LV_LOG_INFO(
         "[bicycle] loop=%uHz idle_min=%ums gpx=%u push=%u draw=%u skip=%u "
         "map_pan=%u render=%u pts=%u lap=%u"
 #if VMAP_TRACK_ENABLE

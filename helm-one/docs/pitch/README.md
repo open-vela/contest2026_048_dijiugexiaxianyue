@@ -1,9 +1,6 @@
 # 上游必改件（pitch）
 
-> **路径对照**：本目录写于开发树，文中的 `vendor/my_vendor/...` 在发布树里就是
-> **`vendor/HelmOne/...`**（参赛仓里的 `helm-one/`，由清单 linkfile 挂载）。其余内容逐字适用。
-
-`vendor/my_vendor` 跟 `repo sync` 走。`nuttx` / `apps` / `zblue` 每次整树同步都会回到上游干净树。
+`vendor/HelmOne` 跟 `repo sync` 走。`nuttx` / `apps` / `zblue` 每次整树同步都会回到上游干净树。
 
 本目录只收 **不能还原、也不在 vendor 编译单元里的功能性改动**。漏掉它们时 NSH 往往仍能起来，但：
 
@@ -51,7 +48,7 @@ strings -a cmake_out/<cfg>/nuttx.bin | grep -c '^vela_override/'      # 期望 =
 现在的做法（已生效）：
 
 - 标记常量放进独立段 **`.myvendor_marker`**（不是 `.rodata`）；
-- 板级链接脚本 `boards/sf32lb52/my_vendor/scripts/ld.script` 里 `KEEP(*(.myvendor_marker))`，
+- 板级链接脚本 `boards/sf32lb52/helmone/scripts/ld.script` 里 `KEEP(*(.myvendor_marker))`，
   `KEEP` 是 GC 根，段就不会被丢；段在 `.text` 里 → 落在 **flash**，**不占 SRAM**；
 - 于是裸 `nuttx.bin`、strip 过的镜像里都有：`strings -a <bin> | grep '^vela_override/'`（现 19 条，
   约 2.7 KB flash）；`strings -a -e S` 还能看整行（含上游 blob 与原因）；
@@ -84,12 +81,12 @@ HEAD 表为准。
 
 ```bash
 # A. 与上表 HEAD 一致时（最省事）
-cp vendor/my_vendor/docs/pitch/replace/frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c \
+cp vendor/HelmOne/docs/pitch/replace/frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c \
    frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c
 
 # B. 上游同一处有漂移时（注意仓库根是 frameworks/connectivity/bluetooth）
 git -C frameworks/connectivity/bluetooth apply \
-  ../../vendor/my_vendor/docs/pitch/patches/vela-hci-h4-rx-reopen.patch
+  ../../vendor/HelmOne/docs/pitch/patches/vela-hci-h4-rx-reopen.patch
 
 # 打完确认：应能看到 h4_rx_reopen 与 syslog(LOG_WARNING, "H4: rx reopen
 git -C frameworks/connectivity/bluetooth diff -- service/stacks/zephyr/hci_h4.c
@@ -133,6 +130,7 @@ docs/pitch/
 | BLE H4 | `frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c`（**独立仓库 `frameworks_bluetooth`**；`apps/frameworks` 是指向 `../frameworks/` 的符号链接） | [replace/.../hci_h4.c](replace/frameworks/connectivity/bluetooth/service/stacks/zephyr/hci_h4.c) | [vela-hci-h4-rx-reopen.patch](patches/vela-hci-h4-rx-reopen.patch) | [ble-hci-h4-rx-reopen.md](ble-hci-h4-rx-reopen.md) |
 | BLE scan | `external/zblue/zblue/subsys/bluetooth/host/scan.c` | 只留补丁（文件 2000+ 行，整文件覆盖不划算） | [zblue-scan-stop-null-ctx.patch](patches/zblue-scan-stop-null-ctx.patch) | [zblue-scan-stop-null-ctx.md](zblue-scan-stop-null-ctx.md) |
 | LVGL config | `apps/graphics/lvgl/lvgl/Kconfig`（**嵌套 project `apps_graphics_lvgl`，不是 `apps`**） | 只留补丁（46 KB，整文件覆盖不划算） | [apps-lvgl-kconfig.patch](patches/apps-lvgl-kconfig.patch) | [lvgl.md](lvgl.md) |
+| NuttX cmake | `nuttx/cmake/nuttx_kconfig.cmake`（**`nuttx` 仓库**，构建脚本，抽换层够不着） | 只留补丁 | [nuttx-kconfig-quote-blank.patch](patches/nuttx-kconfig-quote-blank.patch) | [nuttx-kconfig-quote-blank.md](nuttx-kconfig-quote-blank.md) |
 
 对照本工作区当时的上游 HEAD：
 
@@ -149,12 +147,12 @@ docs/pitch/
 
 ## 一键打上全部补丁（在 OpenVela 根目录执行）
 
-**五份补丁 = 上游的全部改动**（逐份说明、id 表、`--check` 命令见 [patches/README.md](patches/README.md)）。
+**八份补丁 = 上游的全部改动**（逐份说明、id 表、`--check` 命令见 [patches/README.md](patches/README.md)）。
 下面这段整段复制到 shell 里跑即可，**幂等**：已打过的会显示"已打过，跳过"，打不上的会指路。
 
 ```bash
 cd <OpenVela 根目录>
-P=vendor/my_vendor/docs/pitch/patches
+P=vendor/HelmOne/docs/pitch/patches
 apply() {   # $1=仓库（相对根目录） $2=补丁文件名
   repo=$1 patch=$2
   if git -C "$repo" apply --check -R "$PWD/$P/$patch" 2>/dev/null; then
@@ -170,6 +168,9 @@ apply external/zblue/zblue              zblue-scan-stop-null-ctx.patch        # 
 apply frameworks/connectivity/bluetooth vela-hci-h4-rx-reopen.patch
 apply apps                              apps-lvgl-myvendor-stack.patch
 apply apps/graphics/lvgl/lvgl           apps-lvgl-kconfig.patch               # ← 嵌套仓库
+apply nuttx                             nuttx-kconfig-quote-blank.patch       # ← 构建脚本（空行不再当参数）
+apply nuttx                             nuttx-psram-cache-wb.patch            # ← PSRAM 写回缓存全局宏
+apply nuttx                             nuttx-lfs-prog-error.patch            # ← LittleFS 写失败返回 -EIO，不再断言
 
 # 复用已有的构建目录时，让 config 重新推导一次（全新机器不用管）
 for c in cmake_out/*/.config; do
@@ -194,19 +195,22 @@ done
 ## 打完怎么确认
 
 ```bash
-# ① 全树只应剩这 5 个文件被改（外加 nist-sts 那种重叠检出的噪音）
+# ① 全树只应是这 8 份补丁覆盖的文件被改（外加 nist-sts 那种重叠检出的噪音）
 repo status -j16 | grep -v '\.mimosa' | grep -B1 '^ [-mad]' | grep '^project'
-# ② 五份补丁反向 dry-run 全过（= 补丁与本机现状逐字相符）
-P=vendor/my_vendor/docs/pitch/patches
+# ② 八份补丁反向 dry-run 全过（= 补丁与本机现状逐字相符）
+P=vendor/HelmOne/docs/pitch/patches
 for x in "external/zblue/zblue:zblue-id-scan-eacces.patch" \
          "external/zblue/zblue:zblue-scan-stop-null-ctx.patch" \
          "frameworks/connectivity/bluetooth:vela-hci-h4-rx-reopen.patch" \
          "apps:apps-lvgl-myvendor-stack.patch" \
-         "apps/graphics/lvgl/lvgl:apps-lvgl-kconfig.patch"; do
+         "apps/graphics/lvgl/lvgl:apps-lvgl-kconfig.patch" \
+         "nuttx:nuttx-kconfig-quote-blank.patch" \
+         "nuttx:nuttx-psram-cache-wb.patch" \
+         "nuttx:nuttx-lfs-prog-error.patch"; do
   git -C "${x%%:*}" apply --check -R "$PWD/$P/${x##*:}" && echo "  ok ${x##*:}"
 done
 # ③ 编完之后：镜像里应能数到抽换件标记（数量 = vela_override 里的 .c + patch_*.py）
-strings -a cmake_out/my_vendor_nsh/nuttx.bin | grep -c '^vela_override/'
+strings -a cmake_out/helmone_nsh/nuttx.bin | grep -c '^vela_override/'
 ```
 
 开机：`ble_companion: advertising started`；手机已连接时 `test sensor scan` 能出表。
@@ -287,7 +291,7 @@ strings -a cmake_out/my_vendor_nsh/nuttx.bin | grep -c '^vela_override/'
 | `vela_override/zblue/init.c` | `z_sys_init` 做成幂等（重复调用直接返回） | z_sys_init 幂等（SAL BREDR+LE 都可能调用） | `external/zblue/zblue` @ `6f79fb2a0`<br>`port/kernel/init.c`<br>blob `f17a4edb88fa` |
 | `vela_override/zblue/system_work_q.c` | 第二条 sysworkq 不再复用同一块 BSS 栈 | 禁止第二条 sysworkq 共用 BSS 栈 | `external/zblue/zblue` @ `6f79fb2a0`<br>`kernel/system_work_q.c`<br>blob `5cc26fd82e14` |
 | `vela_override/zblue/long_wq.c` | 第二条 BT LW WQ 不再复用同一块 BSS 栈 | 禁止第二条 BT LW WQ 共用 BSS 栈 | `external/zblue/zblue` @ `6f79fb2a0`<br>`subsys/bluetooth/host/long_wq.c`<br>blob `b7b6e3dc03b1` |
-| `vela_override/zblue/patch_hci_core.py` | 命令超时返回 `-ETIMEDOUT`（不改断言）；`skip_sync` 的轮询退出不再走不可中断等待 | 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待 | `external/zblue/zblue` @ `6f79fb2a0`<br>`subsys/bluetooth/host/hci_core.c`<br>blob `ab23d63b2da4` |
+| `vela_override/zblue/patch_hci_core.py` | 命令超时返回 `-ETIMEDOUT`（不改断言）；`skip_sync` 的轮询退出不再走不可中断等待；peripheral pending conn 先按原始 RPA 查、再回退身份地址 | 超时返回 -ETIMEDOUT；skip_sync 轮询退出不可中断等待；定向连接不被 `0x16 No pending conn` 丢弃 | `external/zblue/zblue` @ `6f79fb2a0`<br>`subsys/bluetooth/host/hci_core.c`<br>blob `ab23d63b2da4` |
 | `vela_override/zblue/patch_gatt_ccc_pool.py` | 断开时释放 CCC 槽、池满时回收已断开的 peer；CCC 池加金丝雀 + 30 s 校验 | 断开释放 CCC 槽 + 池满时回收已断开的 peer；CCC 池金丝雀 + 30 s 校验 | `external/zblue/zblue` @ `6f79fb2a0`<br>`subsys/bluetooth/host/gatt.c`<br>blob `8e31d1cfa353` |
 | `vela_override/zblue/patch_net_buf_timeout.py` | `net_buf` 的 `K_FOREVER` 申请改成有上限的轮询（拿不到就丢包继续） | 缓冲区 K_FOREVER 改成有上限的轮询（否则卡死不可杀） | `external/zblue/zblue` @ `6f79fb2a0`<br>`subsys/bluetooth/host/buf.c`<br>blob `b7ed19303be2`<br>`external/zblue/zblue` @ `6f79fb2a0`<br>`subsys/bluetooth/host/hci_core.c`<br>blob `ab23d63b2da4` |
 
@@ -295,5 +299,36 @@ strings -a cmake_out/my_vendor_nsh/nuttx.bin | grep -c '^vela_override/'
 
 | 东西 | 做了什么 | 为什么 | 上游（仓库 @ HEAD / 路径 / blob） |
 |---|---|---|---|
-| 官方 `apps/graphics/lvgl/lvgl/` 整树（9.1→9.5） | 用工作区里的 `vendor/my_vendor/apps/graphics/lvgl/` 顶替，官方树不动 | 整树版本替换不是功能补丁；且 `CONFIG_MYVENDOR_LVGL_STACK` 会与官方 `lvgl` target 撞车（见 [lvgl.md](lvgl.md)） | `apps` @ `017abdbef`<br>`graphics/lvgl/lvgl/`（子树）<br>tree `` |
+| 官方 `apps/graphics/lvgl/lvgl/` 整树（9.1→9.5） | 用工作区里的 `vendor/HelmOne/apps/graphics/lvgl/` 顶替，官方树不动 | 整树版本替换不是功能补丁；且 `CONFIG_MYVENDOR_LVGL_STACK` 会与官方 `lvgl` target 撞车（见 [lvgl.md](lvgl.md)） | `apps` @ `017abdbef`<br>`graphics/lvgl/lvgl/`（子树）<br>tree `` |
 | nist-sts 未跟踪文件 | 不处理 | 与本板无关，不进镜像 | 与本板无对应上游，无需 id |
+
+## 补丁落地目录（2026-11-04 复核，逐条 `git apply --check --reverse` 通过）
+
+`repo sync` / 整树同步后按此表把 `patches/*.patch` 打回去；**应用目录**一栏是该仓库里
+`git apply` 的工作目录（补丁里的路径相对它）。
+
+| 补丁 | 应用目录 | 作用 | 覆盖的改动 |
+|---|---|---|---|
+| `apps-lvgl-kconfig.patch` | `apps/graphics/lvgl` | LVGL v9.5 的 Kconfig 标头（子模块根，需在 lvgl 目录内打） | `Kconfig` |
+| `apps-lvgl-myvendor-stack.patch` | `apps` | `CONFIG_MYVENDOR_LVGL_STACK` 时让位（避免与官方 `lvgl` target 撞车）+ EPIC 头文件/宏 | `graphics/lvgl/{CMakeLists.txt,Makefile}` |
+| `nuttx-kconfig-quote-blank.patch` | `nuttx` | CMake 3.23+ 下 `.config` 空行导致的参数展开报错 | `cmake/nuttx_kconfig.cmake` |
+| `nuttx-psram-cache-wb.patch` | `nuttx` | `CONFIG_MYVENDOR_PSRAM_CACHE_WB` → `PSRAM_CACHE_WB` 编译宏（MPU 与 DMA 口径一致） | `CMakeLists.txt` |
+| `nuttx-lfs-prog-error.patch` | `nuttx` | littlefs `pcache->block` 断言改返回 `LFS_ERR_IO`（SD 判死时 program 失败会把 diag 线程打死） | `fs/littlefs/CMakeLists.txt` + 新增 `fs/littlefs/lfs_prog_error.patch` |
+| `vela-hci-h4-rx-reopen.patch` | `apps/frameworks/connectivity/bluetooth` | HCI H4 读侧超时/卡住重开 | `service/stacks/zephyr/hci_h4.c` |
+| `zblue-id-scan-eacces.patch` | `apps/external/zblue` | 扫描期 id.c 的 EACCES 处理 | `subsys/bluetooth/host/id.c` |
+| `zblue-scan-stop-null-ctx.patch` | `apps/external/zblue` | scan stop 空 ctx 防护 | `subsys/bluetooth/host/scan.c` |
+
+复核命令（当前树已全部应用，所以用 `--reverse` 应该成功）：
+
+```sh
+cd openvela
+(cd nuttx && for p in ../vendor/HelmOne/docs/pitch/patches/nuttx-*.patch; do git apply --check --reverse "$p"; done)
+(cd apps  && git apply --check --reverse ../vendor/HelmOne/docs/pitch/patches/apps-lvgl-myvendor-stack.patch)
+(cd apps/graphics/lvgl && git apply --check --reverse ../../../../vendor/HelmOne/docs/pitch/patches/apps-lvgl-kconfig.patch)
+(cd apps/frameworks/connectivity/bluetooth && git apply --check --reverse ../../../../vendor/HelmOne/docs/pitch/patches/vela-hci-h4-rx-reopen.patch)
+(cd apps/external/zblue && for p in ../../../../../vendor/HelmOne/docs/pitch/patches/zblue-*.patch; do git apply --check --reverse "$p"; done)
+```
+
+`nuttx/fs/littlefs/littlefs/lfs.c` 本身不进补丁：`littlefs/` 被 `.gitignore` 且每次构建从
+GitHub 拉 v2.4.0，所以改动做成 `lfs_prog_error.patch` 交给 `PATCH_COMMAND` 打（本补丁已包含
+该文件与 `CMakeLists.txt` 的挂钩）。

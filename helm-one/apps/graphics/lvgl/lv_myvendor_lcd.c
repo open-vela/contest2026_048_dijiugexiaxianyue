@@ -1,10 +1,14 @@
 /**
  * @file lv_myvendor_lcd.c
  *
- * LVGL display port: two SRAM strip draw buffers (A/B), flush_cb passes the
- * active SRAM pointer to the ui_flush worker for kernel DMA (no PSRAM copy).
+ * LVGL display port: two SRAM strip draw buffers (A/B), flush_cb hands the
+ * active SRAM pointer directly to the LCDC/QSPI engine (no PSRAM copy, no
+ * intermediate thread).
  *
- * UI thread submits and waits; ui_flush transfers the previous strip.
+ * flush_cb starts the DMA and returns; the LCDC EOF interrupt calls
+ * lv_display_flush_ready() through myvendor_lcd_disp's done callback.  While
+ * the hardware shifts out strip A the UI renders strip B, so the pipeline
+ * keeps the A/B overlap of the old worker design without the worker.
  */
 
 #include "lv_myvendor_lcd.h"
@@ -21,6 +25,7 @@
 #endif
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <syslog.h>
 
@@ -49,7 +54,16 @@ typedef struct
   void         *sram_px1;
   void         *sram_px2;
   uint32_t      sram_bytes;
+  struct lcddev_area_align_s area_align;
 } lv_myvendor_lcd_dsc_t;
+
+/* Benchmark-only: skip the real LCDC DMA entirely (pure render timing). */
+static bool s_skip_flush;
+
+void lv_myvendor_lcd_set_skip_flush(bool skip)
+{
+  s_skip_flush = skip;
+}
 
 static void flush_cb(lv_display_t * disp, const lv_area_t * area,
                      uint8_t * color_p);
@@ -58,6 +72,7 @@ static void flush_done_cb(void * user_data);
 static void flush_refr_cb(void * user_data);
 static void flush_unblock_cb(void * user_data);
 static void display_release_cb(lv_event_t * e);
+static void rounder_cb(lv_event_t * e);
 
 lv_display_t * lv_myvendor_lcd_create(const char * lcd_path)
 {
@@ -124,6 +139,17 @@ lv_display_t * lv_myvendor_lcd_create(const char * lcd_path)
 
   dsc->sram_px1 = g_lcd_sram_buf_a;
   dsc->sram_px2 = g_lcd_sram_buf_b;
+  dsc->area_align = info.area_align;
+
+  if ((uintptr_t)dsc->sram_px1 % info.area_align.buf_align != 0 ||
+      (uintptr_t)dsc->sram_px2 % info.area_align.buf_align != 0)
+    {
+      syslog(LOG_ERR, "lv_myvendor_lcd: SRAM buffer alignment unsupported");
+      lv_free(dsc);
+      lv_display_delete(disp);
+      myvendor_lcd_disp_deinit();
+      return NULL;
+    }
 
   if (lv_draw_buf_init(&dsc->draw1, info.hor_res, info.strip_rows,
           LV_COLOR_FORMAT_RGB565, stride, dsc->sram_px1,
@@ -146,21 +172,46 @@ lv_display_t * lv_myvendor_lcd_create(const char * lcd_path)
   lv_display_set_render_mode(disp, LV_DISPLAY_RENDER_MODE_PARTIAL);
   lv_display_set_flush_cb(disp, flush_cb);
   lv_display_set_flush_wait_cb(disp, flush_wait_cb);
+  lv_display_add_event_cb(disp, rounder_cb, LV_EVENT_INVALIDATE_AREA, dsc);
   lv_display_add_event_cb(disp, display_release_cb, LV_EVENT_DELETE, disp);
 
   myvendor_lcd_disp_register_done_cb(flush_done_cb, disp);
   myvendor_lcd_disp_register_recover_cbs(flush_refr_cb, flush_unblock_cb, disp);
 
   syslog(LOG_INFO,
-         "lv_myvendor_lcd: %ux%u strip=%u SRAM A/B ~%u KiB x2 ui_flush DMA epic=%d",
+         "lv_myvendor_lcd: %ux%u strip=%u SRAM A/B ~%u KiB x2 "
+         "IRQ-driven LCDC DMA epic=%d",
          info.hor_res, info.ver_res, info.strip_rows,
          (unsigned)(dsc->sram_bytes / 1024u),
          (int)LV_USE_SIFLI_EPIC);
-  LV_LOG_USER("lv_myvendor_lcd %ux%u strip=%u SRAM direct epic=%d",
+  LV_LOG_INFO("lv_myvendor_lcd %ux%u strip=%u SRAM direct epic=%d",
               info.hor_res, info.ver_res, info.strip_rows,
               (int)LV_USE_SIFLI_EPIC);
 
   return disp;
+}
+
+/* Match the LCD driver's contract, as lv_nuttx_lcd does. Expand damage
+ * before LVGL renders it: changing only the flush coordinates would send
+ * pixels that are absent from the packed strip. This event also lets LVGL
+ * round strip heights down to fit the SRAM buffer when splitting damage.
+ */
+static void rounder_cb(lv_event_t * e)
+{
+  lv_myvendor_lcd_dsc_t * dsc = lv_event_get_user_data(e);
+  lv_area_t * area = lv_event_get_param(e);
+  const struct lcddev_area_align_s * a = &dsc->area_align;
+  int32_t w;
+  int32_t h;
+
+  area->x1 -= area->x1 % a->col_start_align;
+  area->y1 -= area->y1 % a->row_start_align;
+  w = area->x2 - area->x1 + 1;
+  h = area->y2 - area->y1 + 1;
+  area->x2 = area->x1 +
+             (w + a->width_align - 1) / a->width_align * a->width_align - 1;
+  area->y2 = area->y1 +
+             (h + a->height_align - 1) / a->height_align * a->height_align - 1;
 }
 
 static void flush_done_cb(void * user_data)
@@ -199,16 +250,30 @@ static void flush_unblock_cb(void * user_data)
   lv_display_flush_ready(disp);
 }
 
-/** Wait until ui_flush finishes the submitted strip (other buffer can draw). */
+/** Wait for the previous strip's LCDC DMA (other buffer can be rendered). */
 static void flush_wait_cb(lv_display_t * disp)
 {
   uint32_t waited_ms = 0;
+  bool timeout;
+
+  if (s_skip_flush)
+    {
+      return; /* no DMA is in flight: never wait */
+    }
 
   (void)disp;
-  myvendor_lcd_disp_wait_idle(0, &waited_ms);
+  timeout = !myvendor_lcd_disp_wait_idle(MYVENDOR_LCD_DISP_WAIT_MS,
+                                         &waited_ms);
   /* Recover may finish while we block — flush_ready only (no invalidate here). */
   myvendor_lcd_disp_poll_recover_unblock();
-  myvendor_lcd_disp_stats_note_wait(waited_ms, false, false);
+  myvendor_lcd_disp_stats_note_wait(waited_ms, timeout, false);
+
+  if (timeout)
+    {
+      /* No worker to restart: release LVGL so the UI keeps running; the
+       * service records the timeout and the panel needs a real reset. */
+      lv_display_flush_ready(disp);
+    }
 }
 
 static void flush_cb(lv_display_t * disp, const lv_area_t * area,
@@ -218,6 +283,12 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area,
   lv_draw_buf_t * draw_buf;
   uint32_t stride;
   int ret;
+
+  if (s_skip_flush)
+    {
+      lv_display_flush_ready(disp); /* no push: mark the strip done at once */
+      return;
+    }
 
 #if LV_USE_SIFLI_EPIC
   if(lv_epic_is_initialized()) {
@@ -279,7 +350,7 @@ static void display_release_cb(lv_event_t * e)
       lv_display_set_driver_data(disp, NULL);
     }
 
-  LV_LOG_USER("lv_myvendor_lcd released");
+  LV_LOG_INFO("lv_myvendor_lcd released");
 }
 
 #endif /* LV_USE_MYVENDOR_LCD_DISP */

@@ -52,6 +52,13 @@ void myvendor_watchdog_ui_beat(void);
 void myvendor_watchdog_work_beat(void);
 
 /**
+ * @brief SysTick/HCLK 换档后同步 idle/work/ui 心跳时间戳，避免年龄算炸。
+ *
+ * DVFS `sifli_systick_reclock()` 之后必须调用；见 n580 误复位。
+ */
+void myvendor_watchdog_tick_reclock(void);
+
+/**
  * @brief 长加载让出 CPU：每满 1s usleep 10ms。不打 UI/work 心跳。
  */
 void myvendor_watchdog_busy_pump(void);
@@ -102,6 +109,10 @@ static inline void myvendor_watchdog_ui_beat(void)
 }
 
 static inline void myvendor_watchdog_work_beat(void)
+{
+}
+
+static inline void myvendor_watchdog_tick_reclock(void)
 {
 }
 

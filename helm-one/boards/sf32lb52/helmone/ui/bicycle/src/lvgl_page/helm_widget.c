@@ -5,6 +5,7 @@
 
 #include "helm_widget.h"
 
+#include "helm_anim.h"
 #include "helm_font.h"
 #include "helm_palette.h"
 #include "lvgl/src/core/lv_obj_private.h"
@@ -24,12 +25,79 @@
 #define HELM_STAGGER_GAP 40
 #define HELM_STAGGER_MAX 6
 #define HELM_MSW_TAG     ((void *)(uintptr_t)0x48535731u)
+/** @brief 旋钮上一次落位的状态（记在旋钮 user_data 上，开关本身仍用 HELM_MSW_TAG）。 */
+#define HELM_MSW_ON_TAG  ((void *)(uintptr_t)0x48535732u)
+#define HELM_MSW_OFF_TAG ((void *)(uintptr_t)0x48535733u)
+#define HELM_MSW_SLIDE_MS 120
+/** @brief 两端旋钮中心的横向差（on 右 / off 左）。34 宽开关左右各 1 px 边框 +
+ *         旋钮 12 px、两端各留 2 px ⇒ (34-2) - 12 - 4 = 16。 */
+#define HELM_MSW_TRAVEL  16
+/** @brief 次级文字标记（副标题/右值）：选中或深底时要翻成浅色，得先能认出它。 */
+#define HELM_MLAB_TAG    ((void *)(uintptr_t)0x48534C31u)
 #define HELM_MSW_W       34
 #define HELM_MSW_H       18
 #define HELM_MCUR_TAG    ((void *)(uintptr_t)0x484D4331u)
 #define HELM_CUR_MS      16
 #define HELM_CUR_SPEED   4
 #define HELM_CUR_SQUEEZE 8
+
+/**
+ * @brief 图标按"域"取色：导航橙 / 连接青 / 数据·系统棕 / 危险红。
+ * @details 原来一律 INK（黑），所有行的图标长得一样、扫读时没有区分度；
+ *          用户 2026-09-26 定的现代化方案里这一条是"按域给色"。
+ *          颜色只落在**形状**（图标）上，文字仍是墨色/次级灰，符合用色规则。
+ */
+static uint32_t helm_ico_tone(helm_ico_id_t ico)
+{
+    switch (ico) {
+    case HELM_ICO_POWER:
+    case HELM_ICO_XMARK:
+        return HELM_COLOR_HR;
+    case HELM_ICO_NAV:
+    case HELM_ICO_PIN:
+    case HELM_ICO_FLAG:
+    case HELM_ICO_SKIP:
+    case HELM_ICO_GO:
+        return HELM_COLOR_NAV;
+    case HELM_ICO_BLE:
+    case HELM_ICO_USB:
+    case HELM_ICO_BELL:
+    case HELM_ICO_SOUND:
+    case HELM_ICO_CALL:
+    case HELM_ICO_INBOX:
+        return HELM_COLOR_CLIMB;
+    default:
+        return HELM_COLOR_PWR;
+    }
+}
+
+/** @brief 选中/深底上的行图标：本域色调的**浅色版**。
+ *  @details 用户 2026-09-26：「可是 icon 是彩色的啊」—— 所以不上白，改成**同色相提亮**，
+ *           保住"每项图标一色"。实测在选中蓝 0x1D4ED8 上：原色 1.12~1.83:1（等于看不见），
+ *           浅色版 3.27~4.51:1（图形按 3:1 判，够；4.5:1 是文字的门槛）。 */
+static uint32_t helm_ico_tone_sel(helm_ico_id_t ico)
+{
+    switch (ico) {
+    case HELM_ICO_POWER:
+    case HELM_ICO_XMARK:
+        return HELM_COLOR_HR_FILL;
+    case HELM_ICO_NAV:
+    case HELM_ICO_PIN:
+    case HELM_ICO_FLAG:
+    case HELM_ICO_SKIP:
+    case HELM_ICO_GO:
+        return HELM_COLOR_NAV_FILL;
+    case HELM_ICO_BLE:
+    case HELM_ICO_USB:
+    case HELM_ICO_BELL:
+    case HELM_ICO_SOUND:
+    case HELM_ICO_CALL:
+    case HELM_ICO_INBOX:
+        return HELM_COLOR_CLIMB_FILL;
+    default:
+        return HELM_COLOR_PWR_FILL;
+    }
+}
 
 static void helm_mitem_apply_mix(lv_obj_t * row, uint8_t mix);
 
@@ -89,30 +157,109 @@ static void helm_text_sel(lv_obj_t * obj, bool sel, const lv_font_t * font)
     }
 }
 
+/** @brief 页头标题字体：22px（系统 TTF，未就绪时回落 15px 点阵）。
+ *  @details 2026-11-01 二次改版：用户"菜单的 title 好丑" —— 原来 15px 和列表
+ *           行标题一样大，根本分不出层级；抬到 22px 才有"页标题"的样子。
+ */
+static const lv_font_t * helm_mhead_font(void)
+{
+    return helm_font_sys(22, helm_font_title());
+}
+
+/** @brief 页头下划线与标题对齐（宽度 = 文字宽，位置 = 文字下沿）。
+ *  @details 用户 2026-11-01："这个竖线好丑……放在菜单文字下面使用横线都没这么丑"
+ *           ⇒ 去掉左侧竖轨，改成标题下面一条**与文字等宽**的橙色短线。
+ *           每次改标题 / 换主题 / 改字体都要重跑（宽度是按文字实测的）。
+ */
+static void helm_mhead_fit(lv_obj_t * head)
+{
+    lv_obj_t * lab = (lv_obj_t *)lv_obj_get_user_data(head);
+    lv_obj_t * ul;
+    lv_point_t sz;
+    const lv_font_t * font;
+    const char * txt;
+    lv_coord_t ty;
+
+    if (lab == NULL) {
+        return;
+    }
+
+    ul = (lv_obj_t *)lv_obj_get_user_data(lab);
+    font = lv_obj_get_style_text_font(lab, 0);
+    txt = lv_label_get_text(lab);
+    lv_txt_get_size(&sz, txt ? txt : "", font, 0, 0, LV_COORD_MAX,
+                    LV_TEXT_FLAG_NONE);
+    if (sz.x < 24) {
+        sz.x = 24;
+    }
+    if (sz.x > PAGE_HOR_RES - 32) {
+        sz.x = PAGE_HOR_RES - 32;
+    }
+    ty = (lv_coord_t)((HELM_MHEAD_H - sz.y) / 2);
+    if (ty < 0) {
+        ty = 0;
+    }
+    lv_obj_set_y(lab, ty);
+    if (ul != NULL) {
+        lv_coord_t uy = (lv_coord_t)(ty + sz.y);
+
+        if (uy > HELM_MHEAD_H - 4) {
+            uy = HELM_MHEAD_H - 4;
+        }
+        lv_obj_set_width(ul, sz.x);
+        lv_obj_set_y(ul, uy);
+    }
+}
+
+/** @brief 页头的通用样式（create / 换主题重设 两处同源）。
+ *  @details 透明底（露出页面底色），颜色只在下划线这一条**形状**上；标题 INK。
+ */
+static void helm_mhead_style(lv_obj_t * head)
+{
+    lv_obj_t * lab = (lv_obj_t *)lv_obj_get_user_data(head);
+    lv_obj_t * ul = (lab != NULL) ? (lv_obj_t *)lv_obj_get_user_data(lab) : NULL;
+
+    lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
+    if (ul != NULL) {
+        lv_obj_set_style_bg_color(ul, helm_color(HELM_COLOR_NAV), 0);
+    }
+}
+
 lv_obj_t * helm_mhead_create(lv_obj_t * parent, const char * title)
 {
     lv_obj_t * head = lv_obj_create(parent);
     lv_obj_t * lab;
+    lv_obj_t * ul;
 
     lv_obj_remove_style_all(head);
     lv_obj_set_size(head, PAGE_HOR_RES, HELM_MHEAD_H);
     lv_obj_set_style_min_height(head, HELM_MHEAD_H, 0);
     lv_obj_set_style_max_height(head, HELM_MHEAD_H, 0);
     lv_obj_set_flex_grow(head, 0);
-    lv_obj_set_style_bg_color(head, helm_color(HELM_COLOR_INK), 0);
-    lv_obj_set_style_bg_opa(head, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_hor(head, 12, 0);
-    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+    helm_mhead_style(head);
 
-    lab = helm_label(head, helm_font_title(), HELM_COLOR_PAPER,
+    lab = helm_label(head, helm_mhead_font(), HELM_COLOR_INK,
                      title ? title : "");
-    /* 像素宽：flex_grow + width 0 在父宽未解时标题是空白。 */
-    lv_obj_set_width(lab, PAGE_HOR_RES - 24);
+    /* 像素宽 + DOTS：超长文件名不会撑出页头。 */
+    lv_obj_set_pos(lab, 16, 4);
+    lv_obj_set_width(lab, PAGE_HOR_RES - 32);
     lv_label_set_long_mode(lab, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_user_data(head, lab);
+
+    /* 标题下划线：3px 橙，宽度由 helm_mhead_fit() 按文字实测。 */
+    ul = lv_obj_create(head);
+    lv_obj_remove_style_all(ul);
+    lv_obj_set_size(ul, 32, 3);
+    lv_obj_set_pos(ul, 16, HELM_MHEAD_H - 5);
+    lv_obj_set_style_radius(ul, 2, 0);
+    lv_obj_set_style_bg_opa(ul, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(ul, helm_color(HELM_COLOR_NAV), 0);
+    lv_obj_clear_flag(ul, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(ul, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_user_data(lab, ul);
+
+    helm_mhead_fit(head);
     return head;
 }
 
@@ -126,8 +273,9 @@ void helm_mhead_set(lv_obj_t * head, const char * title)
 
     lab = (lv_obj_t *)lv_obj_get_user_data(head);
     if (lab) {
-        lv_obj_set_style_text_font(lab, helm_font_title(), 0);
+        lv_obj_set_style_text_font(lab, helm_mhead_font(), 0);
         lv_label_set_text(lab, title ? title : "");
+        helm_mhead_fit(head);
     }
 }
 
@@ -142,7 +290,29 @@ void helm_mhead_set_font(lv_obj_t * head, const lv_font_t * font)
     lab = (lv_obj_t *)lv_obj_get_user_data(head);
     if (lab) {
         lv_obj_set_style_text_font(lab, font, 0);
+        helm_mhead_fit(head);
     }
+}
+
+/** @brief 换主题后重设页头样式：把 `helm_mhead_create()` 设过的那几行**再跑一遍**。
+ *  @details 颜色是建页时烘进样式的（`helm_color()` 取值就在 `set_style` 那一刻），
+ *           `helm_mhead_set()` 只改文案不改色 ⇒ 明暗互换必须重跑这几行。
+ *           字体/下划线宽度也按新样式重量一次（下划线是"文字宽"派生的）。 */
+void helm_mhead_reapply(lv_obj_t * head)
+{
+    lv_obj_t * lab;
+
+    if (head == NULL) {
+        return;
+    }
+
+    lab = (lv_obj_t *)lv_obj_get_user_data(head);
+    if (lab != NULL) {
+        lv_obj_set_style_text_font(lab, helm_mhead_font(), 0);
+        lv_obj_set_style_text_color(lab, helm_color(HELM_COLOR_INK), 0);
+    }
+    helm_mhead_style(head);
+    helm_mhead_fit(head);
 }
 
 typedef struct {
@@ -260,9 +430,12 @@ static void helm_mcur_draw(lv_event_t * e)
     layer = lv_event_get_layer(e);
     helm_mcur_box(c, &a);
     lv_draw_rect_dsc_init(&rd);
-    rd.bg_color = helm_color(HELM_COLOR_NAV);
+    /* 2026-09-26：选中态 = **中性抬升**（App 里根本没有"彩色光标"这回事，
+     * 触屏靠手指；设备是键盘光标，所以做"底色浅一档"，不上任何彩色）。
+     * 历史方案已否：实心橙块（压 22px 标题 ~3:1）、淡橙底 + 3px 橙条（太花）。 */
+        rd.bg_color = helm_color(HELM_COLOR_MENU_LIFT);
     rd.bg_opa = opa;
-    rd.radius = HELM_RADIUS;
+    rd.radius = HELM_RADIUS - 2;
     lv_draw_rect(layer, &rd, &a);
 }
 
@@ -479,7 +652,8 @@ lv_obj_t * helm_mlist_create(lv_obj_t * parent)
     return list;
 }
 
-static uintptr_t helm_row_pack(uint8_t mix, uint8_t kind, bool has_sw, bool sw_on)
+static uintptr_t helm_row_pack(uint8_t mix, uint8_t kind, bool has_sw, bool sw_on,
+                               bool dark)
 {
     uintptr_t u = (uintptr_t)mix | ((uintptr_t)kind << 8);
 
@@ -490,55 +664,170 @@ static uintptr_t helm_row_pack(uint8_t mix, uint8_t kind, bool has_sw, bool sw_o
         }
     }
 
+    if (dark) {
+        u |= (1u << 12);
+    }
+
     return u;
 }
 
-static void helm_row_store(lv_obj_t * row, uint8_t mix, uint8_t kind, bool has_sw,
-                           bool sw_on)
+static bool helm_row_dark(lv_obj_t * row)
 {
-    lv_obj_set_user_data(row, (void *)helm_row_pack(mix, kind, has_sw, sw_on));
+    return row != NULL &&
+           (((uintptr_t)lv_obj_get_user_data(row) & (1u << 12)) != 0);
+}
+
+/** @brief 次级文字上色：浅底用 MUTE，深底（选中块 / 配色试验的整行底色）用浅色。
+ *  @note 顺带打上 HELM_MLAB_TAG —— 光标动画到两端时要能把它找出来翻色。 */
+static void helm_text_soft(lv_obj_t * obj, bool light, const lv_font_t * font)
+{
+    lv_color_t want;
+
+    if (obj == NULL) {
+        return;
+    }
+
+    lv_obj_set_user_data(obj, HELM_MLAB_TAG);
+    want = helm_color(light ? HELM_COLOR_MENU_SEL_MUTED : HELM_COLOR_MENU_MUTED);
+    /* 颜色没变就别 set_style：LVGL 不比较旧值，每设一次都会把该对象重刷一遍。
+     * 光标每动一下要翻两行、每条 poll 刷新还会把整页再翻一遍 —— 全是白刷的
+     * （用户 2026-09-26："感觉卡卡的"）。 */
+    if (lv_color_eq(lv_obj_get_style_text_color(obj, 0), want)) {
+        if (font && lv_obj_get_style_text_font(obj, 0) == font) {
+            return;
+        }
+
+        if (font) {
+            lv_obj_set_style_text_font(obj, font, 0);
+        }
+
+        return;
+    }
+
+    lv_obj_set_style_text_color(obj, want, 0);
+    if (font) {
+        lv_obj_set_style_text_font(obj, font, 0);
+    }
+}
+
+static void helm_mitem_soft_walk(lv_obj_t * obj, bool light)
+{
+    uint32_t i;
+    uint32_t n;
+
+    if (obj == NULL) {
+        return;
+    }
+
+    n = lv_obj_get_child_count(obj);
+    for (i = 0; i < n; i++) {
+        lv_obj_t * c = lv_obj_get_child(obj, i);
+
+        if (c == NULL) {
+            continue;
+        }
+
+        if (lv_obj_get_user_data(c) == HELM_MLAB_TAG) {
+            helm_text_soft(c, light, NULL);
+        } else if (lv_obj_has_flag(c, LV_OBJ_FLAG_USER_1)) {
+            /* 行图标：亮底用本域色调，深底用它的**浅色版**（保住"每项图标一色"）。
+             * 图标 id 存在 user_data 里（helm_icon_create），所以不另打标记，
+             * 用 USER_1 这个用户标志认它，还原时照 id 重算色调；
+             * helm_icon_set_color 自己会跳过同色（不然每次都要重画字形）。 */
+            helm_ico_id_t lid = (helm_ico_id_t)(uintptr_t)lv_obj_get_user_data(c);
+
+            helm_icon_set_color(c, helm_color(light
+                ? helm_ico_tone_sel(lid) : helm_ico_tone(lid)));
+        }
+
+        helm_mitem_soft_walk(c, light);
+    }
+}
+
+static void helm_row_store(lv_obj_t * row, uint8_t mix, uint8_t kind, bool has_sw,
+                           bool sw_on, bool dark)
+{
+    lv_obj_set_user_data(row, (void *)helm_row_pack(mix, kind, has_sw, sw_on, dark));
+}
+
+/** @brief 旋钮滑动（translate_x 的 exec）：只脏 34x18 的开关区域。 */
+static void helm_msw_knob_exec(void * var, int32_t v)
+{
+    if (helm_anim_is_suspended()) {
+        return;
+    }
+
+    lv_obj_set_style_translate_x((lv_obj_t *)var, v, 0);
+}
+
+/** @brief 滑到位后把 translate_x 归零：align 已经是终态。 */
+static void helm_msw_knob_done(lv_anim_t * a)
+{
+    if (a != NULL && a->var != NULL) {
+        lv_obj_set_style_translate_x((lv_obj_t *)a->var, 0, 0);
+    }
 }
 
 static void helm_msw_restyle(lv_obj_t * sw, bool on, uint8_t mix)
 {
     lv_obj_t * knob;
+    void * last;
+    bool last_on;
     lv_color_t ink = helm_color(HELM_COLOR_INK);
     lv_color_t paper = helm_color(HELM_COLOR_PAPER);
     lv_color_t nav = helm_color(HELM_COLOR_NAV);
-    lv_color_t fg = lv_color_mix(paper, ink, mix);
+
+    /* ⚠ 开关**不跟聚焦/选中反色**（用户 2026-09-26 晚："右侧的开关，在聚焦时也
+     * 不需要反色吧，日光和夜间都可以保持原色显示"）。原来这里按 `mix` 把轨道/旋钮
+     * 往 PAPER 混（↑聚焦↑浅），聚焦行上就成了一条浅色胶囊（现场截图：夜间那根粉白胶囊）。
+     * 现在两个态都取**未聚焦**的满色，与 `helm_msw_make()` 同源：
+     *   on  = 轨道 NAV、旋钮 PAPER；off = 描边 + 旋钮 INK。
+     * 聚焦与否由整行底色（光标）表达，开关只表达**开/关**。
+     * 注：这与本文件里"选中不再给文字反色"的那次是同一个决定（见
+     * `helm_mitem_apply_mix()` 的注释）——这次把开关也补齐。 */
+    LV_UNUSED(mix);
 
     if (sw == NULL) {
         return;
     }
 
     knob = lv_obj_get_child(sw, 0);
-    if (on) {
-        lv_color_t fill = lv_color_mix(paper, nav, mix);
-        lv_color_t knob_c = lv_color_mix(nav, paper, mix);
+    last = (knob != NULL) ? lv_obj_get_user_data(knob) : NULL;
+    last_on = (last == HELM_MSW_ON_TAG);
 
-        lv_obj_set_style_bg_color(sw, fill, 0);
-        lv_obj_set_style_border_color(sw, fill, 0);
+    if (on) {
+        lv_obj_set_style_bg_color(sw, nav, 0);
+        lv_obj_set_style_border_color(sw, nav, 0);
+        lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
         if (knob) {
-            lv_obj_set_style_bg_color(knob, knob_c, 0);
-        }
-        /* Align/opa only at endpoints: lv_obj_align every mix frame reflows the list. */
-        if (mix == 0 || mix == 255) {
-            lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
-            if (knob) {
-                lv_obj_align(knob, LV_ALIGN_RIGHT_MID, -2, 0);
-            }
+            lv_obj_set_style_bg_color(knob, paper, 0);
+            lv_obj_align(knob, LV_ALIGN_RIGHT_MID, -2, 0);
         }
     } else {
-        lv_obj_set_style_border_color(sw, fg, 0);
+        lv_obj_set_style_border_color(sw, ink, 0);
+        lv_obj_set_style_bg_opa(sw, LV_OPA_TRANSP, 0);
         if (knob) {
-            lv_obj_set_style_bg_color(knob, fg, 0);
+            lv_obj_set_style_bg_color(knob, ink, 0);
+            lv_obj_align(knob, LV_ALIGN_LEFT_MID, 2, 0);
         }
-        if (mix == 0 || mix == 255) {
-            lv_obj_set_style_bg_opa(sw, LV_OPA_TRANSP, 0);
-            if (knob) {
-                lv_obj_align(knob, LV_ALIGN_LEFT_MID, 2, 0);
-            }
+    }
+
+    /* 旋钮滑动：只在状态**真的翻过来**时走一次（行刷新每拍都会进来，不能重播）。
+     * align 已按新态落好，位移只是从旧端点补到 0；旧端点偏移 = 两端中心差。 */
+    if (knob != NULL) {
+        if (last == NULL || helm_anim_is_suspended()) {
+            /* 首次（make 已把终态/标记写好）或屏幕不可见：直接落位，不留偏移。 */
+            helm_anim_stop(knob, helm_msw_knob_exec);
+            lv_obj_set_style_translate_x(knob, 0, 0);
+        } else if (last_on != on) {
+            int32_t from = on ? -HELM_MSW_TRAVEL : HELM_MSW_TRAVEL;
+
+            lv_obj_set_style_translate_x(knob, from, 0);
+            helm_anim_run(knob, helm_msw_knob_exec, from, 0, HELM_MSW_SLIDE_MS,
+                          lv_anim_path_ease_out, helm_msw_knob_done);
         }
+
+        lv_obj_set_user_data(knob, on ? HELM_MSW_ON_TAG : HELM_MSW_OFF_TAG);
     }
 }
 
@@ -580,12 +869,19 @@ static void helm_mitem_apply_mix(lv_obj_t * row, uint8_t mix)
     sw_on = (u & (1u << 11)) != 0;
 
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    /* OLED 光标上文字始终墨色，不再整树改色（会把整行标脏）。 */
+    /* 次级文字翻色只在两端做：逐帧改会把整行标脏（原来连开关都只在端点动）。 */
+    if (mix == 0 || mix == 255) {
+        helm_mitem_soft_walk(row, mix == 255 || helm_row_dark(row));
+    }
+
+    /* ⚠ 不做"选中即反色"（2026-09-26 用户："选中后，可以不要吧字体反色设计吗"）：
+     * 选中只换整行底色，文字保持 INK / MUTE —— 黑字压实心蓝（#2A6ED0）实测约
+     * 4.2:1，够读；而且光标上下移动时文字不再闪白闪黑，观感稳。 */
     if (has_sw) {
         helm_msw_restyle(helm_row_find_sw(row), sw_on, mix);
     }
 
-    helm_row_store(row, mix, kind, has_sw, sw_on);
+    helm_row_store(row, mix, kind, has_sw, sw_on, helm_row_dark(row));
 }
 
 static void helm_mitem_anim_mix(lv_obj_t * row, uint8_t to)
@@ -593,11 +889,14 @@ static void helm_mitem_anim_mix(lv_obj_t * row, uint8_t to)
     helm_mitem_apply_mix(row, to);
 }
 
-static lv_obj_t * helm_msw_make(lv_obj_t * parent, bool on, bool sel)
+/** @brief 造一个开关。
+ *  @note **不看 `sel`**（"选中不反色"那条决定的落点，与 `helm_msw_restyle()` 同源）：
+ *        建行时哪怕这行正被选中，开关也按它自己的态画 —— on = NAV 轨道 + PAPER 旋钮、
+ *        off = INK 描边 + INK 旋钮。 */
+static lv_obj_t * helm_msw_make(lv_obj_t * parent, bool on)
 {
     lv_obj_t * sw = lv_obj_create(parent);
     lv_obj_t * knob;
-    uint32_t fg = sel ? HELM_COLOR_PAPER : HELM_COLOR_INK;
 
     lv_obj_remove_style_all(sw);
     lv_obj_set_size(sw, HELM_MSW_W, HELM_MSW_H);
@@ -606,14 +905,12 @@ static lv_obj_t * helm_msw_make(lv_obj_t * parent, bool on, bool sel)
     lv_obj_clear_flag(sw, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_user_data(sw, HELM_MSW_TAG);
     if (on) {
-        lv_obj_set_style_bg_color(sw,
-            helm_color(sel ? HELM_COLOR_PAPER : HELM_COLOR_NAV), 0);
+        lv_obj_set_style_bg_color(sw, helm_color(HELM_COLOR_NAV), 0);
         lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_color(sw,
-            helm_color(sel ? HELM_COLOR_PAPER : HELM_COLOR_NAV), 0);
+        lv_obj_set_style_border_color(sw, helm_color(HELM_COLOR_NAV), 0);
     } else {
         lv_obj_set_style_bg_opa(sw, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_color(sw, helm_color(fg), 0);
+        lv_obj_set_style_border_color(sw, helm_color(HELM_COLOR_INK), 0);
     }
 
     knob = lv_obj_create(sw);
@@ -621,12 +918,13 @@ static lv_obj_t * helm_msw_make(lv_obj_t * parent, bool on, bool sel)
     lv_obj_set_size(knob, 12, 12);
     lv_obj_set_style_radius(knob, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(knob, LV_OPA_COVER, 0);
+    /* 记下旋钮当前所在端点：restyle 靠它判断"状态真的变了"，首帧同态 ⇒ 不播滑动。 */
+    lv_obj_set_user_data(knob, on ? HELM_MSW_ON_TAG : HELM_MSW_OFF_TAG);
     if (on) {
-        lv_obj_set_style_bg_color(knob,
-            helm_color(sel ? HELM_COLOR_NAV : HELM_COLOR_PAPER), 0);
+        lv_obj_set_style_bg_color(knob, helm_color(HELM_COLOR_PAPER), 0);
         lv_obj_align(knob, LV_ALIGN_RIGHT_MID, -2, 0);
     } else {
-        lv_obj_set_style_bg_color(knob, helm_color(fg), 0);
+        lv_obj_set_style_bg_color(knob, helm_color(HELM_COLOR_INK), 0);
         lv_obj_align(knob, LV_ALIGN_LEFT_MID, 2, 0);
     }
 
@@ -661,6 +959,57 @@ static lv_obj_t * helm_mbar_make(lv_obj_t * parent, const helm_item_t * spec)
     return bar;
 }
 
+/** @brief 给一棵子树里每个对象挂上绘制任务事件（打桩用，见 helm_ui_task_cb）。
+ *  @details 行的标签/图标是**子对象**，事件只发给带标志的那个对象本身
+ *           ⇒ 不逐对象挂，label/img/圆角填充这些分类永远是 0。 */
+static void helm_probe_attach_tree(lv_obj_t * obj)
+{
+    uint32_t i;
+    uint32_t n;
+
+    if (obj == NULL) {
+        return;
+    }
+
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS);
+    lv_obj_add_event_cb(obj, helm_ui_task_cb, LV_EVENT_DRAW_TASK_ADDED, NULL);
+
+    n = lv_obj_get_child_count(obj);
+    for (i = 0; i < n; i++) {
+        helm_probe_attach_tree(lv_obj_get_child(obj, i));
+    }
+}
+
+void helm_mitem_list_built(lv_obj_t * list, int sel)
+{
+    lv_obj_t * row;
+    uint32_t n;
+
+    if (list == NULL || sel < 0) {
+        return;
+    }
+
+    n = lv_obj_get_child_count(list);
+    if ((uint32_t)sel >= n) {
+        return;
+    }
+
+    row = lv_obj_get_child(list, (uint32_t)sel);
+    if (row == NULL) {
+        return;
+    }
+
+    /* 已经在视口里就别滚 —— `lv_obj_scroll_to_view()` 会强制整表重新布局，
+     * 实测这一步单独就 50~250 ms（[vperf] ui slow menu 的 grp= 里就混着它）。
+     * 判据取最省事的那种：选中行是第 0 行且列表已在顶端（进页/首页的常态），
+     * 这时滚动本来就是空操作。要判"任意行是否可见"就得先算布局，反而更贵。 */
+    if (sel != 0 || lv_obj_get_scroll_y(list) != 0) {
+        lv_obj_scroll_to_view(row, LV_ANIM_OFF);
+    }
+
+    helm_mcur_go(list, (uint8_t)sel, true);
+}
+
 lv_obj_t * helm_mitem_create(lv_obj_t * list, const helm_item_t * spec)
 {
     lv_obj_t * row;
@@ -688,15 +1037,22 @@ lv_obj_t * helm_mitem_create(lv_obj_t * list, const helm_item_t * spec)
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    /* 2026-09-26 菜单现代化：行底改成 App 的深色卡（#1C1C1E），行间发丝线缩进到
+     * 文字列（HELM_MENU_HAIR_INDENT）。样式只在这里设一次，刷新路径不动。 */
+    lv_obj_set_style_bg_color(row,
+        helm_color(spec->bg_set ? spec->bg_color : HELM_COLOR_MENU_CARD), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     helm_row_store(row, on ? 255 : 0, spec->kind,
-                   spec->kind == HELM_ITEM_SW, spec->on);
+                   spec->kind == HELM_ITEM_SW, spec->on, spec->bg_dark);
 
     if (spec->ico != HELM_ICO_NONE) {
         ico = helm_icon_create(row, spec->ico, 22);
-        helm_icon_set_color(ico, helm_color(HELM_COLOR_INK));
+        /* 选中块/深底上本域色调全糊（用户 2026-09-26："左侧 icon 看不清"）⇒ 翻白。 */
+        lv_obj_add_flag(ico, LV_OBJ_FLAG_USER_1);
+        helm_icon_set_color(ico, helm_color((on || spec->bg_dark)
+            ? helm_ico_tone_sel(spec->ico) : helm_ico_tone(spec->ico)));
     }
 
     body = lv_obj_create(row);
@@ -709,9 +1065,14 @@ lv_obj_t * helm_mitem_create(lv_obj_t * list, const helm_item_t * spec)
 
     lab = lv_label_create(body);
     lv_label_set_text(lab, spec->title ? spec->title : "");
+    /* 字号层级对齐 App（18/15 在 390 宽上 ⇒ 15/12 在 240 宽上）：
+     * 原来非 slim 行用 22px，在 240 宽上过大、"浮夸"的一半来自这里。 */
+    /* 与 helm_mitem_refresh 同源：非 slim 行 15px。原来这里取 12px、
+     * 刷新那条路取 15px ⇒ 同一行首帧 12px、重画一次变 15px。 */
     helm_text_sel(lab, on,
                   spec->title_font ? spec->title_font :
                   (slim ? helm_font_lab() : helm_font_title()));
+    lv_obj_set_style_text_color(lab, helm_color(HELM_COLOR_MENU_FG), 0);
     lv_label_set_long_mode(lab, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_width(lab, lv_pct(100));
 
@@ -719,7 +1080,9 @@ lv_obj_t * helm_mitem_create(lv_obj_t * list, const helm_item_t * spec)
         lv_obj_t * sub = lv_label_create(body);
 
         lv_label_set_text(sub, spec->sub);
-        helm_text_sel(sub, on, helm_font_lab());
+        /* 走 helm_font_lab() 而不是裸 &helm_mism4_12：副标题里放的是蓝牙地址
+         * 这类外来串，必须带上"苹方 → 系统 TTF"的回退链（见 helm_font.c）。 */
+        helm_text_soft(sub, on || spec->bg_dark, helm_font_lab());
         lv_label_set_long_mode(sub, LV_LABEL_LONG_MODE_DOTS);
         lv_obj_set_width(sub, lv_pct(100));
     }
@@ -729,18 +1092,18 @@ lv_obj_t * helm_mitem_create(lv_obj_t * list, const helm_item_t * spec)
     }
 
     if (spec->kind == HELM_ITEM_SW) {
-        helm_msw_make(row, spec->on, on);
+        helm_msw_make(row, spec->on);
     } else if (spec->kind == HELM_ITEM_VAL) {
         lv_obj_t * val = lv_label_create(row);
 
         lv_label_set_text(val, spec->value ? spec->value : "");
-        helm_text_sel(val, on, helm_font_lab());
+        helm_text_soft(val, on || spec->bg_dark, helm_font_lab());
     } else if (!slim) {
         if (spec->value && spec->value[0] != '\0') {
             lv_obj_t * val = lv_label_create(row);
 
             lv_label_set_text(val, spec->value);
-            helm_text_sel(val, on, helm_font_lab());
+            helm_text_soft(val, on || spec->bg_dark, helm_font_lab());
         }
 
         {
@@ -750,15 +1113,11 @@ lv_obj_t * helm_mitem_create(lv_obj_t * list, const helm_item_t * spec)
         }
     }
 
+    helm_probe_attach_tree(row);
     helm_mitem_apply_mix(row, on ? 255 : 0);
-    if (on) {
-        int32_t idx = lv_obj_get_index(row);
-
-        lv_obj_scroll_to_view(row, LV_ANIM_OFF);
-        if (idx >= 0) {
-            helm_mcur_go(list, (uint8_t)idx, true);
-        }
-    }
+    /* ⚠ 这里**不要**滚动/起光标：建一行就 scroll_to_view 一次会强制整表重新布局，
+     * 于是变成 O(n²) —— 实测 8 行 200 ms、15 行 115 ms（[vperf] ui slow menu 的
+     * build=）。整页建完之后调一次 helm_mitem_list_built() 即可。 */
 
     return row;
 }
@@ -795,6 +1154,10 @@ bool helm_mitem_refresh(lv_obj_t * row, const helm_item_t * spec)
         return false;
     }
 
+    /* 底色也归刷新路径管：不然重建后改了底色、就地刷新那条路会留着旧色
+     * （创建与刷新两处必须同源，否则同一个 spec 两种观感）。 */
+    lv_obj_set_style_bg_color(row,
+        helm_color(spec->bg_set ? spec->bg_color : HELM_COLOR_MENU_CARD), 0);
     slim = (spec->kind == HELM_ITEM_SLIM);
     want_ico = (spec->ico != HELM_ICO_NONE);
     want_sub = (spec->sub != NULL && spec->sub[0] != '\0');
@@ -858,6 +1221,12 @@ bool helm_mitem_refresh(lv_obj_t * row, const helm_item_t * spec)
         return false;
     }
 
+    if (ico != NULL) {
+        /* 就地刷新也要跟选中/深底走，否则翻色只发生在重建那一拍。 */
+        helm_icon_set_color(ico, helm_color((spec->sel || spec->bg_dark)
+            ? helm_ico_tone_sel(spec->ico) : helm_ico_tone(spec->ico)));
+    }
+
     title = lv_obj_get_child(body, 0);
     sub = want_sub ? lv_obj_get_child(body, 1) : NULL;
     if (lv_obj_get_child_count(body) !=
@@ -895,6 +1264,8 @@ bool helm_mitem_refresh(lv_obj_t * row, const helm_item_t * spec)
         const char * cur = lv_label_get_text(sub);
         const char * next = spec->sub ? spec->sub : "";
 
+        helm_text_soft(sub, spec->sel || spec->bg_dark, NULL);
+
         if (cur == NULL || strcmp(cur, next) != 0) {
             lv_label_set_text(sub, next);
         }
@@ -903,6 +1274,8 @@ bool helm_mitem_refresh(lv_obj_t * row, const helm_item_t * spec)
     if (val) {
         const char * cur = lv_label_get_text(val);
         const char * next = spec->value ? spec->value : "";
+
+        helm_text_soft(val, spec->sel || spec->bg_dark, NULL);
 
         if (cur == NULL || strcmp(cur, next) != 0) {
             lv_label_set_text(val, next);
@@ -917,7 +1290,7 @@ bool helm_mitem_refresh(lv_obj_t * row, const helm_item_t * spec)
         uint8_t mix = spec->sel ? 255 : 0;
 
         helm_row_store(row, mix, spec->kind, spec->kind == HELM_ITEM_SW,
-                       spec->on);
+                       spec->on, spec->bg_dark);
         helm_mitem_apply_mix(row, mix);
         if (spec->sel) {
             int32_t idx = lv_obj_get_index(row);
@@ -1394,8 +1767,10 @@ lv_obj_t * helm_kv_add(lv_obj_t * box, helm_ico_id_t ico, const char * k,
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     icon = helm_icon_create(row, ico, 16);
-    helm_icon_set_color(icon, helm_color(HELM_COLOR_NAV));
-    helm_label(row, helm_font_lab(), HELM_COLOR_INK, k);
+    /* 设计稿 19/20 页的 KV 行图标是**次级灰**（原来是橙色，比右边的值还抢眼）。 */
+    helm_icon_set_color(icon, helm_color(HELM_COLOR_MUTE));
+    /* 键次级（MUTE 12px）、值主级（INK 15px）—— 与菜单行的层级一致。 */
+    helm_label(row, helm_font_lab(), HELM_COLOR_MUTE, k);
     val = helm_label(row, helm_font_title(), HELM_COLOR_INK, v ? v : "");
     helm_grow_x(val);
     lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);

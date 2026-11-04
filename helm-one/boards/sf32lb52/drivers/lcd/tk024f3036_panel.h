@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/tk024f3036_panel.h
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/tk024f3036_panel.h
  *
  * TK024F3036 (ST7789S, 320x240) panel helpers
  *

@@ -39,6 +39,16 @@ bool lv_pm_notify_show(const char * title, const char * text, uint32_t duration_
 /** @brief 同 lv_pm_notify_show，可选 POSIX 图标路径（PNG）；icon_path 可为 NULL。 */
 bool lv_pm_notify_show_ex(const char * title, const char * text,
                           const char * icon_path, uint32_t duration_ms);
+/**
+ * @brief 同 lv_pm_notify_show，但左侧画一个**内置图标**（系统通知用）。
+ *
+ * @details App 通知的图标是手机下发的 PNG（走 `_ex` 的 icon_path）；系统自己发的通知
+ *          （亮度、低电、骑行恢复…）没有 PNG，就用本接口的内置图标 —— 两者占**同一个
+ *          槽**（左侧 32px + 文字左对齐），观感一致。
+ * @param ico `helm_ico_id_t` 取值（0 = 无图标），见 lvgl_page/helm_icon.h。
+ */
+bool lv_pm_notify_show_icon(const char * title, const char * text, int ico,
+                            uint32_t duration_ms);
 /** @brief 同 lv_pm_notify_show 且 LV_PM_NOTIFY_HOLD — 须 lv_pm_notify_dismiss() 关闭。 */
 static inline bool lv_pm_notify_show_hold(const char * title, const char * text)
 {

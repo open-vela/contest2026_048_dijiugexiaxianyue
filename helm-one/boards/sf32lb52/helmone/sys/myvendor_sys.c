@@ -31,7 +31,9 @@
 #  include "companion_bridge.h"
 #endif
 
+#include "companion_proto.h"
 #include "myvendor_gnss.h"
+#include "myvendor_identity.h"
 #include "sf32lb_dvfs.h"
 
 #include "bf0_hal.h"
@@ -239,6 +241,16 @@ void myvendor_sys_sensor_ui_get(myvendor_sys_sensor_ui_t *out)
         out->slot[i].name[MYVENDOR_SYS_SENSOR_NAME_MAX - 1u] = '\0';
       }
   }
+#endif
+}
+
+bool myvendor_sys_sensor_bound(uint8_t kind)
+{
+#ifdef CONFIG_MYVENDOR_BLE_COMPANION
+  return companion_bridge_sensor_slot_bound(kind);
+#else
+  (void)kind;
+  return false;
 #endif
 }
 
@@ -804,10 +816,14 @@ static void sys_print_clk(void)
   myvendor_sys_clk_t c;
 
   myvendor_sys_clk_get(&c);
-  printf("  clk     sys %u MHz  hclk %u MHz  psram %u MHz (%s/%u)  nand %u MHz (%s/%u)\n",
+  /* PSRAM 报**时钟**口径（= 数据率/2）：厂商文档表与 HAL 的延迟分档表
+   * （`HAL_QSPI_GET_CLK()/2` 之后比 66/109/133/166/200）用的都是这个数 ——
+   * 官方配置 DLL2 288 / 分频 1 就是"144 MHz"。`ddr` 那栏才是 `HAL_QSPI_GET_CLK`。 */
+  printf("  clk     sys %u MHz  hclk %u MHz  psram %u MHz clock (%s/%u, ddr %u)  nand %u MHz (%s/%u)\n",
          (unsigned)(c.sysclk_hz / 1000000u), (unsigned)(c.hclk_hz / 1000000u),
-         (unsigned)(c.flash1_hz / 1000000u),
+         (unsigned)(c.flash1_hz / 2000000u),
          myvendor_sys_clk_src_name(c.flash1_src), (unsigned)c.flash1_psclr,
+         (unsigned)(c.flash1_hz / 1000000u),
          (unsigned)(c.flash2_hz / 1000000u),
          myvendor_sys_clk_src_name(c.flash2_src), (unsigned)c.flash2_psclr);
 
@@ -819,6 +835,17 @@ static void sys_print_clk(void)
              (unsigned)c.flash1_sw_div, (unsigned)c.flash2_sw_div,
              (unsigned)c.flash1_psclr, (unsigned)c.flash2_psclr);
     }
+
+  /* PSRAM 的读写命令延迟（`HAL_MPI_MODIFY_RCMD/WCMD_DELAY` 写的就是这两个
+   * `DCYC` 字段，值 = 延迟档 − 1）。这张档位表是**开机算一次**的，而总线频率
+   * 会随档位走 ⇒ 把实际值打出来，才能判断"延迟码和当前频率还配不配"。
+   * 参照：`HAL_MPI_PSRAM_Init` 里 sys_clk(=总线/2) ≤66→3 / ≤109→4 /
+   * ≤133→5 / ≤166→6 / ≤200→7（该表没有 else，>200 会落空）。 */
+  printf("  clk     psram lat rcmd=%u wcmd=%u (code = 该值+1)\n",
+         (unsigned)GET_REG_VAL(hwp_qspi1->HRCCR, MPI_HRCCR_DCYC_Msk,
+                               MPI_HRCCR_DCYC_Pos),
+         (unsigned)GET_REG_VAL(hwp_qspi1->HWCCR, MPI_HWCCR_DCYC_Msk,
+                               MPI_HWCCR_DCYC_Pos));
 }
 
 /** @brief 堆栈摘要：最紧的三个 + 超过 80% 的个数。
@@ -918,6 +945,22 @@ static void sys_print_stacks(void)
     }
 }
 
+/** @brief COMPANION_SLOT_* → 短名，供 `sys` 一眼认槽。 */
+static const char *sys_slot_name(uint8_t slot)
+{
+  switch (slot)
+    {
+      case COMPANION_SLOT_FW:
+        return "fw";
+      case COMPANION_SLOT_MAIN:
+        return "main";
+      case COMPANION_SLOT_FACTORY:
+        return "factory";
+      default:
+        return "--";
+    }
+}
+
 void myvendor_sys_dump(void)
 {
   myvendor_sys_snapshot_t s;
@@ -925,6 +968,38 @@ void myvendor_sys_dump(void)
   myvendor_sys_snapshot(&s);
 
   printf("sys  (read)\n");
+  /* 板卡身份放最前：翻串口/截图时先确认「烧的是哪一版、从哪槽起来」。
+   * 全部走 myvendor_identity（与关于页 / MTP / BLE 同源），不另开配置。 */
+  {
+    const char *id  = myvendor_identity_name();
+    const char *sn  = myvendor_identity_serial();
+    const char *sw  = myvendor_sw_version();
+    const char *hw  = myvendor_hw_version();
+    const char *bld = myvendor_build_date();
+    const char *bl  = myvendor_boot_version();
+    const char *fw  = myvendor_boot_fw_name();
+    uint8_t slot = myvendor_boot_slot();
+    uint8_t tgt  = myvendor_boot_target();
+
+    printf("  board   %s  sn %s\n",
+           (id != NULL && id[0] != '\0') ? id : "--",
+           (sn != NULL && sn[0] != '\0') ? sn : "--");
+    printf("  fw      %s  hw %s  build %s\n",
+           (sw != NULL && sw[0] != '\0') ? sw : "--",
+           (hw != NULL && hw[0] != '\0') ? hw : "--",
+           (bld != NULL && bld[0] != '\0') ? bld : "--");
+    printf("  slot    %s", sys_slot_name(slot));
+    if (slot == COMPANION_SLOT_FW && fw != NULL && fw[0] != '\0')
+      {
+        printf(" (%s)", fw);
+      }
+
+    printf("  target %s  bl %s%s\n",
+           sys_slot_name(tgt),
+           (bl != NULL && bl[0] != '\0') ? bl : "--",
+           myvendor_is_factory() ? "  factory-image" : "");
+  }
+
   /* 运行时间。日志每行前缀（`[  108.321770]`）本来就是它，但事后翻日志时手上
    * 往往没有那一行 —— `sys` 里问一句最省事。
    * `boot` 只有 RTC 对过时才有意义（对时前 `time(NULL)` 不可信），给不出来

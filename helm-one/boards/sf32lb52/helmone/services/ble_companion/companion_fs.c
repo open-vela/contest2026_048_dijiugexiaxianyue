@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,8 +36,14 @@
 #include "myvendor_watchdog.h"
 #include "transfer_backend.h"
 
-#define LOGI(fmt, ...) printf("ble_companion: " fmt "\n", ##__VA_ARGS__)
-#define LOGE(fmt, ...) printf("ble_companion: ERROR " fmt "\n", ##__VA_ARGS__)
+/**
+ * @brief 本模块日志出口（官方规则：服务层统一走 `syslog()`，不用 `printf`）。
+ *
+ * @details 前缀固定 `ble_companion: `（与 downlink 共用一个标签，便于整条 FS 通道一起
+ *          grep）；正常会话/结束用 INFO，真故障才 ERROR。
+ */
+#define LOGI(fmt, ...) syslog(LOG_INFO, "ble_companion: " fmt "\n", ##__VA_ARGS__)
+#define LOGE(fmt, ...) syslog(LOG_ERR, "ble_companion: " fmt "\n", ##__VA_ARGS__)
 
 #define FS_STAGING_MAX          320
 #define FS_DATA_SLOTS           512
@@ -148,7 +155,7 @@ struct fs_ctx
   uint16_t            data_q_rd;
   uint16_t            data_q_n;
   bool                abort_req;
-  bool                commit_pending; /* CLOSE 已回复，尚未落盘 */
+  bool                commit_pending; /* CLOSE 待落盘，尚未回复 */
   bool                disk_hold;      /* CLOSE 抽环时只进 RAM，不写盘 */
   uint32_t            send_ms;
   struct fs_need_slot need[FS_NEED_Q];
@@ -546,7 +553,27 @@ void companion_fs_wait(uint32_t timeout_ms)
       return;
     }
 
-  clock_gettime(CLOCK_REALTIME, &ts);
+  /* 2026-09-23（审计 F9c）：**改用 sem_clockwait + CLOCK_MONOTONIC。**
+   *
+   * 原来读 CLOCK_REALTIME 再喂给 `sem_timedwait()` —— 而本树的
+   * `sem_timedwait()` 是**写死**的实时钟：
+   *   nuttx/libs/libc/semaphore/sem_timedwait.c:71-73
+   *       return sem_clockwait(sem, CLOCK_REALTIME, abstime);
+   * 于是这个"等一段时间"会被 `settimeofday()` 直接拖动 —— 而**同一个
+   * companion 线程**就会校时：`companion_apply_time_sync()`（ble_companion.c，
+   * 手机下发 TIME_SYNC 时调）。校时到真实时间通常是一次**大跳**，
+   * 跳完之后这里算出的绝对时间早就在过去 ⇒ `sem_timedwait()` 立刻返回 ⇒
+   * 等待被无声打断（本该等 N ms 的地方变成忙转）。
+   *
+   * 修法不是"换成 CLOCK_MONOTONIC 再喂 sem_timedwait"（那样更糟：单调基准
+   * 比实时基准小约 1.79e9 秒，算出来的绝对时间远在过去，等待直接变 no-op），
+   * 而是换成能把时钟**一起传下去**的接口。本树的
+   * `sem_clockwait()`（nuttx/libs/libc/semaphore/sem_clockwait.c:76）就是把
+   * clockid 透传给 `nxsem_clockwait()`，后者对非 CLOCK_REALTIME 走
+   * `wd_start_abstime()`（单调基准）—— 见
+   * nuttx/sched/semaphore/sem_clockwait.c:66-80。
+   */
+  clock_gettime(CLOCK_MONOTONIC, &ts);
   ts.tv_sec += (time_t)(timeout_ms / 1000);
   ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
   if (ts.tv_nsec >= 1000000000L)
@@ -555,7 +582,7 @@ void companion_fs_wait(uint32_t timeout_ms)
       ts.tv_nsec -= 1000000000L;
     }
 
-  (void)sem_timedwait(&g_fs_wake, &ts);
+  (void)sem_clockwait(&g_fs_wake, CLOCK_MONOTONIC, &ts);
   while (sem_trywait(&g_fs_wake) == 0)
     {
     }
@@ -660,18 +687,15 @@ static void release_lfs(void)
     }
 }
 
-/** @brief CLOSE 已应答后把 RAM 缓冲写入 *.part 并 rename。 */
+/** @brief 把 RAM 缓冲写入 *.part 并 rename，随后回复 CLOSE。 */
 static void fs_deferred_commit(void);
+static void fs_progress_ping(void);
 
 /** @brief 重置 FS 会话状态。 */
 static void session_reset(bool drop_part)
 {
-  if (g_fs.commit_pending)
-    {
-      g_fs.commit_pending = false;
-      fs_deferred_commit();
-    }
-  else if (g_fs.wfd >= 0)
+  /* No success has been sent yet: interrupted CLOSE keeps .part resumable. */
+  if (g_fs.wfd >= 0)
     {
       if (drop_part)
         {
@@ -823,7 +847,7 @@ static bool path_is_ota_fw(const char *path)
 
 static bool icon_png_ok(const char *abs_path);
 
-/** @brief CLOSE 已应答后把 RAM 缓冲写入 *.part 并 rename。 */
+/** @brief 把 RAM 缓冲写入 *.part 并 rename，随后回复 CLOSE。 */
 static void fs_deferred_commit(void)
 {
   int ret;
@@ -833,27 +857,45 @@ static void fs_deferred_commit(void)
   uint32_t left = g_fs.wbuf_len;
 
   ret = wbuf_flush();
+  if (ret == 0 && icon && fsync(g_fs.wfd) != 0)
+    {
+      ret = errno != 0 ? errno : EIO;
+    }
+
+  if (ret == 0 && icon && !icon_png_ok(g_fs.tmp_path))
+    {
+      ret = EIO;
+      LOGI("fs write commit rejected icon %s", g_fs.tmp_path);
+    }
+
   if (ret == 0)
     {
       ret = xfer_write_commit(g_fs.wfd, g_fs.tmp_path, g_fs.path);
     }
-
-  g_fs.wfd = -1;
-  if (ret == 0 && icon && !icon_png_ok(g_fs.path))
+  else
     {
-      unlink(g_fs.path);
-      ret = EIO;
-      LOGI("fs write commit rejected icon %s", g_fs.path);
+      /* flush/validation do not own the fd; preserve the previous final. */
+      xfer_write_suspend(g_fs.wfd);
     }
 
+  g_fs.wfd = -1;
   release_lfs();
   g_fs.state = FS_IDLE;
   if (ret != 0)
     {
-      LOGI("fs write commit after-ack failed %s errno=%d", g_fs.path, ret);
+      LOGI("fs write commit failed %s errno=%d", g_fs.path, ret);
+      pthread_mutex_lock(&g_fs.lock);
+      queue_err(COMPANION_FS_WRITE_CLOSE, g_fs.tid, ret);
+      fs_progress_ping();
+      pthread_mutex_unlock(&g_fs.lock);
       return;
     }
 
+  pthread_mutex_lock(&g_fs.lock);
+  g_fs.state = FS_REPLY;
+  queue_ok(COMPANION_FS_WRITE_CLOSE, g_fs.tid, NULL, 0, true);
+  fs_progress_ping();
+  pthread_mutex_unlock(&g_fs.lock);
   LOGI("fs write commit %s %lu bytes leftover=%lu %ums",
        g_fs.path, (unsigned long)g_fs.w_expected,
        (unsigned long)left,
@@ -1377,11 +1419,15 @@ static void handle_write_close(uint8_t tid, const uint8_t *payload,
       return;
     }
 
-  /* GPX/图标等：先 CLOSE OK 让 App 结束，落盘在 notify 之后。
-   * 否则 fsync/write 十几秒，手机进度条卡死。 */
+  /* Worker commits outside the notify lock. LAST success means durable data,
+   * not merely receipt in RAM. Keep the existing CLOSE wire format. */
+  g_fs.cmd = COMPANION_FS_WRITE_CLOSE;
+  g_fs.tid = tid;
+  g_fs.tx_len = 0;
+  g_fs.tx_last = false;
+  g_fs.tx_err = false;
   g_fs.commit_pending = true;
-  queue_ok(COMPANION_FS_WRITE_CLOSE, tid, NULL, 0, true);
-  LOGI("fs write close acked %s %lu bytes (flush deferred wbuf=%lu)",
+  LOGI("fs write close pending %s %lu bytes (wbuf=%lu)",
        g_fs.path, (unsigned long)g_fs.w_expected,
        (unsigned long)g_fs.wbuf_len);
 }
@@ -2015,36 +2061,38 @@ void companion_fs_set_mtu(const bt_address_t *addr, uint32_t mtu)
  */
 void companion_fs_set_ccc(bool enabled)
 {
-  pthread_mutex_lock(&g_fs.lock);
-  g_fs.ccc      = enabled;
-  g_fs.inflight = 0;
+  bool was;
+  int  state;
 
-  /** **取消订阅时把开着的 FS 事务一起收掉**（2026-09-20）。
+  pthread_mutex_lock(&g_fs.lock);
+  was             = g_fs.ccc;
+  state           = (int)g_fs.state;
+  g_fs.ccc        = enabled;
+  g_fs.inflight   = 0;
+
+  /** **不要在 CCC=0 的瞬间立刻 `session_reset`**（2026-09-21）。
    *
-   *  只清 ccc/inflight 是不够的：事务还挂在 FS_REPLY/FS_LIST/FS_READ/FS_WRITE
-   *  上，而 0xFF16 的通知通道已经关了 ⇒ 数据/POST 永远发不出去 ⇒ 事务永远走不完
-   *  ⇒ `companion_fs_busy()` 恒真 ⇒ 状态帧的 `FS_BUSY` 常亮。
+   *  以前这里一关订阅就把开着的事务收掉，是为了避免 `FS_BUSY` 常亮。但 App
+   *  侧的"3 s 无第一帧 → 立刻补订"会在**事务还挂着**时把 CCC 写成 0 再写回 1
+   *  （`setNotifyValue` 重建订阅）；设备这边若立刻 abort，宽限期内回来的 CCC
+   *  也救不回那条 reply —— App 看到的就是"就绪后文件传输全超时 / 无法通信"。
    *
-   *  用户现场：App 报"码表 USB/MTP 占用中"，但**根本没进过 MTP 页**。
-   *  根因就在这一位：app 的判据是 `isTransferBusy = fsBusy | usbMtpBusy`
-   *  （lib/ble/companion_proto.dart），而板上是 `fs_disc state=2 … ccc=0`
-   *  （LIST 事务开着、订阅已关），USB 那边其实一直是 0。事务收掉，bit4 就落下去。
-   *
-   *  `session_reset(false)` 语义与断链路径一致：保留已写部分、放掉 LFS、回 IDLE。 */
-  if (!enabled && g_fs.state != FS_IDLE)
+   *  卡死兜底改由 `companion_fs_pump` 的 `FS_CCC_GRACE_MS` 宽限期负责：CCC
+   *  在宽限内补上 ⇒ 事务接着发；一直没补 ⇒ 再收掉，busy 照样落回 IDLE。 */
+  if (!enabled && state != FS_IDLE)
     {
-      LOGE("fs session aborted (ccc off, state=%d)", (int)g_fs.state);
-      session_reset(false);
+      LOGI("fs ccc off while state=%d (grace, not abort)", state);
+    }
+  else if (enabled && !was && state != FS_IDLE)
+    {
+      LOGI("fs ccc on while state=%d (resume)", state);
     }
 
   pthread_mutex_unlock(&g_fs.lock);
-  LOGI("fs subscribe -> %d", (int)enabled);
+  LOGI("fs subscribe -> %d (was=%d state=%d)", (int)enabled, was ? 1 : 0, state);
 
-  if (!enabled)
-    {
-      /* 让 pump 跑一拍：把恒真的 busy 落回 IDLE（回调/状态帧都靠它）。 */
-      companion_fs_kick();
-    }
+  /* 开关都 kick：开 ⇒ 把压着的 reply 立刻发出去；关 ⇒ 让宽限期计时跑起来。 */
+  companion_fs_kick();
 }
 
 /* 事务"有进展"打点：定义在 pump 前面（它要用 g_fs_progress_ms），而 on_cmd/on_data
@@ -2056,6 +2104,13 @@ static void fs_progress_ping(void);
  */
 uint16_t companion_fs_on_cmd(const uint8_t *value, uint16_t length)
 {
+  uint8_t cmd;
+  uint8_t tid;
+  int     state;
+  int     ccc;
+  int     conn;
+  unsigned qn;
+
   if (value == NULL || length == 0)
     {
       return 0;
@@ -2066,12 +2121,22 @@ uint16_t companion_fs_on_cmd(const uint8_t *value, uint16_t length)
       length = sizeof(g_fs.cmd_req.buf);
     }
 
+  cmd = value[0];
+  tid = (length > 1) ? value[1] : 0;
+
   pthread_mutex_lock(&g_fs.lock);
   memcpy(g_fs.cmd_req.buf, value, length);
   g_fs.cmd_req.len     = length;
   g_fs.cmd_req.pending = true;
   fs_progress_ping();          /* 收到命令 = 事务有进展（看门狗别误判卡死） */
+  state = (int)g_fs.state;
+  ccc   = g_fs.ccc ? 1 : 0;
+  conn  = g_fs.connected ? 1 : 0;
+  qn    = (unsigned)g_fs.data_q_n;
   pthread_mutex_unlock(&g_fs.lock);
+  /* 诊断放锁外：printf 走串口，别堵协议栈线程。 */
+  LOGI("fs cmd in cmd=0x%02x tid=%u len=%u state=%d ccc=%d conn=%d q=%u",
+       (unsigned)cmd, (unsigned)tid, (unsigned)length, state, ccc, conn, qn);
   companion_fs_kick();
   return length;
 }
@@ -2464,6 +2529,22 @@ bool companion_fs_pump(void)
 
           if (!send_tx_build(frame, &flen, &n_handle, &n_peer, &n_attr))
             {
+              /* 组不出帧：多半是 ccc/conn 掉了。限频打，避免 pump 每拍刷屏。 */
+              static uint32_t s_skip_log_ms;
+              uint32_t now = fs_now_ms();
+
+              if (s_skip_log_ms == 0 ||
+                  myvendor_mono_elapsed_ms(now, s_skip_log_ms) > 1000u)
+                {
+                  s_skip_log_ms = now ? now : 1u;
+                  LOGI("fs tx skip state=%d ccc=%d conn=%d handle=%d "
+                       "tx_len=%u last=%d",
+                       (int)g_fs.state, g_fs.ccc ? 1 : 0,
+                       g_fs.connected ? 1 : 0,
+                       g_fs.handle != NULL ? 1 : 0,
+                       (unsigned)g_fs.tx_len, g_fs.tx_last ? 1 : 0);
+                }
+
               break;
             }
 
@@ -2484,6 +2565,14 @@ bool companion_fs_pump(void)
 
           /* 成功发出一页：喂卡死看门狗（见函数开头的说明）。 */
           fs_progress_ping();
+          /* 首帧 / 偶发对账：seq 从 0 起或每 32 页打一次。 */
+          if ((g_diag_notify_sent & 31u) == 1u)
+            {
+              LOGI("fs notify ok cmd=0x%02x tid=%u seq=%u flen=%u inflight=%u",
+                   (unsigned)g_fs.cmd, (unsigned)g_fs.tid,
+                   (unsigned)(g_fs.seq > 0 ? g_fs.seq - 1 : 0),
+                   (unsigned)flen, (unsigned)g_fs.inflight);
+            }
         }
       else
         {

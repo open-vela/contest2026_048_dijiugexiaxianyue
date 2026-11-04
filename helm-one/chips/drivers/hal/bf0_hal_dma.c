@@ -7,6 +7,11 @@
 
 #include "bf0_hal.h"
 
+#ifdef __NuttX__
+#  include <nuttx/irq.h>
+#  include <arch/arm_m/nvicpri.h>
+#endif
+
 /** @addtogroup BF0_HAL_Driver
   * @{
   */
@@ -294,7 +299,21 @@ static HAL_StatusTypeDef DMA_AllocChannel(DMA_HandleTypeDef *hdma, bool init)
             DMA_Init(hdma);
         }
         pool[i].handle = hdma;
-        NVIC_SetPriority(irq_type,hdma->Init.IrqPrio);
+        uint32_t irq_prio = hdma->Init.IrqPrio;
+#ifdef __NuttX__
+        /* DMA callbacks can wake NuttX waiters (UART RX -> uart_datareceived
+         * -> nxsem_post -> wd_cancel). Priorities above BASEPRI can preempt
+         * enter_critical_section() and mutate the watchdog list midway.
+         * CMSIS takes an unshifted priority; NuttX's threshold is raw. */
+        const uint32_t min_kernel_prio =
+            NVIC_SYSH_DISABLE_PRIORITY >> (8U - __NVIC_PRIO_BITS);
+
+        if (irq_prio < min_kernel_prio)
+        {
+            irq_prio = min_kernel_prio;
+        }
+#endif
+        NVIC_SetPriority(irq_type, irq_prio);
         HAL_NVIC_EnableIRQ(irq_type);
     }
 
@@ -429,7 +448,18 @@ static void DMA_Start(DMA_HandleTypeDef *hdma, bool InterruptMode)
     /* Configure the source, destination address and the data length & clear flags*/
     DMA_SetConfig(hdma, hdma->SrcAddress, hdma->DstAddress, trans_counts);
 
+    /* 源侧 clean：设备要读内存 ⇒ 脏行必须先落盘（PSRAM_CACHE_WB 下才有效，
+     * 否则 mpu_dcache_clean 是空宏）。
+     *
+     * 目的侧 clean（2026-09-27 补）：设备要写内存时，**目的区间**里 CPU 的脏行
+     * 也必须在起动前落盘 —— 否则它们之后被逐出会把设备写进去的数据盖回去。
+     * ⚠ 这里只做 clean（不丢数据）；**"设备写完之后 CPU 读到旧行"那一半必须由
+     * 驱动在传输完成后自己 invalidate**（HAL 没有完成回调能覆盖 polling 路径）。
+     * 我们树里唯一把 PSRAM 交给 master 写的是 EPIC/画布，它在
+     * `myvendor_epic_blit.c::epic_invalidate_rect_rows()` 里做了。
+     * 审计与缺口清单：docs/psram_cache_wb_audit.md。 */
     mpu_dcache_clean((void *)hdma->SrcAddress, trans_bytes_src);
+    mpu_dcache_clean((void *)hdma->DstAddress, trans_bytes_dst);
 
     if (hdma->SrcInc)
     {
@@ -483,6 +513,47 @@ static uint32_t DMA_GetSrcBytes(DMA_HandleTypeDef *hdma, uint32_t Counts)
     }
 
     if (DMA_PINC_ENABLE == hdma->Init.PeriphInc)
+    {
+        return bytes * Counts;
+    }
+    else
+    {
+        return bytes;
+    }
+}
+
+/**
+  * @brief  目的侧字节数（与 DMA_GetSrcBytes 对称）。
+  * @param  hdma   DMA 句柄（读 Init.MemDataAlignment / Init.MemInc）。
+  * @param  Counts 传输次数（DMA 计数单位）。
+  * @retval 目的缓冲区本次传输涉及的字节数。
+  * @note   用于"设备要写内存"方向在起动前 clean 目的区间：PSRAM 写回模式下，目的区间里
+  *         CPU 的脏行必须先落盘，否则它们之后被逐出会把设备写进去的数据盖回去。
+  * @warning 本函数只解决"脏行回灌"这一半；"设备写完后 CPU 读到旧行"那一半必须由**驱动**
+  *         在传输完成后自行 invalidate（HAL 没有能覆盖 polling 路径的完成回调）。
+  *         审计、缺口清单与已落地的维护点见 docs/psram_cache_wb_audit.md。
+  */
+static uint32_t DMA_GetDstBytes(DMA_HandleTypeDef *hdma, uint32_t Counts)
+{
+    uint32_t bytes;
+    switch (hdma->Init.MemDataAlignment)
+    {
+    case DMA_MDATAALIGN_BYTE:
+        bytes = 1;
+        break;
+    case DMA_MDATAALIGN_HALFWORD:
+        bytes = 2;
+        break;
+    case DMA_MDATAALIGN_WORD:
+        bytes = 4;
+        break;
+    default:
+        bytes = 0;
+        HAL_ASSERT(0);
+        break;
+    }
+
+    if (DMA_MINC_ENABLE == hdma->Init.MemInc)
     {
         return bytes * Counts;
     }
@@ -788,6 +859,8 @@ __HAL_ROM_USED HAL_StatusTypeDef HAL_DMA_Start(DMA_HandleTypeDef *hdma, uint32_t
         DMA_SetConfig(hdma, SrcAddress, DstAddress, Counts);
 
         mpu_dcache_clean((void *)SrcAddress, DMA_GetSrcBytes(hdma, Counts));
+        /* 目的侧 clean：见 DMA_Start 里的说明（设备要写内存时防 CPU 脏行回灌）。 */
+        mpu_dcache_clean((void *)DstAddress, DMA_GetDstBytes(hdma, Counts));
         /* Enable the Peripheral */
         __HAL_DMA_ENABLE(hdma);
 #endif /* DMA_SUPPORT_DYN_CHANNEL_ALLOC */
@@ -867,6 +940,8 @@ __HAL_ROM_USED HAL_StatusTypeDef HAL_DMA_Start_IT(DMA_HandleTypeDef *hdma, uint3
         }
 
         mpu_dcache_clean((void *)SrcAddress, DMA_GetSrcBytes(hdma, Counts));
+        /* 目的侧 clean：见 DMA_Start 里的说明（设备要写内存时防 CPU 脏行回灌）。 */
+        mpu_dcache_clean((void *)DstAddress, DMA_GetDstBytes(hdma, Counts));
 
         /* Enable the Peripheral */
         __HAL_DMA_ENABLE(hdma);

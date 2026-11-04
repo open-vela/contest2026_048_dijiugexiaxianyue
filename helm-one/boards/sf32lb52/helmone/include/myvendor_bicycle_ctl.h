@@ -40,6 +40,7 @@ typedef enum {
     MYVENDOR_BICYCLE_CTL_OP_NAV_STOP,        /**< 忽略 arg。 */
     MYVENDOR_BICYCLE_CTL_OP_NAV_SIM_SPEED,   /**< arg：km/h 字符串，如 "120"。 */
     MYVENDOR_BICYCLE_CTL_OP_MAP_ZOOM,        /**< arg："in"|"out"|"reset"|"z,N"|"s,F"。 */
+    MYVENDOR_BICYCLE_CTL_OP_MAP_ROT,         /**< arg："on"|"off"：航向朝上（地图随骑行方向转）。 */
     MYVENDOR_BICYCLE_CTL_OP_RIDE_START,      /**< 开始记录；套用挂起导航。 */
     MYVENDOR_BICYCLE_CTL_OP_RIDE_STOP,       /**< 停止记录与导航。 */
     MYVENDOR_BICYCLE_CTL_OP_SENSOR_SET,      /**< arg："hr,cad,pwr" 或 "off"。 */
@@ -48,6 +49,7 @@ typedef enum {
     MYVENDOR_BICYCLE_CTL_OP_IDLE_WAKE,       /**< 退出静止休眠。 */
     MYVENDOR_BICYCLE_CTL_OP_IDLE_HOUR,       /**< 立刻耗尽静止 1 小时并关机。 */
     MYVENDOR_BICYCLE_CTL_OP_IDLE_STAY,       /**< arg："on" 本次开机禁止自动静止；"off" 恢复。 */
+    MYVENDOR_BICYCLE_CTL_OP_DEMO,            /**< arg："on"|"off"|"toggle"|"run:<场景名>"|"next"|"prev"|"mode:<模式名>" 演示模式/单场景/循环演示。 */
 } myvendor_bicycle_ctl_op_t;
 
 /**
@@ -65,6 +67,7 @@ typedef enum {
     MYVENDOR_BICYCLE_CTL_STATE_MAP_STYLE = 0,  /**< 当前地图样式名。 */
     MYVENDOR_BICYCLE_CTL_STATE_UI_LOCALE,      /**< 当前 locale。 */
     MYVENDOR_BICYCLE_CTL_STATE_MAP_ZOOM,       /**< 当前缩放描述。 */
+    MYVENDOR_BICYCLE_CTL_STATE_DEMO,           /**< 演示模式："off" 或当前那一步的文案。 */
     MYVENDOR_BICYCLE_CTL_STATE_COUNT,          /**< 状态槽个数。 */
 } myvendor_bicycle_ctl_state_id_t;
 

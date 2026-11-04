@@ -160,7 +160,58 @@ void HAL_PreInit(void)
   HAL_MspInit();
 
 #if defined(CONFIG_BSP_USING_SPI_NAND)
-  /* PSRAM XIP: do not touch MPI1/DLL2 clocks; bootloader left PSRAM @ ~144MHz. */
+  /* ★ 把 PSRAM 总线钉到 DLL2/2 = 144 MHz（官方设计）。
+   *
+   * 出处：`SDK/2.4/docs/source/app_development/startup_flow_sf32lb52x.md` 的时钟表 ——
+   * 内置 PSRAM 走 **DLL2**、固定 **144 MHz**，与大核系统时钟（走 DLL1）解耦；SDK 里
+   * 每一块板也都 `ClockSelect(FLASH1, RCC_CLK_FLASH_DLL2)`。
+   *
+   * 为什么必须由这里补：本配置下 App 的代码**就在 PSRAM 里**（`ld.script` 的
+   * `flash` 区 = `0x10000000` = `HCPU_PSRAM_CODE`），所以只能切**时钟源与分频**，
+   * **绝不能重跑 `HAL_MPI_PSRAM_Init()`** —— 那会 reset 器件、把正在执行的代码抹掉。
+   * 但 bootloader 把 FLASH1 留在了 SYSCLK 上（它的 `bootloader_switch_clock()` 明确
+   * 不选 DLL2：那时 HXT48 还没起），于是 PSRAM 一直跟着 HCLK 从 144 荡到 240，
+   * 而读写延迟码只在开机按低时钟算过一次。
+   *
+   * 延迟码**故意不动**：实测它在 240 MHz 下已经跑得住（代码就是从 PSRAM 取指的，
+   * 读延迟不够会立刻取指错），144 MHz 只会更宽松；而重写 MR0/MR4 的那几行本身
+   * 也在 PSRAM 里（`bf0_hal_mpi_psram.c` 没有 `.ramfunc`），"改读时序的同时从它取指"
+   * 才是真正的风险。**频率一旦固定，"延迟一次算准、全档通用"这个性质就成立了。**
+   *
+   * ★ 为什么 DLL2 取 **240 MHz** 而不是官方的 288：
+   *   OPI 模式下分频恒为 1（`HAL_OPI_PSRAM_Init()` 里写的是常量 1，校准函数
+   *   `HAL_MPI_OPSRAM_CAL_DELAY()` 也只是临时改成 2 再恢复），所以
+   *   `HAL_QSPI_GET_CLK` = DLL2 频率本身。而**读写延迟码只在开机按低时钟算过一次
+   *   （w_lat=3），没人重算** —— 厂商表在等效 144（DLL2 288）那一行要 w_lat=6。
+   *   实测：**DLL2=288 起不来**（板子卡在加载后重启，见下），而 **DLL2=240 与
+   *   改之前 SYSCLK 240/1 的 `HAL_QSPI_GET_CLK` 是同一个数**，等于速度不变、
+   *   只是把时钟源从这个会跟着 HCLK 荡的域换到了一个不动的域。240 也是厂商
+   *   用过的值（`bsp_init.c` 的 USB 分支就 `EnableDLL2(240000000)`）。
+   *
+   * ⚠ **不要碰 `PSCLR`**：曾经在这里写过 `PSCLR = 2`（等效降到 72），那比现在还慢。
+   *   OPI 下它是常量 1，改它等于背离厂商的配置形状。
+   *
+   * 权衡记在这里：想要官方那个等效 144（DLL2 288/1），前提是**把延迟码
+   * 重算成 w_lat=6/r_lat=12**；而重写 MR0/MR4 的那几行本身也在 PSRAM 里
+   * （`bf0_hal_mpi_psram.c` 没有 `.ramfunc`），"改读时序的同时从它取指"是
+   * 另一个量级的风险，没做。
+   *
+   * XT48 由上面的 `BSP_Board_PreInit()` 打开（DLL2 靠它）。失败就维持 bootloader
+   * 留下的 SYSCLK 路径 —— 也就是现状，不会更糟。 */
+  /* If the bootloader already handed off at 240 MHz, FLASH1 is SYSCLK/2 =
+   * 120 MHz and the image is executing from PSRAM.  Switching the MPI1 bus to
+   * DLL2=240 MHz under a live XIP instruction stream kills the fetch right
+   * after the switch (observed: 'ABC' then reset).  Keep the bootloader's
+   * 120 MHz setting in that case; only the 48 MHz boot path needs the switch.
+   */
+  if (HAL_RCC_GetHCLKFreq(CORE_ID_HCPU) < 200000000U)
+    {
+      if (HAL_RCC_HCPU_EnableDLL2(240000000) == HAL_OK)
+        {
+          HAL_RCC_HCPU_ClockSelect(RCC_CLK_MOD_FLASH1, RCC_CLK_FLASH_DLL2);
+        }
+    }
+
   g_psram_ready = true;
 #else
   sifli_psram_preinit();

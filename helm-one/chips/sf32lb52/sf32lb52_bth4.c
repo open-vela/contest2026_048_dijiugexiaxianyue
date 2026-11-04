@@ -152,6 +152,18 @@
 #  define BT_HCI_OP_LE_CONN_UPDATE          BT_OP(BT_OGF_LE, 0x0013)
 #endif
 
+#ifndef BT_HCI_OP_LE_SET_RANDOM_ADDRESS
+#  define BT_HCI_OP_LE_SET_RANDOM_ADDRESS   BT_OP(BT_OGF_LE, 0x0005)
+#endif
+
+#ifndef BT_HCI_OP_LE_SET_ADV_PARAM
+#  define BT_HCI_OP_LE_SET_ADV_PARAM        BT_OP(BT_OGF_LE, 0x0006)
+#endif
+
+#ifndef BT_HCI_OP_LE_SET_ADV_ENABLE
+#  define BT_HCI_OP_LE_SET_ADV_ENABLE       BT_OP(BT_OGF_LE, 0x000a)
+#endif
+
 #ifndef BT_HCI_OP_LE_READ_SUPP_STATES
 #  define BT_HCI_OP_LE_READ_SUPP_STATES     BT_OP(BT_OGF_LE, 0x001c)
 #endif
@@ -188,6 +200,21 @@
 #define SF32LB52_HCI_READ_COMMANDS_RPLEN     65
 #define SF32LB52_HCI_RAND_RPLEN              9
 #define SF32LB52_HCI_MAX_CMD_COMPLETE_RPLEN  SF32LB52_HCI_READ_COMMANDS_RPLEN
+
+/** 控制器解析列表（RAL）容量：**必须与 LCPU 侧配置一致**。
+ *
+ *  来源：`sf32lb52_lcpu_boot.c` 开机下发的
+ *  `act_cfg.ble_max_ral = 3`（`HAL_LCPU_CONFIG_BT_ACT_CFG`），
+ *  与厂商 SDK 里 `peripheral` / `pair` / `file_transfer` 例程的
+ *  `act_cfg.ble_max_ral = 3` 是同一个值（Kconfig `MAX_BLE_RAL` 默认 3）。
+ *
+ *  ⚠ 以前这里报 0（bring-up 期的桩）。zblue 的 `bt_id_add()` 开头就是
+ *  `if (!hdev->le.rl_size || ...) { 只记账; return; }` —— 报 0 等于告诉协议栈
+ *  "控制器不会解析"，于是**每个已绑定设备的 IRK 都从不写给控制器**、
+ *  `LE Set Address Resolution Enable` 也从不打开，手机每次回连的轮换 RPA
+ *  都原样上报给应用 ⇒ 记录/准入永远认不出它、只能靠配对窗口续命。
+ */
+#define SF32LB52_HCI_RL_SIZE                 3
 
 struct sf32lb52_bt_priv_s
 {
@@ -280,6 +307,37 @@ static void sf32lb52_bt_put_le16(uint8_t *data, uint16_t value)
 {
   data[0] = value & 0xff;
   data[1] = value >> 8;
+}
+
+/* HCI 广播三件套的原样解码。定向广播排障只需要这三条：
+ *   0x2006 LE Set Advertising Parameters（type/own/peer/interval）
+ *   0x200a LE Set Advertising Enable（真开还是真关）
+ *   0x2005 LE Set Random Address（RPA/static random 的本地地址）
+ * 命令参数布局见 Core Vol 4 Part E 7.8.5 / 7.8.8 / 7.8.4。 */
+static void sf32lb52_bt_log_adv_cmd(uint16_t opcode, const uint8_t *p,
+                                    size_t plen)
+{
+  if (opcode == BT_HCI_OP_LE_SET_ADV_PARAM && plen >= 15)
+    {
+      syslog(LOG_INFO,
+             "sf32lb52 bth4 adv_param itv=%u/%u type=0x%02x own=0x%02x "
+             "peer_type=0x%02x peer=%02x:%02x:%02x:%02x:%02x:%02x "
+             "ch=0x%02x fp=0x%02x\n",
+             sf32lb52_bt_get_le16(&p[0]), sf32lb52_bt_get_le16(&p[2]),
+             p[4], p[5], p[6],
+             p[12], p[11], p[10], p[9], p[8], p[7],
+             p[13], p[14]);
+    }
+  else if (opcode == BT_HCI_OP_LE_SET_ADV_ENABLE && plen >= 1)
+    {
+      syslog(LOG_INFO, "sf32lb52 bth4 adv_enable=%u\n", p[0]);
+    }
+  else if (opcode == BT_HCI_OP_LE_SET_RANDOM_ADDRESS && plen >= 6)
+    {
+      syslog(LOG_INFO,
+             "sf32lb52 bth4 set_random_addr=%02x:%02x:%02x:%02x:%02x:%02x\n",
+             p[5], p[4], p[3], p[2], p[1], p[0]);
+    }
 }
 
 static bool sf32lb52_bt_is_classic_opcode(uint16_t opcode)
@@ -397,6 +455,15 @@ static void sf32lb52_bt_normalize_event(uint8_t *data, size_t len)
   if (data[1] == BT_HCI_EVT_CMD_COMPLETE && data[2] >= 4)
     {
       opcode = sf32lb52_bt_get_le16(&data[4]);
+      if (opcode == BT_HCI_OP_LE_SET_ADV_PARAM ||
+          opcode == BT_HCI_OP_LE_SET_ADV_ENABLE ||
+          opcode == BT_HCI_OP_LE_SET_RANDOM_ADDRESS)
+        {
+          syslog(LOG_INFO,
+                 "sf32lb52 bth4 adv_cc op=0x%04x status=0x%02x\n",
+                 opcode, len > 6 ? data[6] : 0xff);
+        }
+
       if (sf32lb52_bt_is_classic_opcode(opcode))
         {
           syslog(LOG_INFO,
@@ -422,6 +489,15 @@ static void sf32lb52_bt_normalize_event(uint8_t *data, size_t len)
   else if (data[1] == BT_HCI_EVT_CMD_STATUS && data[2] >= 4)
     {
       opcode = sf32lb52_bt_get_le16(&data[5]);
+      if (opcode == BT_HCI_OP_LE_SET_ADV_PARAM ||
+          opcode == BT_HCI_OP_LE_SET_ADV_ENABLE ||
+          opcode == BT_HCI_OP_LE_SET_RANDOM_ADDRESS)
+        {
+          syslog(LOG_INFO,
+                 "sf32lb52 bth4 adv_cs op=0x%04x status=0x%02x\n",
+                 opcode, data[3]);
+        }
+
       if (sf32lb52_bt_is_classic_opcode(opcode))
         {
           syslog(LOG_INFO,
@@ -689,7 +765,32 @@ static bool sf32lb52_bt_emulate_cmd(struct sf32lb52_bt_priv_s *priv,
       case BT_HCI_OP_READ_SUPPORTED_COMMANDS:
         memset(params, 0, sizeof(params));
         params[0] = SF32LB52_HCI_STATUS_SUCCESS;
+        /* (octet, bit) 索引与 zblue 的 `BT_CMD_TEST(supported_commands, o, b)`
+         * 调用点一一对应 —— 全树只有这两处：
+         *
+         *   (27,7) = HCI_LE_Rand：`hci_core.c:554`（`bt_rand()` 的入口检查）。
+         *            本函数**自己桩了** `LE_Rand`，所以必须报支持，否则
+         *            `bt_rand()` 直接 -ENOTSUP。
+         *
+         *   (39,2) = HCI_LE_Set_Privacy_Mode：`id.c:838`
+         *            （`le_set_privacy_mode()` 的唯一调用点）。**这一位以前是 0**
+         *            ⇒ 该函数开头 `if (!BT_CMD_TEST(...)) { return 0; }` 直接返回，
+         *            **`LE Set Privacy Mode` 从不发给控制器** ⇒ 控制器一直停在复位
+         *            默认的 network privacy mode。
+         *
+         * 补上它的理由：`bt_id_add()` 在把对端 IRK 写进解析列表之后会调
+         * `le_set_privacy_mode(…, DEVICE)`，厂商 `connection_manager` 的
+         * `update_resolving_list()` 同样用 `priv_mode = 1`（device）。
+         * 现场（2026-09-23 17:0x）解析列表已写入且解析已使能
+         * （日志可见 `op=0x2027` / `op=0x202d`），但连接完成事件仍报 RPA
+         * （`conn … atype=1 peer=5e:…`）—— 这是与厂商参考剩下的最后一处差异。
+         *
+         * 安全性：`(39,2)` 全树只有 `le_set_privacy_mode()` 一个消费者，与
+         * `(27,7)` 不相干。LCPU 若不支持该命令，`bt_id_add()` 只走
+         * `LOG_ERR` + `goto done`，解析列表条目**已经在**、解析使能照旧执行。
+         */
         params[1 + 27] = 1 << 7;
+        params[1 + 39] = 1 << 2;
         *ret = sf32lb52_bt_synth_cmd_complete(priv, opcode, params,
                                               SF32LB52_HCI_READ_COMMANDS_RPLEN);
         return true;
@@ -718,8 +819,30 @@ static bool sf32lb52_bt_emulate_cmd(struct sf32lb52_bt_priv_s *priv,
       case BT_HCI_OP_LE_READ_LOCAL_FEATURES:
         memset(params, 0, 9);
         params[0] = SF32LB52_HCI_STATUS_SUCCESS;
-        /* enc, conn-param, ext-reject, slave-features, ping, DLE */
-        params[1] = 0x3f;
+        /* enc, conn-param, ext-reject, slave-features, ping, DLE, **LL Privacy**
+         *
+         * ⚠ bit6（LL Privacy，`BT_LE_FEAT_BIT_PRIVACY = 6`）以前是 0，与
+         * `LE Read Resolving List Size` 报 0 是**同一处 bring-up 期的保守桩**，
+         * 而且这两条必须一起改、只改一条没用：
+         *
+         *   zblue 的 `le_init()` 里整段隐私初始化（含读 RAL 容量）被
+         *   `if (BT_FEAT_LE_PRIVACY(hdev->le.features))` 包着。
+         *   bit6 为 0 ⇒ `LE Read Resolving List Size` **根本不会发出去** ⇒
+         *   `hdev->le.rl_size` 永远是 0 ⇒ `bt_id_add()` 走"主机侧解析"早退 ⇒
+         *   已绑定设备的 IRK 从不写进控制器解析列表 ⇒ 手机每次回连上报的都是
+         *   轮换 RPA（现场：`bt_keys kv: … -> RAL rl_size=0`）。
+         *
+         * 控制器确实支持：板上给 LCPU 配了 `ble_max_ral = 3`
+         * （`sf32lb52_lcpu_boot.c`），厂商 `example/ble/*` 也是同一个值。
+         *
+         * 打开它只多三件事，都已核过是安全的：
+         *   · `LE Set RPA Timeout` —— 本函数已有桩（回 success，不转给 LCPU）；
+         *   · `LE Read Resolving List Size` —— 本函数回 3（目标）；
+         *   · 事件掩码里的 `ENH_CONN_COMPLETE` —— 但 `LE Set Event Mask` 也被
+         *     本函数吞掉了，控制器照旧发 legacy 连接完成事件，而 zblue 是按
+         *     **实际收到的子事件**分发的（`le_meta_event()`），两种都认 ⇒
+         *     连接事件格式不变，`conn st=… peer=…` 那行诊断照旧。 */
+        params[1] = 0x7f;
         /* LE 2M PHY */
         params[2] = 0x01;
         *ret = sf32lb52_bt_synth_cmd_complete(priv, opcode, params, 9);
@@ -746,8 +869,18 @@ static bool sf32lb52_bt_emulate_cmd(struct sf32lb52_bt_priv_s *priv,
         return true;
 
       case BT_HCI_OP_LE_READ_RL_SIZE:
+        /* 报真实容量（见 SF32LB52_HCI_RL_SIZE 注释）。回报里它就一个字节，
+         * 之后 zblue 会依次发 LE Add Device To Resolving List（每把已存 IRK
+         * 一条）、LE Set Privacy Mode(=device)、LE Set Address Resolution
+         * Enable —— 这三条本函数不拦，原样转给 LCPU。
+         *
+         * 自证伪：若 LCPU 其实不支持，日志会成片出现
+         *   `Failed to add IRK to controller` / `Failed to set privacy mode`
+         * 且手机侧地址仍是轮换 RPA（`ctl pair phone` 里 type=1 每次都在变）
+         * ⇒ 那时说明容量该报 0，把本行改回去。
+         */
         params[0] = SF32LB52_HCI_STATUS_SUCCESS;
-        params[1] = 0;
+        params[1] = SF32LB52_HCI_RL_SIZE;
         *ret = sf32lb52_bt_synth_cmd_complete(priv, opcode, params, 2);
         return true;
 
@@ -919,6 +1052,10 @@ static int sf32lb52_bt_send(struct bt_driver_s *drv,
   if (type == BT_CMD && len >= sizeof(struct bt_hci_cmd_hdr_s))
     {
       opcode = sf32lb52_bt_get_le16(data);
+      sf32lb52_bt_log_adv_cmd(opcode,
+                              ((const uint8_t *)data) +
+                                sizeof(struct bt_hci_cmd_hdr_s),
+                              len - sizeof(struct bt_hci_cmd_hdr_s));
       if (sf32lb52_bt_emulate_cmd(priv, opcode, &ret))
         {
           return ret < 0 ? ret : len;

@@ -35,6 +35,7 @@
 #include "myvendor_mtp.h"
 #include "myvendor_gnss.h"
 #include "myvendor_sys.h"
+#include "sf32lb_dvfs.h"
 #include "myvendor_usbdev.h"
 #include "myvendor_watchdog.h"
 
@@ -69,6 +70,8 @@ static bool g_notif = true;  /**< 默认接受手机通知。 */
 static bool g_calls;         /**< 默认不只过滤来电。 */
 static bool g_sound = true;  /**< 默认开蜂鸣器。 */
 static bool g_autopause = true; /**< 默认开骑行自动暂停。 */
+/** @brief 默认关：正北朝上 + 文字烘进底图（性能最好）。 */
+static bool g_map_heading_up;
 static int32_t g_last_ride_m;   /**< 上次保存骑行里程，米。 */
 static int32_t g_last_lon_e7;   /**< 上次骑行终点经度 ×1e7。 */
 static int32_t g_last_lat_e7;   /**< 上次骑行终点纬度 ×1e7。 */
@@ -80,6 +83,9 @@ static int16_t g_tz_min = MYVENDOR_DEVCTL_TZ_DEFAULT;  /**< 时区分钟。 */
 static int g_bat_full_mv = MYVENDOR_DEVCTL_BAT_FULL_DEFAULT; /**< 100% 毫伏。 */
 static bool g_bat_full_have; /**< persist.battery.full_mv 是否已有合法值。 */
 static uint8_t g_log_mask = MYVENDOR_DEVCTL_LOG_DEFAULT; /**< syslog 屏蔽位。 */
+/** 「充电时也按负载动态调频」模式（见 `sf32lb_dvfs.h` / `MYVENDOR_DEVCTL_DVFS_CHARGE_DYN_KEY`）。 */
+static bool g_dvfs_charge_dyn;
+static uint32_t g_diag_cnt_mask = 0xffffffffu; /**< 周期计数器报表开关，位序见 diag。 */
 
 static pthread_mutex_t g_srec_lock = PTHREAD_MUTEX_INITIALIZER;
 static myvendor_devctl_sensor_rec_t g_srec[MYVENDOR_DEVCTL_SENSOR_REC_MAX];
@@ -299,6 +305,135 @@ static int persist_set_i32(const char *key, int32_t v)
 
   close(fd);
   return 0;
+}
+
+/** @brief 把字符串写进 persist 文件，**按 KVDB 约定带上结尾 NUL**。
+ *
+ *  KVDB 的字符串值是 `property_set` 写出来的：`strlen+1`（**含 NUL**）。
+ *  bootloader 侧同样是这个口径（`boot_target.c` 的
+ *  `boot_lfs_put(path, buf, n + 1u)`，注释原文
+ *  "match property_set strlen+1"），所以这里必须一致 ——
+ *  原来那个 `persist.boot.target` 是 **3 字节**，正是 `fw\0`。
+ *
+ *  两边读的时候都会 trim（`boot_target.c` 的 `trim_val()` 会把结尾的
+ *  `\0`/`\n`/空格都剪掉再 `strcmp`），所以少一个 NUL 也能读；
+ *  但**写就得按约定写**，免得将来有人加严格解析时被这个差异坑到。 */
+static int persist_set_str(const char *key, const char *s)
+{
+  char path[80];
+  int fd;
+  size_t n;
+
+  if (key == NULL || key[0] == '\0' || s == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if (persist_ensure_db() < 0)
+    {
+      int err = errno;
+
+      syslog(LOG_WARNING, "ctl: persist mkdir %s errno=%d", DEVCTL_KV_DB_PATH,
+             err);
+      return -err;
+    }
+
+  persist_make_path(path, sizeof(path), key);
+  n = strlen(s) + 1u;            /* +1 = 结尾 NUL，见上面的约定 */
+  fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0)
+    {
+      int err = errno;
+
+      syslog(LOG_WARNING, "ctl: persist %s failed errno=%d", key, err);
+      return -err;
+    }
+
+  if (write(fd, s, n) != (ssize_t)n)
+    {
+      int err = errno;
+
+      syslog(LOG_WARNING, "ctl: persist %s write errno=%d", key, err);
+      close(fd);
+      return -err;
+    }
+
+  close(fd);
+  return 0;
+}
+
+/** @brief 读 persist 文件里的字符串，去掉行尾空白。成功为 true。 */
+static bool persist_get_str(const char *key, char *out, size_t n)
+{
+  ssize_t got;
+  int fd;
+  char *p;
+
+  if (key == NULL || key[0] == '\0' || out == NULL || n < 2u)
+    {
+      return false;
+    }
+
+  fd = persist_open_ro(key);
+  if (fd < 0)
+    {
+      return false;
+    }
+
+  got = read(fd, out, n - 1u);
+  close(fd);
+  if (got <= 0)
+    {
+      return false;
+    }
+
+  out[got] = '\0';
+
+  /* 写进去时没带换行，但文件可能是手工改的（或旧版带过）—— 统一修剪，
+   * 否则 `ctl boot` 打印出来会多一截空白，比对时也对不上。 */
+  for (p = out; *p != '\0'; p++)
+    {
+      if (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t')
+        {
+          *p = '\0';
+          break;
+        }
+    }
+
+  return out[0] != '\0';
+}
+
+/** @brief 槽位名是否合法：`fw` / `main` / `factory`。
+ *
+ *  **必须用 `strcmp`（大小写敏感）与 `boot_target.c` 的 `boot_target_parse()`
+ *  同口径**：bootloader 那边是 `if (strcmp(s, "fw") == 0) …`。放 `FW` 进去它
+ *  认不出 ⇒ `BOOT_TARGET_NONE` ⇒ **静默退回默认链**，表现就是"我明明设了却没
+ *  生效" —— 这是最不值得花时间查的一类症状，所以在入口就拒掉。
+ *
+ *  **故意不收 `boot` / `msh`**（bootloader 那个解析器收）：那是"停在 2SFBL 的
+ *  msh、不进应用"的调试档。放进来只会让人误设成一块开不了机的板子；它属于
+ *  bootloader 自己的 msh `target` 命令，不该由应用侧的 ctl 暴露。
+ */
+static bool boot_target_known(const char *t)
+{
+  return strcmp(t, "fw") == 0 ||
+         strcmp(t, "main") == 0 ||
+         strcmp(t, "factory") == 0;
+}
+
+bool myvendor_devctl_boot_target_get(char *out, size_t n)
+{
+  return persist_get_str(MYVENDOR_DEVCTL_BOOT_TARGET_KEY, out, n);
+}
+
+int myvendor_devctl_boot_target_set(const char *target)
+{
+  if (target == NULL || !boot_target_known(target))
+    {
+      return -EINVAL;
+    }
+
+  return persist_set_str(MYVENDOR_DEVCTL_BOOT_TARGET_KEY, target);
 }
 
 static bool srec_addr_empty(const uint8_t *addr)
@@ -787,12 +922,34 @@ void myvendor_devctl_load(void)
 
   nx_setlogmask((int)g_log_mask);
 
+  /* 充电动态调频模式：从 KV 恢复（`ctl dvfs charge on` 会落盘）。
+   * 放在这里而不是 DVFS 自己里：持久化的 owner 是 devctl（同 log mask）。
+   * 此时 DVFS 可能还没 `sf32lb_dvfs_boot()`（`g_applied_mhz == 0`），
+   * setter 内部只记标志、不强行切频 —— boot 时会自然带上这个档位。 */
+  if (!myvendor_is_factory())
+    {
+      g_dvfs_charge_dyn =
+        persist_get_i32(MYVENDOR_DEVCTL_DVFS_CHARGE_DYN_KEY, 0) != 0;
+      (void)sf32lb_dvfs_charge_dyn_set(g_dvfs_charge_dyn);
+
+      /* 周期计数器报表的开关（`ctl cnt`）。缺省 **全开** ⇒ fallback 取 -1 再翻成
+       * 0xffffffff —— 0 是"全关"这个**合法值**，不能拿它当"没配过"。 */
+      {
+        extern void myvendor_diag_cnt_mask_set(uint32_t mask);
+        int32_t m = persist_get_i32(MYVENDOR_DEVCTL_DIAG_CNT_KEY, -1);
+
+        g_diag_cnt_mask = (m < 0) ? 0xffffffffu : (uint32_t)m;
+        myvendor_diag_cnt_mask_set(g_diag_cnt_mask);
+      }
+    }
+
   bl = persist_get_i32(MYVENDOR_DEVCTL_BL_KEY, (int32_t)MYVENDOR_DEVCTL_BL_DEFAULT);
   sensor = persist_get_i32(MYVENDOR_DEVCTL_SENSOR_KEY, 1);
   notif = persist_get_i32(MYVENDOR_DEVCTL_NOTIF_KEY, 1);
   calls = persist_get_i32(MYVENDOR_DEVCTL_CALLS_KEY, 0);
   sound = persist_get_i32(MYVENDOR_DEVCTL_SOUND_KEY, 1);
   autopause = persist_get_i32(MYVENDOR_DEVCTL_AUTOPAUSE_KEY, 1);
+  g_map_heading_up = persist_get_i32(MYVENDOR_DEVCTL_MAP_UP_KEY, 0) != 0;
   g_last_ride_m = persist_get_i32(MYVENDOR_DEVCTL_LAST_RIDE_M_KEY, 0);
   if (g_last_ride_m < 0)
     {
@@ -1091,65 +1248,113 @@ uint32_t myvendor_devctl_pair_window_left_ms(void)
 }
 
 /**
- * @brief 读"已绑定手机"记录，判断这台手机是不是配过、并把地址带出来。
- *
- * 记录文件 `/mnt/kv/bt_phone.tsv` 一行 `ADDR<TAB>TYPE`，这里取 TAB 之前那段；
- * 空行 / 坏行都当"没配对"。
- *
- * @param addr 可选；非空时写入地址文本（NUL 结尾）。
- * @param len  addr 缓冲长度。
- * @return 1 = 有记录；0 = 没记录 / 读不到（首启文件不存在是正常的）。
+ * @brief 读已绑定手机列表（最多 3 行 `ADDR<TAB>TYPE`）。
  */
-int myvendor_devctl_pair_phone(char *addr, size_t len)
+unsigned myvendor_devctl_pair_phone_count(void)
 {
-  /* 直接读设备侧那份记录（companion 也是读它）：UI 只关心"有没有 + 地址"。
-   * 文件一行 `ADDR<TAB>TYPE`，这里取 TAB 之前那段。 */
   FILE *f = fopen("/mnt/kv/bt_phone.tsv", "r");
   char  line[64];
+  unsigned n = 0;
 
-  if (f == NULL) {
-    return 0;
-  }
+  if (f == NULL)
+    {
+      return 0u;
+    }
 
-  if (fgets(line, sizeof(line), f) == NULL) {
-    fclose(f);
-    return 0;
-  }
-  fclose(f);
+  while (n < 3u && fgets(line, sizeof(line), f) != NULL)
+    {
+      if (line[0] == '\0' || line[0] == '\n' || line[0] == '\r')
+        {
+          continue;
+        }
 
-  /* 空行/坏行也算没配对。 */
-  if (line[0] == '\0' || line[0] == '\n' || line[0] == '\r') {
-    return 0;
-  }
-
-  if (addr != NULL && len > 0u) {
-    size_t n = 0;
-
-    while (line[n] != '\0' && line[n] != '\t' && line[n] != '\n'
-           && line[n] != '\r' && n + 1u < len) {
-      addr[n] = line[n];
       n++;
     }
-    addr[n] = '\0';
-  }
 
-  return 1;
+  fclose(f);
+  return n;
+}
+
+int myvendor_devctl_pair_phone_at(unsigned idx, char *addr, size_t len)
+{
+  FILE *f = fopen("/mnt/kv/bt_phone.tsv", "r");
+  char  line[64];
+  unsigned n = 0;
+
+  if (f == NULL)
+    {
+      return 0;
+    }
+
+  while (fgets(line, sizeof(line), f) != NULL)
+    {
+      if (line[0] == '\0' || line[0] == '\n' || line[0] == '\r')
+        {
+          continue;
+        }
+
+      if (n == idx)
+        {
+          size_t i = 0;
+
+          fclose(f);
+          if (addr != NULL && len > 0u)
+            {
+              while (line[i] != '\0' && line[i] != '\t' && line[i] != '\n'
+                     && line[i] != '\r' && i + 1u < len)
+                {
+                  addr[i] = line[i];
+                  i++;
+                }
+
+              addr[i] = '\0';
+            }
+
+          return 1;
+        }
+
+      n++;
+    }
+
+  fclose(f);
+  return 0;
 }
 
 /**
- * @brief 解除与手机的绑定（设备 UI 长按右键 → 解除绑定 / app 的控制帧）。
- *
- * 同样是投命令：真正的 `bt_unpair` + 删记录 + 关窗都由 companion 线程执行
- * （`myvendor_pair_unbind_poll()`）。
- *
- * @return 0 = 已投递；-ENOTSUP = 本固件没编 companion。
+ * @brief 读第一台已绑定手机（兼容）。
+ */
+int myvendor_devctl_pair_phone(char *addr, size_t len)
+{
+  return myvendor_devctl_pair_phone_at(0u, addr, len);
+}
+
+/**
+ * @brief 解除全部手机绑定。
  */
 int myvendor_devctl_pair_unbind(void)
 {
 #ifdef CONFIG_MYVENDOR_BLE_COMPANION
+  companion_bridge_sensor_cmd_set_pair_unbind_slot(0xffu);
   companion_bridge_sensor_cmd_post(COMPANION_TEST_PAIR_UNBIND);
   return 0;
 #else
+  return -ENOTSUP;
+#endif
+}
+
+int myvendor_devctl_pair_unbind_at(unsigned idx)
+{
+#ifdef CONFIG_MYVENDOR_BLE_COMPANION
+  if (idx > 2u)
+    {
+      return -EINVAL;
+    }
+
+  companion_bridge_sensor_cmd_set_pair_unbind_slot((uint8_t)idx);
+  companion_bridge_sensor_cmd_post(COMPANION_TEST_PAIR_UNBIND);
+  return 0;
+#else
+  (void)idx;
   return -ENOTSUP;
 #endif
 }
@@ -1399,6 +1604,20 @@ bool myvendor_devctl_autopause_get(void)
   return g_autopause;
 }
 
+int myvendor_devctl_map_heading_up_set(bool on)
+{
+  ensure_loaded();
+  g_map_heading_up = on;
+  persist_set_i32(MYVENDOR_DEVCTL_MAP_UP_KEY, on ? 1 : 0);
+  return 0;
+}
+
+bool myvendor_devctl_map_heading_up_get(void)
+{
+  ensure_loaded();
+  return g_map_heading_up;
+}
+
 void myvendor_devctl_last_ride_m_set(int32_t m)
 {
   ensure_loaded();
@@ -1573,6 +1792,73 @@ uint8_t myvendor_devctl_log_mask_get(void)
 {
   ensure_loaded();
   return g_log_mask;
+}
+
+int myvendor_devctl_dvfs_charge_dyn_set(bool on)
+{
+  int ret;
+
+  ensure_loaded();
+
+  /* 先改运行期再落盘（同 log mask 的取舍）：写盘失败也保留本次生效的行为。 */
+  (void)sf32lb_dvfs_charge_dyn_set(on);
+  g_dvfs_charge_dyn = on;
+
+  /* 工厂固件不回写：KV 里那份是产品侧调的，产测改了会跟着产品固件一起带走
+   * （跟 log mask / mtp / radio 同一个理由）。 */
+  if (myvendor_is_factory())
+    {
+      return 0;
+    }
+
+  ret = persist_set_i32(MYVENDOR_DEVCTL_DVFS_CHARGE_DYN_KEY, on ? 1 : 0);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ctl: dvfs charge-dyn %d not persisted (%d)",
+             on ? 1 : 0, ret);
+    }
+
+  return ret;
+}
+
+bool myvendor_devctl_dvfs_charge_dyn_get(void)
+{
+  ensure_loaded();
+  return g_dvfs_charge_dyn;
+}
+
+uint32_t myvendor_devctl_diag_cnt_mask_get(void)
+{
+  ensure_loaded();
+  return g_diag_cnt_mask;
+}
+
+int myvendor_devctl_diag_cnt_mask_set(uint32_t mask)
+{
+  extern void myvendor_diag_cnt_mask_set(uint32_t mask);
+
+  int ret;
+
+  ensure_loaded();
+
+  /* 先改运行期再落盘（同 log mask / dvfs charge 的取舍）：写盘失败也保留本次行为。 */
+  myvendor_diag_cnt_mask_set(mask);
+  g_diag_cnt_mask = mask;
+
+  /* 工厂固件不回写：KV 里那份是产品侧调的（同 log mask / mtp / radio 的理由）。 */
+  if (myvendor_is_factory())
+    {
+      return 0;
+    }
+
+  ret = persist_set_i32(MYVENDOR_DEVCTL_DIAG_CNT_KEY, (int32_t)mask);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ctl: diag cnt mask 0x%lx not persisted (%d)",
+             (unsigned long)mask, ret);
+    }
+
+  return ret;
 }
 
 static bool favorite_coord_parse(const char *text, double min, double max,

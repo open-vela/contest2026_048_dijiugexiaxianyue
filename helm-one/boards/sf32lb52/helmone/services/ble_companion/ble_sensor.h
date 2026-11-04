@@ -51,8 +51,9 @@ void ble_sensor_pump(uint32_t now_ms);
 /**
  * @brief 反馈手机链路与手机广播 hold 状态，驱动 ADV / observer 时间片。
  *
- * 只从 companion 线程调用。手机已连接时 observer 可连续运行；手机未连接
- * 且 sensor 待重连时，observer 与可发现广播互斥轮换。
+ * 只从 companion 线程调用。手机已连接：无手机 ADV，sensor 侧仍按
+ * 4 s 静默 + 0.8 s 短扫间隔找表。手机未连接且有待重连 sensor：与可发现
+ * 广播互斥轮换（先 15 s 只广播）。
  * @param connected 手机 Companion GATT 链路是否已建立。
  * @param adv_held companion 是否已消费“停手机广播”请求。
  */
@@ -76,7 +77,7 @@ void ble_sensor_set_adv_debug(bool enable);
  */
 void ble_sensor_scan_arm(uint32_t timeout_ms);
 
-/** 回到"全量扫描"60 s 窗口（掉线 / 界面上点连接 / 收到开启扫描时调用）。 */
+/** 尽快开一轮短扫（掉线 / 界面点连接；手机优先 15 s 内则排队到其后）。 */
 void ble_sensor_scan_burst(void);
 
 /**

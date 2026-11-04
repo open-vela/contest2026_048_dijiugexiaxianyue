@@ -64,7 +64,7 @@ CONFIG_MYVENDOR_MTP_PSRAM_RESERVE_KB=192
 
 产品名 / 版本 / 厂商只改 Kconfig `CONFIG_MYVENDOR_PRODUCT_*`。USB iProduct、MTP 型号和产品盘卷标在开机后都会变成 **`Helm One-XXXX`**（与 BLE 广播名相同，XXXX 为 MAC 后两字节）。工厂固件三个盘在主机上叫 **file**（`/mnt/lfs`）、**kv**（`/mnt/kv`）和 **fat**（`/mnt/fat`）。
 
-工厂拷文件：**不要**在 2SFBL 里开 MTP。msh `factory`（调试 boot 会自动跳）进 `nsh-factory`：MTP 挂 **全盘** `/mnt/lfs`、`/mnt/kv` 和 `/mnt/fat`。地图拷到 **fat 卷的 `map/`**（`lon*/…`），字体拷到 **`fonts/`**。把产品 `<version>.bin` 放到 **KV 卷的 `fw/`**（见 [fs_firmware.md](../../../../docs/fs_firmware.md)）。产品 `nsh` 只挂 `/mnt/lfs/mtp`，**看不到** 固件槽和地图。再加盘：Kconfig `EXTRA_PATHS` 追加路径，必要时在 `mtp_storage.c` `g_known[]` 补一行。思路见 [docs/factory_firmware.md](../../../../docs/factory_firmware.md)。
+工厂拷文件：**不要**在 2SFBL 里开 MTP。msh `factory`（调试 boot 会自动跳）进 `nsh-factory`：MTP 挂 **全盘** `/mnt/lfs`、`/mnt/kv` 和 `/mnt/fat`。地图拷到 **fat 卷的 `map/`**（`lon*/…`），字体拷到 **`fonts/`**。把产品 `<version>.bin` 放到 **KV 卷的 `fw/`**（见 [fs_firmware.md](../../../../../docs/fs_firmware.md)）。产品 `nsh` 只挂 `/mnt/lfs/mtp`，**看不到** 固件槽和地图。再加盘：Kconfig `EXTRA_PATHS` 追加路径，必要时在 `mtp_storage.c` `g_known[]` 补一行。思路见 [docs/factory_firmware.md](../../../../../docs/factory_firmware.md)。
 
 ## 配置分工
 
@@ -156,13 +156,13 @@ Nautilus（gvfs + libmtp）和资源管理器走的协议路径不同，多选�
 - **GetObjectPropList(0xFFFFFFFF)**：libmtp 启动时会拉全部对象属性。只回 `INVALID_OBJ_HANDLE`（无 DATA）会把 bulk 会话打乱，随后「无法多选 / 无法列出」。现在始终带 DATA 阶段。
 - **ObjectAdded**：`SendObject` 成功后不再发中断事件。gvfs 的事件线程和传输线程共用 libmtp，中断 IN 会和下一个文件的 bulk 命令打架。Windows「新建空文件/文件夹」仍在 `SendObjectInfo` 后发 `ObjectAdded`。
 - **CopyObject**：跨目录复制保留原名（仅重名时加 `_copy`），响应带新 handle。
-- **上传（2026-09-07）**：USB 先收完再回 `0x100d`（≤2 MiB）；LittleFS 后台写，列目录不要去 `opendir` 抢锁。详见 [docs/debug/mtp_upload.md](../../../../docs/debug/mtp_upload.md)。
+- **上传（2026-09-07）**：USB 先收完再回 `0x100d`（≤2 MiB）；LittleFS 后台写，列目录不要去 `opendir` 抢锁。详见 [docs/debug/mtp_upload.md](../../../../../docs/debug/mtp_upload.md)。
 
 ## 已知异常（先查镜像和 SD，再查 MTP）
 
 MTP 能枚举、主机能看见设备，**不等于**协议或 USB 有问题。2026-08-23 实测：
 文件夹/文件「打不开」是 **SD 上的 LittleFS 仍是旧几何镜像**，重打包刻录后即恢复。
-镜像几何与打包命令见 [docs/debug/mklfs.md](../../../../docs/debug/mklfs.md) 第 8 节。
+镜像几何与打包命令见 [docs/debug/mklfs.md](../../../../../docs/debug/mklfs.md) 第 8 节。
 
 ### 设备可见但文件夹打不开 / 极慢
 
@@ -170,7 +170,7 @@ MTP 能枚举、主机能看见设备，**不等于**协议或 USB 有问题。2
 
 | 项 | 错误（旧） | 正确（当前 SD） |
 |----|------------|-----------------|
-| `my_vendor_sd.img` | ~33–34 MiB（2026-08-11） | ~9.7–10 MiB |
+| `helmone_sd.img` | ~33–34 MiB（2026-08-11） | ~9.7–10 MiB |
 | LittleFS 几何 | read/prog=2048，block=131072（NAND） | **512 / 4096**，blocks=1047040 |
 | 典型内容 | 同一棵 `mkfs/`（约 610 个小文件） | 同左，元数据不再按 128 KiB 块放大 |
 
@@ -200,7 +200,7 @@ LittleFS 的 `statfs`/`statvfs` 会走 `lfs_fs_size()`，把**每个已用块**�
 
 ### 上传慢、下载还可以
 
-分层看，不要只改 `g_io_buf`。完整记录：[docs/debug/mtp_upload.md](../../../../docs/debug/mtp_upload.md)。
+分层看，不要只改 `g_io_buf`。完整记录：[docs/debug/mtp_upload.md](../../../../../docs/debug/mtp_upload.md)。
 
 - **读 / 下载**：CMD17/CMD18 + DMA（DMAC1 CH3 / REQUEST_57）。裸读约 3 MB/s；经
   LittleFS 约 1 MB/s。USB FS 实务大约 1 MB/s，下载往往先碰到 USB。
@@ -220,7 +220,7 @@ POSIX/LFS 卡住时 MTP 同样答不了 EP0——这是存储路径堵住协议�
 - ERR/WARNING 恒开：`mtp_err` / `LOG_ERR`。
 - 详细 trace：将 `MTP_FEAT_VERBOSE` 设为 `1`（会镜像到 `/dev/console`，可能与 NSH 串口混用）。
 - SD 计数：`SDDIAG` / `test sdio`（`cmd18_ok` / `cmd25_ok` 上传时应增加）。
-- 上传时序与 gvfs 超时：[docs/debug/mtp_upload.md](../../../../docs/debug/mtp_upload.md)。
+- 上传时序与 gvfs 超时：[docs/debug/mtp_upload.md](../../../../../docs/debug/mtp_upload.md)。
 
 ## 与 full mtp-responder 对比
 

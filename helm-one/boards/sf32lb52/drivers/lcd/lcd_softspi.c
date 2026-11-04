@@ -1,5 +1,5 @@
 /****************************************************************************
- * vendor/my_vendor/boards/sf32lb52/drivers/lcd/lcd_softspi.c
+ * vendor/HelmOne/boards/sf32lb52/drivers/lcd/lcd_softspi.c
  *
  * GPIO bit-bang SPI for TK024F3036 (ST7789S) timing bring-up.
  * Matches vendor STM32 HAL SPI mode 3 (CPOL=1, CPHA=2nd edge).

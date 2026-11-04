@@ -740,6 +740,32 @@ menu "On-chip Peripheral RTOS Drivers"
                     kumm is 1 MiB. LVGL image cache (1 MiB) and map arenas
                     allocate from this pool.
 
+            config MYVENDOR_PSRAM_CACHE_WB
+                bool "PSRAM data cache write-back (global)"
+                default n
+                depends on BSP_USING_PSRAM
+                ---help---
+                    Build the arch/HAL targets with PSRAM_CACHE_WB: the whole
+                    PSRAM window (0x60000000-0x61FFFFFF) turns write-back
+                    instead of write-through.
+
+                    Why: store throughput. Write-through costs ~22 cycles per
+                    byte (every store goes to the bus); write-back lets the
+                    core D-cache absorb them. Measured on the "nationwide hop"
+                    workload (bicycle_nsh gnss hop): the CPU copy/scroll
+                    segment cyc_begin drops 40%, cold tile load 28%, while
+                    tile rasterization (457 KB canvas vs 16 KB D-cache) barely
+                    moves.
+
+                    Cost: every non-CPU master touching PSRAM needs cache
+                    maintenance (clean before it reads, invalidate after it
+                    writes). That work is done and the evidence is in
+                    docs/psram_cache_wb_audit.md: EPIC output is invalidated
+                    per written row (myvendor_epic_blit.c) and the generic DMA
+                    destination is cleaned (bf0_hal_dma.c). To get a
+                    write-through baseline for A/B, drop this line from the
+                    defconfig and force a reconfigure (see the audit doc).
+
             comment "Product identity (USB / MTP / BLE / OVNX wrap)"
 
             config MYVENDOR_PRODUCT_NAME
@@ -755,7 +781,7 @@ menu "On-chip Peripheral RTOS Drivers"
 
             config MYVENDOR_PRODUCT_VERSION
                 string "Product version (X.Y.Z)"
-                default "1.4.0"
+                default "1.4.2"
                 ---help---
                     MTP DeviceInfo version, OVNX header, and firmware slot
                     filename. wrap reads this from defconfig. Bump here when
@@ -897,8 +923,14 @@ menu "On-chip Peripheral RTOS Drivers"
 
             config MYVENDOR_WATCHDOG_HEARTBEAT_MS
                 int "Max idle/work/UI heartbeat age milliseconds"
-                default 10000
+                default 30000
                 range 500 30000
+                ---help---
+                    心跳"过期"门限。旧稳定版（tag zcode-pre-rollback-20260925）
+                    是 30000，后来收紧到 10000；收紧后一次 SD 卡变哑的正常恢复
+                    （实测重识别 18.4 s）被判成"系统卡死"并停喂狗 → 15 s 后硬件
+                    复位。回到 30000 让这类长阻塞能被容忍（期间照常喂狗，只是
+                    画面顿一下）。真正的永久卡死仍会在 30 s 后停喂并落 coredump。
 
             config MYVENDOR_WATCHDOG_UI_GRACE_MS
                 int "Wait for first UI beat when bicycle autostarts"
@@ -924,11 +956,14 @@ menu "On-chip Peripheral RTOS Drivers"
             if MYVENDOR_COREDUMP
             config MYVENDOR_COREDUMP_KEEP
                 int "Crash notes to keep"
-                default 20
+                default 10
                 range 2 32
                 ---help---
                     Keep this many /mnt/kv/coredump/nNNN_*.txt files.
-                    Older notes are deleted when a new crash is saved.
+                    Older notes are deleted when a new crash is saved, and on
+                    boot / periodically by `myvendor_coredump_prune()`.
+                    2026-09-25: default 20 -> 10, to match the diag side
+                    (`DIAGLOG_KEEP = 10`) as the user asked: keep 10 each.
             endif
 
             config MYVENDOR_SCHEDMON_LOG
@@ -1066,6 +1101,34 @@ menu "On-chip Peripheral RTOS Drivers"
                     current draw.  Rounded down to the 0.625 ms unit the
                     controller uses.
 
+            config MYVENDOR_BLE_DIRECTED_ADV
+                bool "Directed advertising to the bonded phone"
+                default n
+                ---help---
+                    Outside the pairing window, when a bonded phone exists,
+                    start ADV_DIRECT_IND (low duty) with own_addr_type=PUBLIC
+                    (the bike's identity address) and TargetA = the phone's
+                    most recent RPA, captured from its last connection
+                    (bt_conn_get_info().le.remote).
+
+                    Both alternatives were tested and do NOT work on this
+                    phone/controller: TargetA = identity address (the phone
+                    uses an RPA and never connects) and own_addr_type=RANDOM
+                    with DIR_ADDR_RPA (the phone's background auto-connect
+                    only recognizes the bike's public AdvA).
+
+                    RPA lifetime is limited (phone rotates it, typically
+                    15 min).  If no fresh RPA is cached, the RPA is older than
+                    10 min, the controller rejects the directed parameters, or
+                    the phone does not connect within 60 s, the advertiser
+                    falls back to undirected ADV_IND for 10 min and then
+                    retries directed.  The pairing window always uses
+                    undirected discoverable advertising.
+
+                    A new RPA is learned on every admitted phone connection;
+                    the cache is RAM-only, so the first reconnect after boot
+                    uses undirected.  See docs/ble/directed_reconnect.md.
+
             config MYVENDOR_BLE_COMPANION_STORAGE_PATH
                 string "Transfer storage root"
                 default "/mnt/lfs"
@@ -1117,7 +1180,12 @@ menu "On-chip Peripheral RTOS Drivers"
 
             config MYVENDOR_GPX_STACKSIZE
                 int "gpx main task stack size (bytes)"
-                default 4096
+                default 8192
+                ---help---
+                    NSH applet `gpx` 的栈。原为 4096：那个 applet 里有
+                    `char buf[512]` 的局部缓冲 + LFS 读写 + printf 路径，
+                    与 `ctl` 是同一类"深度吃栈"的形态（见 nsh/CMakeLists.txt
+                    顶部的"栈大小口径"一节）。栈是逐次分配、退出即释放。
 
             config MYVENDOR_GPX_RECORD_STACKSIZE
                 int "gpx record thread stack size (bytes)"
@@ -1182,7 +1250,14 @@ menu "On-chip Peripheral RTOS Drivers"
 
             config MYVENDOR_MTP_SIMPLE_STACKSIZE
                 int "mtp_simple stack size (bytes)"
-                default 4096
+                default 8192
+                ---help---
+                    原为 4096。mtp_simple 是**常驻**服务任务（不像 NSH applet
+                    那样进出即释放），它同时又是崩溃普查里的一族（n008：
+                    cfsr=0x8200、bfar=0x20080000 落在 RAM 里）。它要跑
+                    USB/MTP 协议栈 + LFS 读写 + 目录枚举，深度与 ctl 同类
+                    ⇒ 提到与 ble_companion 相同的 8192（见 nsh/CMakeLists.txt
+                    顶部的"栈大小口径"一节）。
 
             config MYVENDOR_MTP_PSRAM_RESERVE_KB
                 int "PSRAM tail reserved for mtp_simple buffers (KiB)"
@@ -1274,8 +1349,9 @@ menu "On-chip Peripheral RTOS Drivers"
                     link liblvgl or bicycle.
 
                     Display: myvendor_lcd_disp on /dev/lcd0 — driver-owned N-row
-                    strip double buffers + async PUTAREA worker. App registers
-                    flush-done callback (no /dev/fb0, no kernel framebuffer).
+                    strip double buffers, flush_cb starts LCDC/QSPI DMA and the
+                    EOF IRQ fires the flush-done callback (no /dev/fb0, no
+                    kernel framebuffer, no worker thread).
 
                     Driver-only profile: configs/nsh-driver/defconfig sets this
                     to n. Full UI profile: configs/nsh/defconfig sets this to y.
@@ -1300,8 +1376,8 @@ menu "On-chip Peripheral RTOS Drivers"
                 default n
                 depends on MYVENDOR_LCD_DISP
                 ---help---
-                    Periodic syslog: submit ok/busy/err, worker done, flush_ready,
-                    wait max ms, timeouts. Enable for soak tests.
+                    Periodic syslog: submit ok/busy/err, IRQ transfer done,
+                    flush_ready, wait max ms, timeouts. Enable for soak tests.
 
             config MYVENDOR_LVGL_SIFLI_EPIC
                 bool "Enable SiFli EPIC 2D GPU for LVGL draw"
@@ -1312,8 +1388,27 @@ menu "On-chip Peripheral RTOS Drivers"
                     Hardware-accelerate fill, blend, image, and label tasks via
                     SF32 EPIC. LVGL strip draw buffers live in SRAM (lv_myvendor_lcd).
                     By default EPIC runs on the UI thread (LV_OS_NONE); enable
-                    LV_OS_PTHREAD + LV_USE_SIFLI_EPIC_DRAW_THREAD for a separate
-                    epic_draw thread.
+                    MYVENDOR_LVGL_EPIC_QUEUE_MODE for a separate epic_draw thread.
+
+            config MYVENDOR_LVGL_EPIC_QUEUE_MODE
+                bool "EPIC queue/draw-thread mode (async GPU submit, hand off to a draw thread)"
+                default n
+                depends on MYVENDOR_LVGL_SIFLI_EPIC
+                ---help---
+                  开启后 LVGL 切到 pthread OS 层并让 EPIC 在独立绘制线程里执行
+                  （队列式渲染）。默认关闭：同步单线程实测 ~1.4 FPS 更快。
+
+                  单个开关推导出全部配置：
+                    LV_OS_PTHREAD          (lvgl/Kconfig 的 LV_USE_OS choice 默认值)
+                    LV_USE_SIFLI_EPIC_DRAW_THREAD (它的 default y 依赖 !LV_OS_NONE)
+                    LV_DRAW_THREAD_STACK_SIZE=32768 (FreeType 要求)
+                  Kconfig 不允许 select choice 成员，所以 LV_OS_PTHREAD 由
+                  lvgl/Kconfig 里 "default LV_OS_PTHREAD if MYVENDOR_LVGL_EPIC_QUEUE_MODE"
+                  驱动；不要在本项上加 select LV_OS_PTHREAD（静默无效）。
+                  defconfig 里也不要显式写 CONFIG_LV_OS_NONE=y，否则会盖掉它。
+
+                  切换后务必全量重建（rm -rf cmake_out/<board>），choice 只在
+                  配置阶段求值。
 
             config MYVENDOR_LCD_DISP_STRIP_ROWS
                 int "Strip buffer height (rows per draw buffer)"
@@ -1324,15 +1419,17 @@ menu "On-chip Peripheral RTOS Drivers"
                     fixed HCPU SRAM .bss arrays. 160 rows @ 240 wide ~ 75 KiB
                     per buffer (~150 KiB SRAM total). 60 rows ~ 28 KiB per
                     buffer. They are never allocated from Umem/PSRAM.
+                    The flush path caps each LCDC transfer at 128 rows, so a
+                    160-row buffer is used in 128-row strips.
 
             config MYVENDOR_LCD_DISP_WORKER_STACKSIZE
-                int "ui_flush pthread stack (bytes)"
+                int "Deprecated: old ui_flush pthread stack (unused)"
                 default 2048
                 range 1024 4096
                 ---help---
-                    Stack for the ui_flush worker (ioctl PUTAREA only). Default
-                    task stack (16 KiB) is unnecessary; ~1.3 KiB typical peak
-                    with CONFIG_STACK_COLORATION. Increase if FILLED exceeds 70%.
+                    Kept only so existing defconfigs still parse.  The ui_flush
+                    worker was removed: flush_cb now starts LCDC/QSPI DMA and the
+                    LCDC EOF interrupt calls lv_display_flush_ready().
 
             endif
             endif
@@ -1412,10 +1509,10 @@ menu "On-chip Peripheral RTOS Drivers"
                 ---help---
                     Compile the bicycle X-TRACK fork (boards/.../my_vendor/bicycle/).
                     LVGL uses myvendor_lcd_disp on /dev/lcd0: partial double
-                    buffers (see MYVENDOR_LCD_DISP_STRIP_ROWS), flush via worker
-                    + LCDDEVIO_PUTAREA (SPI2 DMA underneath).
+                    buffers (see MYVENDOR_LCD_DISP_STRIP_ROWS), flush_cb starts
+                    LCDC/QSPI DMA directly and the EOF IRQ completes the flush.
                     Assets on LittleFS /mnt/lfs (FS_REGION, NAND or SD/eMMC); edit
-                    boards/.../helmone/mkfs/, build with build_fs_root.sh, flash fs_root.bin.
+                    boards/.../my_vendor/mkfs/, build with build_fs_root.sh, flash fs_root.bin.
                     NSH: bicycle &  (see rcS when MYVENDOR_BICYCLE_AUTOSTART=y)
 
             if MYVENDOR_BICYCLE
@@ -1430,7 +1527,14 @@ menu "On-chip Peripheral RTOS Drivers"
 
             config MYVENDOR_BICYCLE_STACKSIZE
                 int "bicycle stack size"
-                default 16384
+                default 34816
+                ---help---
+                    NuttX carves the argv and TLS frames (96 bytes) off the
+                    top of a task's stack, and LVGL checks at init that the
+                    usable stack is at least 32768 bytes when freetype or
+                    thorvg is enabled.  Leave that headroom here, otherwise
+                    boot logs an LVGL "Stack size is too small" error.
+                    2026-09-25: default 16384 -> 34816.
 
             config MYVENDOR_BICYCLE_PRIORITY
                 int "bicycle task priority"
