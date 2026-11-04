@@ -1,0 +1,161 @@
+OpenAI Codex v0.163.0-alpha.10.2
+--------
+workdir: /home/jinsc/SDK/vela/openvela/vendor/my_vendor
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 01a18391-c5bf-7f30-bec2-6e2e5d71c852
+--------
+user
+你是独立审查者（只读），第三轮。仓库 vendor/my_vendor，HEAD=2c4fedad。
+
+# 上一轮你的结论
+C4 FIXED、C3 FIXED；**C1 PARTIAL**：`helm_shell_rebuild_once()` 末尾重播入场 ⇒
+"先播一轮、旧控件被删、新控件再播一轮"，用户会看到内容先出现再消失再出现。
+新发现 P3：注释过期（170/45/10、260 ms、"触发点只有一处"）。
+
+# 本轮修复（C1 + P3）
+1. 新增/提前 `static bool s_theme_rebuild_pending;`（原在 7822，移到入场动效之前）。
+2. `helm_shell_enter_anim()` 开头：若 `s_theme_rebuild_pending` 为真，**只落末态**
+   （stop + opa=COVER + translate_y=0）并返回 —— 这一轮不播，交给重建末尾那一轮。
+   于是"有待重建"的路径上视觉上只播一轮：
+... (中略) ...
+542:         ui->chore = STARTUP_CHORE_MAP;
+543:         ui->step = STARTUP_STEP_RUN;
+544:         ui->chore_t0 = lv_tick_get();
+545:         startup_bar_goal(ui, 62);
+546:         startup_row(ui, "加载中", true);
+547:         return;
+548:     }
+549: 
+550:     switch (ui->step) {
+551:     case STARTUP_STEP_SLIDE_IN:
+552:         if (lv_tick_elaps(ui->chore_t0) < STARTUP_SLIDE_MS) {
+553:             return;
+554:         }
+555: 
+556:         ui->step = STARTUP_STEP_RUN;
+557:         return;
+558: 
+559:     case STARTUP_STEP_RUN:
+560:         if (!startup_chore_pump(ui)) {
+561:             return;
+562:         }
+563: 
+564:         ui->step = STARTUP_STEP_HOLD;
+565:         ui->chore_t0 = lv_tick_get();
+566:         return;
+567: 
+568:     case STARTUP_STEP_HOLD:
+569:         if (lv_tick_elaps(ui->chore_t0) < STARTUP_HOLD_MS) {
+570:             return;
+571:         }
+572: 
+573:         ui->step = STARTUP_STEP_SLIDE_OUT;
+574:         ui->chore_t0 = lv_tick_get();
+575:         helm_splash_slide_out(&ui->splash);
+576:         return;
+577: 
+578:     case STARTUP_STEP_SLIDE_OUT:
+579:         if (lv_tick_elaps(ui->chore_t0) < STARTUP_SLIDE_MS) {
+580:             return;
+735:     }
+736: 
+737:     startup_stop_bg_anim(ui);
+738:     if (ui->poll_timer) {
+739:         lv_timer_del(ui->poll_timer);
+740:         ui->poll_timer = NULL;
+741:     }
+742: 
+743:     helm_splash_clear(&ui->splash);
+744:     lv_pm_free(ui);
+745:     page->user_data = NULL;
+746:     s_startup = NULL;
+747: }
+748: 
+749: /**
+750:  * @brief 向 lv_pm 注册 Startup splash 页。
+751:  */
+752: void startup_page_register(void)
+753: {
+754:     lv_pm_page_t page = lv_pm_create_page((lv_pm_id)BICYCLE_PM_ID_STARTUP, "Startup");
+755: 
+756:     if (page == NULL) {
+757:         LV_LOG_ERROR("startup_page: register failed");
+758:         return;
+759:     }
+760: 
+761:     lv_pm_set_open(page, startup_on_load);
+762:     lv_pm_set_will_appear(page, startup_will_appear);
+763:     lv_pm_set_will_disappear(page, startup_will_disappear);
+764:     lv_pm_set_close(page, startup_on_unload);
+765:     bicycle_page_anima_apply(page, BICYCLE_PM_ID_STARTUP);
+766: }
+767: 
+768: /**
+769:  * @brief pop Startup，露出栈底 LiveMap。不要 RESET。
+770:  */
+771: void startup_page_finish(void)
+772: {
+773:     myvendor_gnss_ui_ready();
+774: #ifdef CONFIG_MYVENDOR_BLE_COMPANION_AUTOSTART
+775:     board_ble_companion_start_after_ui();
+776: #endif
+777:     if (lv_pm_close_page_msg(NULL) != 0) {
+778:         LV_LOG_ERROR("startup_page: pop failed");
+779:     }
+780: }
+
+exec
+/bin/bash -lc "python3 - <<'PY'
+import hashlib,os
+r='boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/'
+for p in ['helm_shell.c','startup/startup_page.c','live_map/map_page.c','helm_shell.h']:
+ print(hashlib.sha256(open(r+p,'rb').read()).hexdigest(),p)
+PY" in /home/jinsc/SDK/vela/openvela/vendor/my_vendor
+ succeeded in 0ms:
+82064d3b43a2f92aa6b66794589ab83605d8540d794d22bf8fde8aeeb1ccfce2 helm_shell.c
+e4e64de4e7a4c180a666df09d137677d02c36372dd817904b7086d3a10dba4ed startup/startup_page.c
+067810ff0bb4512b582dcce97a431dc1077f35b0631da43dd375c7adc9ff28a7 live_map/map_page.c
+d4776c0d7dfba3c077bfa7fdf91edfb09d22f84a6737346069b60a793a9fcb90 helm_shell.h
+
+codex
+C1 — PARTIAL — [helm_shell.c:6328](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:6328) — 阻止了第一轮子控件动画，但没有消除“先出现、再消失、再出现”的视觉路径：
+
+- pending 分支把旧控件设为 `opa=COVER`。随后页面根执行 **220 ms 淡入**，旧内容会随之出现。
+- [helm_shell.c:7876](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:7876) 要等转场结束才允许重建；重建末尾再次调用入场函数，新控件在 [helm_shell.c:6280](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:6280) 同步设为 `opa=0`，再错峰淡入。因此旧内容已经显示后，三个区域仍会突然消失再出现。
+
+其余核对：
+
+1. **标志时序正确。** 有效 KV 加载触发通知，帧后 `helm_theme_poll_apply()` 登记 pending；Startup 或菜单在栈顶时，apply 的门保留该标志。正常返回主界面时为真。初次 push 空壳时不保证为真，但此时 `attached=false`，直接返回。重建入口在 **7881 行先清 false**，末尾动画不会被自身挡住。
+2. **没有新增永久透明路径。** pending 分支停止动画并显式设置 `COVER/0`，不依赖重建最终发生；即使始终不返回主界面，也不会因此停在 `opa=0`。
+3. **声明移动无语义变化。** 全文件只有 **6203 行**一处定义，仍是静态存储期、隐式初始化为 false。
+4. **P3 — PARTIAL。** 200/80/40 ms、三组结束时间及 ≤400 ms 与参数一致；但 [helm_shell.c:6244](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:6244) 仍写“下移 10px”，实际为 12px；[helm_shell.h:20](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.h:20) 仍写“只在页面出现时调一次”，遗漏重建末尾入口。
+
+新发现：无。
+
+HEAD 与四个源码哈希均吻合，审查结束时未变化。运行验证：NOT_RUN（只读静态审查）。
+
+结论: REJECT
+tokens used
+64,134
+C1 — PARTIAL — [helm_shell.c:6328](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:6328) — 阻止了第一轮子控件动画，但没有消除“先出现、再消失、再出现”的视觉路径：
+
+- pending 分支把旧控件设为 `opa=COVER`。随后页面根执行 **220 ms 淡入**，旧内容会随之出现。
+- [helm_shell.c:7876](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:7876) 要等转场结束才允许重建；重建末尾再次调用入场函数，新控件在 [helm_shell.c:6280](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:6280) 同步设为 `opa=0`，再错峰淡入。因此旧内容已经显示后，三个区域仍会突然消失再出现。
+
+其余核对：
+
+1. **标志时序正确。** 有效 KV 加载触发通知，帧后 `helm_theme_poll_apply()` 登记 pending；Startup 或菜单在栈顶时，apply 的门保留该标志。正常返回主界面时为真。初次 push 空壳时不保证为真，但此时 `attached=false`，直接返回。重建入口在 **7881 行先清 false**，末尾动画不会被自身挡住。
+2. **没有新增永久透明路径。** pending 分支停止动画并显式设置 `COVER/0`，不依赖重建最终发生；即使始终不返回主界面，也不会因此停在 `opa=0`。
+3. **声明移动无语义变化。** 全文件只有 **6203 行**一处定义，仍是静态存储期、隐式初始化为 false。
+4. **P3 — PARTIAL。** 200/80/40 ms、三组结束时间及 ≤400 ms 与参数一致；但 [helm_shell.c:6244](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.c:6244) 仍写“下移 10px”，实际为 12px；[helm_shell.h:20](/home/jinsc/SDK/vela/openvela/vendor/my_vendor/boards/sf32lb52/my_vendor/ui/bicycle/src/lvgl_page/helm_shell.h:20) 仍写“只在页面出现时调一次”，遗漏重建末尾入口。
+
+新发现：无。
+
+HEAD 与四个源码哈希均吻合，审查结束时未变化。运行验证：NOT_RUN（只读静态审查）。
+
+结论: REJECT

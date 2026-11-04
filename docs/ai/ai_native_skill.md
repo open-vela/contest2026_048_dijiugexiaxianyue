@@ -3,8 +3,8 @@
 本文说明 Helm One 项目沉淀的自定义 Skill —— `vela-helm-one` —— 的**来历、结构、安装与维护约定**。
 它是「把散落在仓库文档里的板级事实、强制约束与故障恢复手册固化成 AI 可直接调用的能力」这一步的产物。
 
-- 运行时 Skill：`vendor/my_vendor/ai/skills/vela-helm-one.md` → 拷成 `/data/agent/skills/vela-helm-one.md`
-- PC 侧深读知识库：`vendor/my_vendor/ai/skills/vela-helm-one/`（`README.md` + `references/`）
+- 运行时 Skill：`vendor/HelmOne/ai/skills/vela-helm-one.md` → 拷成 `/data/agent/skills/vela-helm-one.md`
+- PC 侧深读知识库：`vendor/HelmOne/ai/skills/vela-helm-one/`（`README.md` + `references/`）
 - 适用对象：在本仓（openvela + SF32LB52 骑行整机）上工作的 AI 助手与人类开发者
 
 ---
@@ -25,7 +25,7 @@ Skill 把这三类内容**前置**到对话开始处：读一次 Skill（标题 
 ## 2. 结构
 
 ```
-vendor/my_vendor/ai/skills/
+vendor/HelmOne/ai/skills/
 ├── vela-helm-one.md              # ① 运行时 Skill（单文件，openvela ai_agent 规范）
 └── vela-helm-one/                # ② PC 侧深读知识库
     ├── README.md                 #    入口：触发场景 + 工作方式 + 目录
@@ -64,7 +64,7 @@ vendor/my_vendor/ai/skills/
 ```bash
 # ① 运行时 Skill：拷成扁平文件即可（openvela ai_agent 只认 .md，子目录会被忽略）
 mkdir -p /data/agent/skills
-cp vendor/my_vendor/ai/skills/vela-helm-one.md /data/agent/skills/vela-helm-one.md
+cp vendor/HelmOne/ai/skills/vela-helm-one.md /data/agent/skills/vela-helm-one.md
 
 # ② PC 侧知识库：留在仓库里，供人或 PC 上的 AI 查阅
 ```
@@ -110,3 +110,20 @@ cp vendor/my_vendor/ai/skills/vela-helm-one.md /data/agent/skills/vela-helm-one.
 ## 7. 与大赛报告的关系
 
 本文件与 Skill 源对应作品提交报告中 **3.4 节「沉淀的自定义 Skill：vela-helm-one」** 的描述：报告讲**是什么、为什么**，本目录给出**可运行的完整定义**。评审可直接 `cp -r` 到 `/data/agent/skills/` 验证。
+
+## 8. 第二个沉淀：开发方法论 Skill
+
+上面讲的是「产品知识」怎么沉淀。本项目还沉淀了第二个、性质不同的 Skill ——
+[`single-conversation-subagent`](single-conversation-subagent.md)：**单对话两级协作**的
+开发方法论（主对话协调、执行子 Agent 返回有界证据、一对话一问的执行模式、证据落盘、
+独立验收）。它不描述 Helm One 的任何硬件事实，只约束"AI 怎么被使用"。
+
+两者是**互补**关系，也正是本项目对「Skill 沉淀」这句话的两层回答：
+
+| 层 | Skill | 沉淀物 | 失效方式 |
+| --- | --- | --- | --- |
+| 知识 | `vela-helm-one` | 结论（分区表、阈值、故障处置） | 硬件/固件一变就过期，需按 §5 维护 |
+| 方法 | `single-conversation-subagent` | 过程（任务边界、验收闭环、证据落盘） | 与硬件无关，跨项目可迁移 |
+
+方法论 Skill 让每一次排障都留下可复核的证据链，这些证据再被提炼进知识 Skill 的
+`troubleshooting.md`（现 23 节）—— 这是本项目"AI 开发"能规模化的真实原因。
